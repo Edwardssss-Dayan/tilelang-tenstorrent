@@ -14,6 +14,9 @@ def test_comm_namespace_is_exported():
         "CoreRange",
         "Pipe",
         "PipeNet",
+        "all_gather",
+        "all_reduce",
+        "broadcast",
         "foreach_dst",
         "foreach_src",
         "is_active",
@@ -22,6 +25,8 @@ def test_comm_namespace_is_exported():
         "pipe_dst",
         "pipe_dst_range",
         "pipe_src",
+        "put",
+        "transfer",
     }
     assert callable(T.comm_reducer)
 

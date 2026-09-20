@@ -11,11 +11,12 @@ from dataclasses import dataclass
 import json
 from typing import Literal
 
-from tvm import ir, tirx
+from tvm import DataType, arith, ir, tirx
 
 from tilelang.language.eager.builder import Builder
 from tilelang.language.kernel import KernelLaunchFrame
 from tilelang.language.loop import serial
+from tilelang.utils.language import to_buffer_region
 
 
 _FOREACH_SRC_ANNOTATION = "tl.tt.foreach_src"
@@ -23,6 +24,7 @@ _FOREACH_DST_ANNOTATION = "tl.tt.foreach_dst"
 
 CoreCoord = tuple[int, int]
 CoreExpr = tuple[tirx.PrimExpr, tirx.PrimExpr]
+CoreEndpoint = tuple[int | tirx.PrimExpr, int | tirx.PrimExpr]
 PipeKind = Literal["point_to_point", "collective"]
 PipeSide = Literal["src", "dst"]
 
@@ -38,17 +40,37 @@ def _normalize_coord(value: object, name: str) -> CoreCoord:
     return x, y
 
 
+def _normalize_endpoint(value: object, name: str) -> CoreEndpoint:
+    if not isinstance(value, tuple) or len(value) != 2:
+        raise TypeError(f"{name} must be a two-element (x, y) tuple")
+    coords = []
+    for coord in value:
+        if isinstance(coord, bool) or not isinstance(coord, (int, tirx.PrimExpr)):
+            raise TypeError(f"{name} coordinates must be scalar integer expressions")
+        if isinstance(coord, tirx.PrimExpr):
+            if not coord.dtype.startswith(("int", "uint")) or DataType(coord.dtype).lanes != 1:
+                raise TypeError(f"{name} coordinates must be scalar integer expressions")
+            coord = arith.Analyzer().simplify(coord)
+            if isinstance(coord, tirx.IntImm):
+                coord = int(coord.value)
+        if isinstance(coord, int) and coord < 0:
+            raise ValueError(f"{name} coordinates must be non-negative, got {value}")
+        coords.append(coord)
+    return tuple(coords)
+
+
 @dataclass(frozen=True, init=False)
 class CoreRange:
-    """A half-open, two-dimensional rectangle of Core coordinates."""
+    """A half-open Core rectangle; transfer endpoints may use Core expressions."""
 
-    begin: CoreCoord
-    end: CoreCoord
+    begin: CoreEndpoint
+    end: CoreEndpoint
 
-    def __init__(self, begin: CoreCoord, end: CoreCoord):
-        normalized_begin = _normalize_coord(begin, "CoreRange.begin")
-        normalized_end = _normalize_coord(end, "CoreRange.end")
-        if normalized_begin[0] >= normalized_end[0] or normalized_begin[1] >= normalized_end[1]:
+    def __init__(self, begin: CoreEndpoint, end: CoreEndpoint):
+        normalized_begin = _normalize_endpoint(begin, "CoreRange.begin")
+        normalized_end = _normalize_endpoint(end, "CoreRange.end")
+        analyzer = arith.Analyzer()
+        if any(analyzer.can_prove(lo >= hi) for lo, hi in zip(normalized_begin, normalized_end)):
             raise ValueError(f"CoreRange must be non-empty in both dimensions: begin={normalized_begin}, end={normalized_end}")
         object.__setattr__(self, "begin", normalized_begin)
         object.__setattr__(self, "end", normalized_end)
@@ -64,6 +86,8 @@ class Pipe:
     def __init__(self, src: CoreCoord, dst: CoreCoord | CoreRange):
         normalized_src = _normalize_coord(src, "Pipe.src")
         if isinstance(dst, CoreRange):
+            _normalize_coord(dst.begin, "Pipe.dst.begin")
+            _normalize_coord(dst.end, "Pipe.dst.end")
             normalized_dst: CoreCoord | CoreRange = dst
         else:
             normalized_dst = _normalize_coord(dst, "Pipe.dst")
@@ -108,9 +132,17 @@ def _builder_state() -> tuple[Builder, dict]:
             "foreach_frames": {},
             "foreach_vars": [],
             "payload_contracts": [],
+            "communication_count": 0,
         }
         builder._tt_topology_state = state
     return builder, state
+
+
+def _next_communication_site_id() -> tirx.IntImm:
+    _, state = _builder_state()
+    site_id = state["communication_count"]
+    state["communication_count"] += 1
+    return tirx.IntImm("int32", site_id)
 
 
 def _pipenet_id(net: PipeNet) -> int:
@@ -140,8 +172,9 @@ def _encode_pipenet(net: PipeNet) -> str:
     return json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
 
 
-def _validate_in_grid(net: PipeNet) -> None:
-    launch = KernelLaunchFrame.Current()
+def _kernel_grid():
+    builder = Builder.current()
+    launch = next((frame for frame in reversed(builder.frames) if isinstance(frame, KernelLaunchFrame)), None) if builder else None
     if launch is None:
         raise RuntimeError("T.comm topology primitives must be used inside T.Kernel")
     block_frames = launch.frames[0:-4]
@@ -153,6 +186,11 @@ def _validate_in_grid(net: PipeNet) -> None:
         if not isinstance(extent, tirx.IntImm) or extent.dtype == "bool" or extent.value <= 0:
             raise ValueError("T.comm topology primitives require positive compile-time integer T.Kernel grid extents")
         grid.append(int(extent.value))
+    return block_frames, grid
+
+
+def _validate_in_grid(net: PipeNet) -> None:
+    _, grid = _kernel_grid()
 
     def check_coord(coord: CoreCoord, name: str) -> None:
         if coord[0] >= grid[0] or coord[1] >= grid[1]:
@@ -167,6 +205,215 @@ def _validate_in_grid(net: PipeNet) -> None:
                 )
         else:
             check_coord(pipe.dst, f"PipeNet.pipes[{index}].dst")
+
+
+def _validate_payload(value: object, operation: str) -> tirx.Buffer:
+    if not isinstance(value, tirx.Buffer):
+        raise TypeError(f"{operation} requires a complete tirx.Buffer payload")
+    scope = value.scope()
+    if scope not in ("shared", "shared.dyn"):
+        raise ValueError(f"{operation} requires a shared or shared.dyn payload buffer, got scope {scope!r}")
+    if len(value.shape) != 2:
+        raise ValueError(f"{operation} requires a rank-2 payload buffer")
+    for extent in value.shape:
+        if not isinstance(extent, tirx.IntImm) or extent.value <= 0 or extent.value % 32:
+            raise ValueError(f"{operation} requires positive static payload extents divisible by the 32x32 tile shape")
+    return value
+
+
+def transfer(*, src: tirx.Buffer, dst: tirx.Buffer, src_core: CoreEndpoint, dst_cores: CoreEndpoint | CoreRange) -> tirx.PrimExpr:
+    """Describe a logically synchronous, source-exclusive inter-Core transfer.
+
+    Payloads are complete rank-2 shared buffers with equal shape and dtype.
+    A coordinate tuple selects point-to-point communication; a CoreRange selects
+    collective communication even when it contains only one destination.
+    Coordinates may contain integer expressions such as the current Kernel's
+    Core coordinates. Lowering must validate symbolic endpoints, participant
+    correspondence, and buffer lifetimes before generating the two endpoints.
+
+    The frontend emits one opaque call, not executable communication or a
+    user-managed completion handle. Its operation-local site ID distinguishes
+    repeated statements; the enclosing TIR loops retain dynamic occurrences.
+    """
+    block_frames, grid = _kernel_grid()
+    source = _validate_payload(src, "T.comm.transfer")
+    destination = _validate_payload(dst, "T.comm.transfer")
+    if source.dtype != destination.dtype or not ir.structural_equal(source.shape, destination.shape):
+        raise ValueError("T.comm.transfer payload shape/dtype mismatch between src and dst")
+    source_coord = _normalize_endpoint(src_core, "transfer.src_core")
+    if isinstance(dst_cores, CoreRange):
+        kind = "collective"
+        begin, end = dst_cores.begin, dst_cores.end
+    else:
+        kind = "point_to_point"
+        begin = _normalize_endpoint(dst_cores, "transfer.dst_cores")
+        end = tuple(coord + 1 for coord in begin)
+
+    analyzer = arith.Analyzer()
+    for frame in block_frames:
+        analyzer.bind(frame.vars[0], frame.doms[0])
+    for axis, extent in enumerate(grid):
+        for coord in (source_coord[axis], begin[axis]):
+            if analyzer.can_prove(tirx.any(coord < 0, coord >= extent)):
+                raise ValueError("T.comm.transfer endpoint is outside T.Kernel grid")
+        if analyzer.can_prove(end[axis] > extent):
+            raise ValueError("T.comm.transfer destination range is outside T.Kernel grid")
+        if analyzer.can_prove(begin[axis] >= end[axis]):
+            raise ValueError("T.comm.transfer destination range must be non-empty")
+    source_in_destination = tirx.all(*(condition for s, lo, hi in zip(source_coord, begin, end) for condition in (s >= lo, s < hi)))
+    if analyzer.can_prove(source_in_destination):
+        raise ValueError("T.comm.transfer is source-exclusive: dst_cores must exclude src_core")
+
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get("tl.tt.transfer"),
+        to_buffer_region(source, access_type="r", extents=list(source.shape)),
+        to_buffer_region(destination, access_type="w", extents=list(destination.shape)),
+        *source_coord,
+        *begin,
+        *end,
+        tirx.StringImm(kind),
+        _next_communication_site_id(),
+    )
+
+
+def put(*, src: tirx.Buffer, dst: tirx.Buffer, src_core: CoreEndpoint, dst_core: CoreEndpoint) -> tirx.PrimExpr:
+    """Describe one point-to-point transfer with explicit source and destination.
+
+    This is declaration syntax for transfer, including its source-exclusive,
+    logically synchronous contract and compiler-generated receive. Place it in
+    the common participant scope, just like transfer; src_core is explicit and
+    does not default to the calling Core. dst_core must be one coordinate tuple.
+    """
+    destination = _normalize_endpoint(dst_core, "T.comm.put.dst_core")
+    return transfer(src=src, dst=dst, src_core=src_core, dst_cores=destination)
+
+
+def broadcast(*, src: tirx.Buffer, dst: tirx.Buffer, src_core: CoreEndpoint, dst_cores: CoreRange) -> tirx.PrimExpr:
+    """Describe a collective transfer to a source-exclusive CoreRange.
+
+    All destinations receive the same source payload. A singleton range retains
+    the collective contract. Participant scope, logical synchronization, and
+    payload restrictions are inherited from transfer.
+    """
+    if not isinstance(dst_cores, CoreRange):
+        raise TypeError("T.comm.broadcast dst_cores must be a T.comm.CoreRange")
+    return transfer(src=src, dst=dst, src_core=src_core, dst_cores=dst_cores)
+
+
+def _validate_collective_group(group: object, operation: str) -> int:
+    block_frames, grid = _kernel_grid()
+    if not isinstance(group, CoreRange):
+        raise TypeError(f"{operation} group must be a T.comm.CoreRange")
+    analyzer = arith.Analyzer()
+    for frame in block_frames:
+        analyzer.bind(frame.vars[0], frame.doms[0])
+    size = 1
+    for begin, end, extent in zip(group.begin, group.end, grid):
+        if analyzer.can_prove(tirx.any(begin < 0, end > extent)):
+            raise ValueError(f"{operation} group is outside T.Kernel grid")
+        width = analyzer.simplify(end - begin)
+        if not isinstance(width, tirx.IntImm) or width.value <= 0:
+            raise ValueError(f"{operation} group dimensions must be positive compile-time integers")
+        size *= int(width.value)
+    return size
+
+
+def _validate_collective_buffers(src: object, dst: object, operation: str) -> tuple[tirx.Buffer, tirx.Buffer]:
+    source = _validate_payload(src, operation)
+    destination = _validate_payload(dst, operation)
+    if source.dtype != destination.dtype:
+        raise ValueError(f"{operation} src and dst must have the same dtype")
+    if source.dtype not in ("bfloat16", "float32"):
+        raise ValueError(f"{operation} supports only bfloat16 and float32 payloads")
+    if source.data.same_as(destination.data):
+        raise ValueError(f"{operation} requires independent src and dst storage; in-place and aliased buffers are unsupported")
+
+    analyzer = arith.Analyzer()
+    for buffer in (source, destination):
+        if not analyzer.can_prove_equal(buffer.elem_offset, 0) or buffer.axis_separators:
+            raise ValueError(f"{operation} requires complete compact buffers without storage offsets or axis separators")
+        if buffer.strides and (
+            len(buffer.strides) != 2
+            or not analyzer.can_prove_equal(buffer.strides[0], buffer.shape[1])
+            or not analyzer.can_prove_equal(buffer.strides[1], 1)
+        ):
+            raise ValueError(f"{operation} requires compact row-major buffers")
+
+    # MatchBuffer views can have distinct data Vars despite sharing storage.
+    frames = list(Builder.current().frames)
+    while frames:
+        frame = frames.pop()
+        if isinstance(frame, KernelLaunchFrame):
+            frames.extend(frame.frames)
+        for match in getattr(frame, "match_buffers", ()):
+            if match.buffer.data.same_as(source.data) or match.buffer.data.same_as(destination.data):
+                raise ValueError(f"{operation} does not support match_buffer views")
+    return source, destination
+
+
+def _emit_collective(op_name: str, src: tirx.Buffer, dst: tirx.Buffer, group: CoreRange, parameter: tirx.PrimExpr) -> tirx.PrimExpr:
+    return tirx.call_intrin(
+        "handle",
+        tirx.op.Op.get(op_name),
+        to_buffer_region(src, access_type="r", extents=list(src.shape)),
+        to_buffer_region(dst, access_type="w", extents=list(dst.shape)),
+        *group.begin,
+        *group.end,
+        parameter,
+        _next_communication_site_id(),
+    )
+
+
+def all_gather(*, src: tirx.Buffer, dst: tirx.Buffer, group: CoreRange, axis: int) -> tirx.PrimExpr:
+    """Concatenate all group members' inputs along axis into every member's dst.
+
+    Group rank increases along x, then y. Each member contributes its own input;
+    singleton groups still copy src to dst. Inputs and outputs are independent,
+    complete, tile-aligned rank-2 shared buffers with matching BF16/FP32 dtype.
+    Axis is a compile-time integer in [-2, 2); the output extent on that axis is
+    group_size times the input extent, and the other extent is unchanged.
+
+    This captures one opaque high-level operation. Lowering must validate group
+    participation and generate communication, completion, and storage reuse.
+    """
+    operation = "T.comm.all_gather"
+    size = _validate_collective_group(group, operation)
+    source, destination = _validate_collective_buffers(src, dst, operation)
+    if isinstance(axis, tirx.IntImm) and axis.dtype != "bool":
+        axis = int(axis.value)
+    if isinstance(axis, bool) or not isinstance(axis, int):
+        raise TypeError(f"{operation} axis must be a compile-time integer")
+    if axis not in (-2, -1, 0, 1):
+        raise ValueError(f"{operation} axis must be in [-2, 2) for rank-2 payloads")
+    axis %= 2
+    expected = [int(extent.value) for extent in source.shape]
+    expected[axis] *= size
+    actual = [int(extent.value) for extent in destination.shape]
+    if actual != expected:
+        raise ValueError(f"{operation} dst shape must be {expected}, got {actual}")
+    return _emit_collective("tl.tt.all_gather", source, destination, group, tirx.IntImm("int32", axis))
+
+
+def all_reduce(*, src: tirx.Buffer, dst: tirx.Buffer, group: CoreRange, op: Literal["sum", "max", "min"] = "sum") -> tirx.PrimExpr:
+    """Reduce corresponding elements across group members into every member's dst.
+
+    The tensor shape is unchanged; no local tensor dimension is reduced. Src and
+    dst must be independent, complete, tile-aligned rank-2 shared buffers with
+    matching BF16/FP32 dtype and shape. A singleton group still copies src to dst.
+    This captures the reduction kind and dependencies in initial IR; numerical
+    execution, accumulator precision, and synchronization require backend support.
+    """
+    operation = "T.comm.all_reduce"
+    _validate_collective_group(group, operation)
+    source, destination = _validate_collective_buffers(src, dst, operation)
+    if not isinstance(op, str):
+        raise TypeError(f"{operation} op must be a compile-time string")
+    if op not in ("sum", "max", "min"):
+        raise ValueError(f"{operation} op must be one of sum, max, min")
+    if [int(extent.value) for extent in source.shape] != [int(extent.value) for extent in destination.shape]:
+        raise ValueError(f"{operation} src and dst must have the same shape")
+    return _emit_collective("tl.tt.all_reduce", source, destination, group, tirx.StringImm(op))
 
 
 def _require_pipenet(net: object) -> PipeNet:
@@ -310,6 +557,9 @@ __all__ = (
     "CoreRange",
     "Pipe",
     "PipeNet",
+    "all_gather",
+    "all_reduce",
+    "broadcast",
     "foreach_dst",
     "foreach_src",
     "is_active",
@@ -318,4 +568,6 @@ __all__ = (
     "pipe_dst",
     "pipe_dst_range",
     "pipe_src",
+    "put",
+    "transfer",
 )
