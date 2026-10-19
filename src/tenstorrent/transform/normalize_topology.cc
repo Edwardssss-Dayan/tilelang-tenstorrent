@@ -8,6 +8,8 @@
  */
 
 #include "../op/builtin.h"
+#include "../ir/device_ir.h"
+#include "../../op/utils.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
@@ -23,6 +25,8 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -216,6 +220,156 @@ private:
       source_side_;
 };
 
+class HighLevelTopologyCollector : public StmtExprVisitor {
+public:
+  HighLevelTopologyCollector(const Var &core_x, const Var &core_y, int64_t gx,
+                             int64_t gy)
+      : core_x_(core_x), core_y_(core_y), gx_(gx), gy_(gy) {
+    analyzer_.Bind(core_x_, Range::FromMinExtent(Integer(0), Integer(gx_)));
+    analyzer_.Bind(core_y_, Range::FromMinExtent(Integer(0), Integer(gy_)));
+  }
+
+  ffi::Array<NormalizedTopologyDescriptor> Collect(const Stmt &body) {
+    VisitStmt(body);
+    int64_t expected = 0;
+    for (const NormalizedTopologyDescriptor &entry : entries_) {
+      if (entry->site_id != expected++)
+        Reject("communication site IDs must be dense and follow source order");
+    }
+    return entries_;
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    bool contains_communication = false;
+    PostOrderVisit(op->body, [&](const ffi::ObjectRef &object) {
+      const auto *call = object.as<CallNode>();
+      const auto *operator_node = call ? call->op.as<OpNode>() : nullptr;
+      std::string name =
+          operator_node ? std::string(operator_node->name) : "";
+      contains_communication |= name == "tl.tt.transfer" ||
+                                name == "tl.tt.all_gather" ||
+                                name == "tl.tt.all_reduce";
+    });
+    if (!contains_communication) {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
+    if (op->kind != ForKind::kSerial && op->kind != ForKind::kUnrolled)
+      Reject("communication occurrence loops must be serial or unrolled");
+    const auto *minimum = op->min.as<IntImmNode>();
+    const auto *extent = op->extent.as<IntImmNode>();
+    if (!minimum || !extent || extent->value <= 0 ||
+        (op->step.has_value() && !is_one(op->step.value())))
+      Reject("communication occurrence loops require positive static unit-step bounds");
+    analyzer_.Bind(op->loop_var,
+                   Range::FromMinExtent(op->min, op->extent));
+    occurrence_extents_.push_back(op->extent);
+    VisitStmt(op->body);
+    occurrence_extents_.pop_back();
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    bool contains_communication = false;
+    PostOrderVisit(ffi::GetRef<IfThenElse>(op),
+                   [&](const ffi::ObjectRef &object) {
+                     const auto *call = object.as<CallNode>();
+                     const auto *operator_node =
+                         call ? call->op.as<OpNode>() : nullptr;
+                     std::string name =
+                         operator_node ? std::string(operator_node->name) : "";
+                     contains_communication |=
+                         name == "tl.tt.transfer" ||
+                         name == "tl.tt.all_gather" ||
+                         name == "tl.tt.all_reduce";
+                   });
+    if (!contains_communication) {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
+    if (SideEffect(op->condition) > CallEffectKind::kPure)
+      Reject("communication guard must be a pure expression");
+    PrimExpr previous = guard_;
+    guard_ = analyzer_.Simplify(previous && op->condition);
+    VisitStmt(op->then_case);
+    if (op->else_case.has_value()) {
+      guard_ = analyzer_.Simplify(previous && !op->condition);
+      VisitStmt(op->else_case.value());
+    }
+    guard_ = std::move(previous);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    const auto *operator_node = op->op.as<OpNode>();
+    const std::string name = operator_node ? std::string(operator_node->name) : "";
+    if (name != "tl.tt.transfer" && name != "tl.tt.all_gather" &&
+        name != "tl.tt.all_reduce") {
+      StmtExprVisitor::VisitExpr_(op);
+      return;
+    }
+    Call call = ffi::GetRef<Call>(op);
+    const bool transfer_call = name == "tl.tt.transfer";
+    const size_t expected_arity = transfer_call ? 10 : 8;
+    if (call->args.size() != expected_arity)
+      Reject("high-level communication arity changed after frontend validation");
+    BufferRegion source =
+        NormalizeToAccessRegion(call->args[0], kAccessRead).region;
+    BufferRegion destination =
+        NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
+    ffi::Array<PrimExpr> source_coord;
+    ffi::Array<PrimExpr> begin;
+    ffi::Array<PrimExpr> end;
+    PrimExpr parameter;
+    ffi::String contract;
+    if (transfer_call) {
+      source_coord = {call->args[2], call->args[3]};
+      begin = {call->args[4], call->args[5]};
+      end = {call->args[6], call->args[7]};
+      parameter = call->args[8];
+      contract = Downcast<StringImm>(call->args[8])->value;
+    } else {
+      begin = {call->args[2], call->args[3]};
+      end = {call->args[4], call->args[5]};
+      parameter = call->args[6];
+      contract = "collective";
+    }
+    for (size_t axis = 0; axis < 2; ++axis) {
+      PrimExpr limit = Integer(axis == 0 ? gx_ : gy_);
+      if (!analyzer_.CanProve(begin[axis] >= 0) ||
+          !analyzer_.CanProve(begin[axis] < end[axis]) ||
+          !analyzer_.CanProve(end[axis] <= limit))
+        Reject("communication group/endpoints are not statically in the launch grid");
+      if (transfer_call &&
+          (!analyzer_.CanProve(source_coord[axis] >= 0) ||
+           !analyzer_.CanProve(source_coord[axis] < limit)))
+        Reject("communication source is not statically in the launch grid");
+    }
+    if (transfer_call) {
+      PrimExpr source_in_destination =
+          source_coord[0] >= begin[0] && source_coord[0] < end[0] &&
+          source_coord[1] >= begin[1] && source_coord[1] < end[1];
+      if (analyzer_.CanProve(source_in_destination))
+        Reject("source-exclusive transfer destination includes its source");
+    }
+    int64_t site_id = *as_const_int(call->args[expected_arity - 1]);
+    if (!sites_.insert(site_id).second)
+      Reject("duplicate communication site ID");
+    ffi::String kind = transfer_call ? ffi::String("transfer")
+                                     : ffi::String(name.substr(6));
+    entries_.push_back(NormalizedTopologyDescriptor(
+        site_id, kind, source, destination, source_coord, begin, end, parameter,
+        contract, guard_, occurrence_extents_, call->span));
+  }
+
+private:
+  Var core_x_, core_y_;
+  int64_t gx_, gy_;
+  arith::Analyzer analyzer_;
+  PrimExpr guard_{const_true()};
+  ffi::Array<PrimExpr> occurrence_extents_;
+  ffi::Array<NormalizedTopologyDescriptor> entries_;
+  std::unordered_set<int64_t> sites_;
+};
+
 PrimFunc NormalizeTopology(PrimFunc func) {
   if (func->GetAttr<Integer>("tt.topology_normalized").has_value())
     return func;
@@ -226,19 +380,6 @@ PrimFunc NormalizeTopology(PrimFunc func) {
     Reject("logical Core grid must have static integer extents");
   int64_t gx = *as_const_int(grid.value()[0]),
           gy = *as_const_int(grid.value()[1]);
-  bool pipes = false;
-  PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
-    if (const auto *call = object.as<CallNode>()) {
-      if (const auto *op = call->op.as<OpNode>())
-        pipes |= std::string(op->name).rfind("tl.tt.pipe_", 0) == 0 ||
-                 std::string(op->name).rfind("tl.tt.is_", 0) == 0;
-    }
-    if (const auto *loop = object.as<ForNode>())
-      pipes |= loop->annotations.count("tl.tt.foreach_src") ||
-               loop->annotations.count("tl.tt.foreach_dst");
-  });
-  if (gx == 1 && gy == 1 && !pipes)
-    return func;
   if (gx <= 0 || gy <= 0 || gx > 256 || gy > 256 || gx * gy > 256)
     TVM_FFI_THROW(NotImplementedError)
         << "[NormalizeTenstorrentTopology] static Core grid is limited to 256 "
@@ -248,31 +389,9 @@ PrimFunc NormalizeTopology(PrimFunc func) {
     Reject("normalized launch must retain the logical Core x/y loop prefix");
   For xloop = Downcast<For>(func->body);
   For yloop = Downcast<For>(xloop->body);
-  ffi::Array<Stmt> cores;
-  std::map<int64_t, std::string> definitions;
-  for (int64_t x = 0; x < gx; ++x) {
-    for (int64_t y = 0; y < gy; ++y) {
-      CoreSpecializer specializer(x, y, gx, gy, xloop->loop_var,
-                                  yloop->loop_var, &definitions);
-      Stmt body = specializer(yloop->body);
-      SBlock block({}, {}, {}, "tt_core", body, std::nullopt, {}, {},
-                   {{"tt.core_x", Integer(x)}, {"tt.core_y", Integer(y)}},
-                   func->span);
-      cores.push_back(SBlockRealize({}, const_true(), block, func->span));
-    }
-  }
-  yloop.CopyOnWrite()->body =
-      cores.size() == 1 ? cores[0] : SeqStmt(cores, func->span);
-  xloop.CopyOnWrite()->body = yloop;
-  func.CopyOnWrite()->body = xloop;
-  Records original_records;
-  auto decoder = ffi::Function::GetGlobal("tl.tenstorrent.DecodePipeNet");
-  for (const auto &[net, text] : definitions) {
-    Records records = (*decoder)(text).cast<Records>();
-    for (const Record &record : records)
-      original_records.push_back(record);
-  }
-  func = WithAttr(std::move(func), "tt.topology_records", original_records);
+  HighLevelTopologyCollector collector(xloop->loop_var, yloop->loop_var, gx, gy);
+  auto topology = collector.Collect(yloop->body);
+  func = WithAttr(std::move(func), "tt.normalized_topology", topology);
   return WithAttr(std::move(func), "tt.topology_normalized", Integer(1));
 }
 } // namespace

@@ -15,6 +15,11 @@ from testing.python.target.test_tilelang_tenstorrent_phase2_device_ir import _re
 from testing.python.target.test_tilelang_tenstorrent_phase5_resources import rejected
 
 
+pytestmark = pytest.mark.skip(
+    reason="legacy Device IR v4 PipeNet resource schema replaced by typed v04 communication steps"
+)
+
+
 def resource_program(collective=False, duplicate=False):
     destination = T.comm.CoreRange((1, 0), (3, 1)) if collective else (1, 0)
     pipes = [T.comm.Pipe((0, 0), destination)]

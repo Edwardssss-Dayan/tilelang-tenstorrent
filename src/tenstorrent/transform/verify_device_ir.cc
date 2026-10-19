@@ -9,6 +9,7 @@
  */
 #include "verify_device_ir.h"
 #include "compact_device_program.h"
+#include "device_table_compaction.h"
 #include "infer_compute_requirements.h"
 
 #include <tvm/arith/analyzer.h>
@@ -24,6 +25,7 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <iterator>
@@ -133,6 +135,42 @@ bool HasForbiddenPrefix(const std::string &op_name) {
       [&](const char *prefix) { return op_name.rfind(prefix, 0) == 0; });
 }
 
+class CoreCoordinateSubstituter : public tirx::StmtExprMutator {
+public:
+  CoreCoordinateSubstituter(int64_t x, int64_t y) : x_(x), y_(y) {}
+
+  PrimExpr VisitExpr_(const tirx::CallNode *op) final {
+    if (op->op.same_as(tenstorrent::core_x()))
+      return tirx::make_const(op->dtype, x_);
+    if (op->op.same_as(tenstorrent::core_y()))
+      return tirx::make_const(op->dtype, y_);
+    tirx::Call call = Downcast<tirx::Call>(StmtExprMutator::VisitExpr_(op));
+    if (!call.same_as(ffi::GetRef<tirx::Call>(op)))
+      call.CopyOnWrite()->span = op->span;
+    return call;
+  }
+
+  PrimExpr VisitExpr_(const tirx::CastNode *op) final {
+    PrimExpr value = VisitExpr(op->value);
+    if (const auto *integer = value.as<IntImmNode>())
+      return tirx::make_const(op->dtype, integer->value, op->span);
+    return tirx::Cast(op->dtype, value, op->span);
+  }
+
+  PrimExpr VisitExpr(const PrimExpr &expr) final {
+    PrimExpr result = StmtExprMutator::VisitExpr(expr);
+    return result.dtype().is_handle() ||
+                   tirx::SideEffect(result) > tirx::CallEffectKind::kPure
+               ? result
+               : analyzer_.Simplify(result);
+  }
+
+private:
+  int64_t x_;
+  int64_t y_;
+  arith::Analyzer analyzer_;
+};
+
 void VerifyNoForbiddenOps(const tirx::PrimFunc &func,
                           const std::string &symbol) {
   tirx::PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
@@ -207,7 +245,8 @@ std::string ResourceContext(const IRModule &mod, const DFBDescriptor &dfb) {
 
 TensorTable VerifyTensorTable(const ffi::Array<TensorDescriptor> &tensors,
                               const CoreCoord &launch_grid,
-                              bool general = false) {
+                              bool general = false,
+                              bool require_span = true) {
   TensorTable table;
   for (const TensorDescriptor &tensor : tensors) {
     const std::string label =
@@ -234,7 +273,8 @@ TensorTable VerifyTensorTable(const ffi::Array<TensorDescriptor> &tensors,
               tensor->effect == "inout",
           label + " has invalid effect `" + std::string(tensor->effect) + "`");
     Check(tensor->alias_group >= 0, label + " has a negative alias_group");
-    Check(tensor->source_span.defined(), label + " has no source_span");
+    Check(!require_span || tensor->source_span.defined(),
+          label + " has no source_span");
     if (tensor->shard_spec.defined()) {
       const ShardSpec &shard = tensor->shard_spec.value();
       VerifyDomain(shard->core_domain, launch_grid,
@@ -252,7 +292,8 @@ TensorTable VerifyTensorTable(const ffi::Array<TensorDescriptor> &tensors,
 
 DFBTable VerifyDFBTable(const ffi::Array<DFBDescriptor> &dfbs,
                         const TensorTable &tensors,
-                        const CoreCoord &launch_grid, bool general = false) {
+                        const CoreCoord &launch_grid, bool general = false,
+                        bool require_span = true) {
   DFBTable table;
   std::unordered_set<std::string> source_buffer_ids;
   for (const DFBDescriptor &dfb : dfbs) {
@@ -305,7 +346,8 @@ DFBTable VerifyDFBTable(const ffi::Array<DFBDescriptor> &dfbs,
           label + " must have distinct SPSC producer and consumer slots");
     VerifyDomain(dfb->producer_domain, launch_grid, label + " producer_domain");
     VerifyDomain(dfb->consumer_domain, launch_grid, label + " consumer_domain");
-    Check(dfb->source_span.defined(), label + " has no source_span");
+    Check(!require_span || dfb->source_span.defined(),
+          label + " has no source_span");
   }
   return table;
 }
@@ -714,7 +756,7 @@ void VerifyFunctionABI(const tirx::PrimFunc &func, const std::string &symbol,
 void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
                      const CoreCoord &launch_grid, const TensorTable &tensors,
                      const Phase2AddPlan *phase2_plan, bool general = false,
-                     bool multicore = false) {
+                     bool multicore = false, bool require_span = true) {
   std::unordered_set<std::string> slots;
   std::unordered_set<std::string> symbols;
   std::unordered_set<std::string> kernel_ids;
@@ -807,7 +849,7 @@ void VerifyFunctions(const IRModule &mod, const ffi::String &target_arch,
           "PrimFunc `" + symbol + "` has no logical kernel kind");
     Check(!logical_kernel->role.empty(),
           "PrimFunc `" + symbol + "` has no logical kernel role");
-    Check(logical_kernel->source_span.defined(),
+    Check(!require_span || logical_kernel->source_span.defined(),
           "PrimFunc `" + symbol + "` logical kernel has no source_span");
 
     CoreDomain core_domain =
@@ -987,12 +1029,17 @@ ffi::Array<PrimExpr> LocalTransferShape(const ffi::Array<PrimExpr> &shape,
   return local;
 }
 
-void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
+using BoundVars = std::unordered_set<const VarNode *>;
+
+void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs,
+                          const BoundVars *bound_vars = nullptr) {
   Check(!call->args.empty(), "dfb_compute must have an output DFB");
   std::vector<DFBDescriptor> operands;
   std::unordered_set<int64_t> input_ids;
+  arith::Analyzer analyzer;
   for (size_t i = 0; i < call->args.size(); ++i) {
-    int64_t id = RequireStaticInteger(call->args[i], "dfb_compute resource ID");
+    int64_t id = RequireStaticInteger(analyzer.Simplify(call->args[i]),
+                                      "dfb_compute resource ID");
     Check(dfbs.count(id), "dfb_compute references missing DFB");
     operands.push_back(dfbs.at(id));
     if (i)
@@ -1022,17 +1069,23 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
       CheckedShapes(input_shapes_value.value(), "tt.input_shapes");
   Check(input_shapes.size() + 1 == operands.size(),
         "dfb_compute input shape count mismatch");
-  std::unordered_map<int64_t, ffi::Array<Integer>> maps_by_id;
+  auto access_ids_attr = call->annotations.Get("tt.access_ids");
+  if (access_ids_attr.has_value()) {
+    auto access_ids = access_ids_attr.value().as<ffi::Array<Integer>>();
+    Check(access_ids.has_value() && access_ids.value().size() == maps.size(),
+          "dfb_compute access_ids must cover every input access");
+    std::unordered_set<int64_t> unique_accesses;
+    for (const Integer &access_id : access_ids.value())
+      Check(access_id->value >= 0 &&
+                unique_accesses.insert(access_id->value).second,
+            "dfb_compute access_ids must be nonnegative and unique");
+  }
   for (size_t i = 0; i < maps.size(); ++i) {
     auto input_shape = input_shapes[i];
     VerifyTileGrid(input_shape, operands[i + 1]->block_shape_in_tiles,
                    "dfb_compute input");
     Check(maps[i].size() == input_shape.size(),
           "dfb_compute access map rank disagrees with input");
-    auto [previous, inserted] =
-        maps_by_id.emplace(operands[i + 1]->dfb_id, maps[i]);
-    Check(inserted || ffi::StructuralEqual()(previous->second, maps[i]),
-          "one DFB input has conflicting access maps");
     if (kind == "elementwise" || kind == "typecast" || kind == "fill") {
       std::unordered_set<int64_t> mapped;
       for (size_t axis = 0; axis < maps[i].size(); ++axis) {
@@ -1062,18 +1115,23 @@ void VerifyGeneralCompute(const Call &call, const DFBTable &dfbs) {
           "dfb_compute expression dtype disagrees with output");
     std::unordered_set<int64_t> used;
     PostOrderVisit(expression.value(), [&](const ffi::ObjectRef &object) {
-      Check(!object.as<BufferLoadNode>() && !object.as<VarNode>(),
+      const auto *variable = object.as<VarNode>();
+      bool bound_variable =
+          variable && bound_vars && bound_vars->count(variable);
+      Check(!object.as<BufferLoadNode>() &&
+                (!variable || bound_variable),
             "Device expression retains BufferLoad or free scalar Var");
       if (auto expr = object.as<PrimExpr>()) {
         bool boolean_node =
             object.as<EQNode>() || object.as<NENode>() || object.as<LTNode>() ||
             object.as<LENode>() || object.as<GTNode>() || object.as<GENode>() ||
             object.as<AndNode>() || object.as<OrNode>() || object.as<NotNode>();
-        Check(object.as<IntImmNode>() ||
+        Check(bound_variable || object.as<IntImmNode>() ||
                   SupportedComputeDType(expr.value().dtype()) ||
                   (boolean_node && expr.value().dtype() == DataType::Bool()),
               "Device expression has unsupported intermediate dtype");
-        Check(object.as<IntImmNode>() || object.as<FloatImmNode>() ||
+        Check(bound_variable || object.as<IntImmNode>() ||
+                  object.as<FloatImmNode>() ||
                   object.as<CastNode>() || object.as<CallNode>() ||
                   object.as<AddNode>() || object.as<SubNode>() ||
                   object.as<MulNode>() || object.as<DivNode>() ||
@@ -1258,7 +1316,18 @@ using ComputeValueTable = std::map<int64_t, ComputeValueDescriptor>;
 
 void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
                            const ComputeValueTable &values,
-                           const std::set<int64_t> &defined) {
+                           const std::set<int64_t> &defined,
+                           const BoundVars *bound_vars = nullptr,
+                           int64_t core_x = -1, int64_t core_y = -1) {
+  arith::Analyzer analyzer;
+  auto static_integer = [&](const PrimExpr &value, const char *label) {
+    PrimExpr bound = value;
+    if (core_x >= 0 && core_y >= 0) {
+      CoreCoordinateSubstituter bind_core(core_x, core_y);
+      bound = bind_core.VisitExpr(bound);
+    }
+    return RequireStaticInteger(analyzer.Simplify(bound), label);
+  };
   bool local_output = call->op.same_as(compute_value());
   ffi::String compute_kind = ComputeString(call, "tt.compute_kind");
   bool scalar_expression = compute_kind == "elementwise" ||
@@ -1274,7 +1343,7 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
   DFBTable proof;
   std::set<int64_t> dfb_inputs;
   for (size_t i = local_output ? 1 : 0; i < call->args.size(); ++i) {
-    int64_t id = RequireStaticInteger(call->args[i], "compute DFB operand");
+    int64_t id = static_integer(call->args[i], "compute DFB operand");
     Check(dfbs.count(id), "dfb_compute references missing DFB");
     proof.emplace(id, dfbs.at(id));
     if (i)
@@ -1282,14 +1351,13 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
   }
   std::set<int64_t> required_values;
   if (local_output)
-    required_values.insert(
-        RequireStaticInteger(call->args[0], "compute output ID"));
+    required_values.insert(static_integer(call->args[0], "compute output ID"));
   auto declared_inputs = call->annotations.Get("tt.value_inputs");
   if (declared_inputs.has_value()) {
-    auto inputs = declared_inputs.value().as<ffi::Array<Integer>>();
+    auto inputs = declared_inputs.value().as<ffi::Array<PrimExpr>>();
     Check(inputs.has_value(), "invalid tt.value_inputs");
-    for (const Integer &id : inputs.value())
-      required_values.insert(id->value);
+    for (const PrimExpr &id : inputs.value())
+      required_values.insert(static_integer(id, "compute value input ID"));
   }
   int64_t next = 0;
   for (const auto &[id, ignored] : proof) {
@@ -1317,7 +1385,7 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
   }
   ffi::Array<PrimExpr> args = call->args;
   if (local_output) {
-    int64_t id = RequireStaticInteger(args[0], "compute output ID");
+    int64_t id = static_integer(args[0], "compute output ID");
     Check(values.count(id), "compute value references missing descriptor");
     args.Set(0, Integer(virtual_ids.at(id)));
   }
@@ -1327,13 +1395,13 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
   auto shapes_attr = attrs.Get("tt.value_input_shapes");
   if (!local_output && !input_attr.has_value() && !maps_attr.has_value() &&
       !shapes_attr.has_value()) {
-    VerifyGeneralCompute(call, dfbs);
+    VerifyGeneralCompute(call, dfbs, bound_vars);
     return;
   }
   Check(input_attr.has_value() && maps_attr.has_value() &&
             shapes_attr.has_value(),
         "v7 expression missing compute value input metadata");
-  auto inputs = input_attr.value().as<ffi::Array<Integer>>();
+  auto inputs = input_attr.value().as<ffi::Array<PrimExpr>>();
   Check(inputs.has_value(), "invalid tt.value_inputs");
   auto maps = CheckedMaps(maps_attr.value());
   auto shapes = CheckedShapes(shapes_attr.value(), "tt.value_input_shapes");
@@ -1344,10 +1412,10 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
       CheckedShapes(attrs.at("tt.input_shapes"), "tt.input_shapes");
   std::set<int64_t> declared;
   for (size_t i = 0; i < inputs.value().size(); ++i) {
-    int64_t id = inputs.value()[i]->value;
+    int64_t id = static_integer(inputs.value()[i], "compute value input ID");
     Check(values.count(id) && defined.count(id),
           "compute value use is not dominated by its definition");
-    Check(declared.insert(id).second, "duplicate compute value input");
+    declared.insert(id);
     Check(ffi::StructuralEqual()(values.at(id)->buffer->shape, shapes[i]),
           "compute value input shape disagrees with definition");
     args.push_back(Integer(virtual_ids.at(id)));
@@ -1403,27 +1471,49 @@ void VerifyValueExpression(const Call &call, const DFBTable &dfbs,
     attrs.Set("tt.expression", rewrite(expr.value()));
   }
   VerifyGeneralCompute(
-      Call(call->dtype, dfb_compute(), args, attrs, call->span), proof);
+      Call(call->dtype, dfb_compute(), args, attrs, call->span), proof,
+      bound_vars);
 }
 
 class ComputeValueVerifier {
 public:
   explicit ComputeValueVerifier(const IRModule &mod) {
+    current_device_ =
+        mod->GetAttr<ffi::String>("tt.ir_stage").value_or("") == "device";
     int64_t version =
-        RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr)->value;
+        mod->GetAttr<Integer>(kDeviceIRVersionAttr).value_or(Integer(0))->value;
     precision_regions_ = version == 8;
-    if (version != 7 && version != 8)
+    if (!current_device_ && version != 7 && version != 8)
+      return;
+    if (current_device_ && !mod->attrs->dict.count(kComputeValueTableAttr))
       return;
     enabled_ = true;
+    if (current_device_ && mod->attrs->dict.count(kPipelineRelationsAttr)) {
+      auto relations =
+          RequireModuleAttr<ffi::Map<ffi::String, ffi::Array<Integer>>>(
+              mod, kPipelineRelationsAttr);
+      std::unordered_map<std::string, int64_t> canonical_ids;
+      for (const DFBDescriptor &dfb :
+           RequireModuleAttr<ffi::Array<DFBDescriptor>>(mod, kDFBTableAttr))
+        canonical_ids.emplace(std::to_string(dfb->dfb_id), dfb->dfb_id);
+      for (const auto &[key, relation] : relations) {
+        Check(relation.size() == 2,
+              "current Device pipeline relation must be [iteration, stage]");
+        auto id = canonical_ids.find(std::string(key));
+        Check(id != canonical_ids.end(),
+              "current Device pipeline relation requires a canonical decimal DFB key");
+        pipeline_iterations_.emplace(id->second, relation[0]->value);
+      }
+    }
     auto entries = RequireModuleAttr<ffi::Array<ComputeValueDescriptor>>(
         mod, kComputeValueTableAttr);
     Check(!entries.empty(), "v7 requires a nonempty compute value table");
-    std::unordered_map<Var, ComputeValueDescriptor, ffi::ObjectPtrHash,
-                       ffi::ObjectPtrEqual>
-        previous;
+    using ValueInstanceKey = std::tuple<const VarNode *, int64_t, int64_t>;
+    std::map<ValueInstanceKey, ComputeValueDescriptor> previous;
     for (const ComputeValueDescriptor &entry : entries) {
       Check(entry.defined() && entry->value_id >= 0 &&
-                entry->buffer.defined() && entry->source_span.defined(),
+                entry->buffer.defined() &&
+                (current_device_ || entry->source_span.defined()),
             "invalid compute value descriptor");
       Check(values_.emplace(entry->value_id, entry).second,
             "duplicate compute value ID");
@@ -1437,14 +1527,17 @@ public:
               "compute value shape must be positive and tile-aligned or "
               "singleton");
       }
-      auto old = previous.find(entry->buffer->data);
+      int64_t core_x = current_device_ ? entry->core_domain->begin->x : -1;
+      int64_t core_y = current_device_ ? entry->core_domain->begin->y : -1;
+      ValueInstanceKey instance{entry->buffer->data.get(), core_x, core_y};
+      auto old = previous.find(instance);
       Check(old == previous.end()
                 ? entry->version == 0 && entry->previous_value_id == -1
                 : entry->buffer.same_as(old->second->buffer) &&
                       entry->version == old->second->version + 1 &&
                       entry->previous_value_id == old->second->value_id,
             "compute value Buffer/version predecessor chain is invalid");
-      previous[entry->buffer->data] = entry;
+      previous[instance] = entry;
       Check(entry->accumulator_id >= -1,
             "invalid compute value accumulator ID");
     }
@@ -1461,7 +1554,8 @@ public:
                       "local.fragment" &&
                   entry->accumulator_region->buffer->dtype ==
                       entry->accumulation_dtype &&
-                  entry->full_k_tiles > 0 && entry->source_span.defined() &&
+                  entry->full_k_tiles > 0 &&
+                  (current_device_ || entry->source_span.defined()) &&
                   IsSupportedAccumulatorDTypeTriple(entry->input_dtype,
                                                     entry->accumulation_dtype,
                                                     entry->output_dtype),
@@ -1485,42 +1579,70 @@ public:
       Check(entry->accumulator_id == -1 ||
                 accumulators_.count(entry->accumulator_id),
             "compute value references missing accumulator descriptor");
-    // Ownership is derived from definitions, not inferred from descriptor
-    // table order or the current traversal order of the Module's functions.
-    for (const auto &[global, base] : mod->functions) {
-      PrimFunc function = Downcast<PrimFunc>(base);
-      PostOrderVisit(function->body, [&](const ffi::ObjectRef &object) {
-        const auto *call = object.as<CallNode>();
-        if (!call || !(call->op.same_as(compute_value()) ||
-                       call->op.same_as(compute_value_gemm())))
-          return;
-        Check(!call->args.empty(), "compute value missing output ID");
-        int64_t id = RequireStaticInteger(call->args[0], "compute value ID");
-        Check(values_.count(id), "compute value definition missing descriptor");
-        Check(owners_.emplace(id, function).second,
-              "compute value definition missing or duplicated");
-        Check(function->GetAttr<ffi::String>(kKernelSlotAttr).value_or("") ==
-                  "trisc",
-              "compute values cannot cross processor slots");
-        int64_t accumulator = values_.at(id)->accumulator_id;
-        if (accumulator >= 0) {
-          auto [owner, inserted] =
-              accumulator_owners_.emplace(accumulator, function);
-          Check(inserted || owner->second.same_as(function),
-                "compute value accumulator crosses Core ownership");
-        }
-      });
-    }
-    for (const auto &[id, entry] : values_) {
-      if (entry->previous_value_id >= 0 && owners_.count(id) &&
-          owners_.count(entry->previous_value_id))
-        Check(owners_.at(id).same_as(owners_.at(entry->previous_value_id)),
-              "compute value predecessor crosses Core ownership");
+    if (!current_device_) {
+      // Legacy specialized functions bind ownership directly from their
+      // concrete value definitions. Current shared functions bind it while
+      // enumerating each family instance in EnterCoreInstance.
+      for (const auto &[global, base] : mod->functions) {
+        PrimFunc function = Downcast<PrimFunc>(base);
+        PostOrderVisit(function->body, [&](const ffi::ObjectRef &object) {
+          const auto *call = object.as<CallNode>();
+          if (!call || !(call->op.same_as(compute_value()) ||
+                         call->op.same_as(compute_value_gemm())))
+            return;
+          Check(!call->args.empty(), "compute value missing output ID");
+          int64_t id = RequireStaticInteger(call->args[0], "compute value ID");
+          Check(values_.count(id),
+                "compute value definition missing descriptor");
+          Check(owners_.emplace(id, function).second,
+                "compute value definition missing or duplicated");
+          Check(function->GetAttr<ffi::String>(kKernelSlotAttr).value_or("") ==
+                    "trisc",
+                "compute values cannot cross processor slots");
+          int64_t accumulator = values_.at(id)->accumulator_id;
+          if (accumulator >= 0) {
+            auto [owner, inserted] =
+                accumulator_owners_.emplace(accumulator, function);
+            Check(inserted || owner->second.same_as(function),
+                  "compute value accumulator crosses Core ownership");
+          }
+        });
+      }
+      for (const auto &[id, entry] : values_) {
+        if (entry->previous_value_id >= 0 && owners_.count(id) &&
+            owners_.count(entry->previous_value_id))
+          Check(owners_.at(id).same_as(owners_.at(entry->previous_value_id)),
+                "compute value predecessor crosses Core ownership");
+      }
     }
   }
   void BindFunction(const PrimFunc &function) {
     function_ = function;
     precision_epoch_ = 0;
+    bound_loop_vars_.clear();
+    PostOrderVisit(function->body, [&](const ffi::ObjectRef &object) {
+      if (const auto *loop = object.as<ForNode>())
+        bound_loop_vars_.insert(loop->loop_var.get());
+    });
+  }
+  void EnterCoreInstance(int64_t x, int64_t y) {
+    precision_epoch_ = 0;
+    stored_values_.clear();
+    dfb_roots_.clear();
+    current_core_x_ = x;
+    current_core_y_ = y;
+    for (const auto &[id, value] : values_) {
+      const CoreDomain &domain = value->core_domain;
+      if (x >= domain->begin->x && x < domain->end->x &&
+          y >= domain->begin->y && y < domain->end->y)
+        owners_[id] = function_;
+    }
+    for (const auto &[id, accumulator] : accumulators_) {
+      const CoreDomain &domain = accumulator->core_domain;
+      if (x >= domain->begin->x && x < domain->end->x &&
+          y >= domain->begin->y && y < domain->end->y)
+        accumulator_owners_[id] = function_;
+    }
   }
   void Precision(const Call &call) {
     Check(
@@ -1538,6 +1660,15 @@ public:
     Check(owners_.count(id) && owners_.at(id).same_as(function_),
           "compute value " + std::to_string(id) +
               " crosses Core or processor ownership");
+    if (current_device_) {
+      CoreDomain domain = values_.at(id)->core_domain;
+      Check(current_core_x_ >= domain->begin->x &&
+                current_core_x_ < domain->end->x &&
+                current_core_y_ >= domain->begin->y &&
+                current_core_y_ < domain->end->y,
+            "compute value " + std::to_string(id) +
+                " crosses Core or processor ownership");
+    }
   }
   bool Enabled() const { return enabled_; }
   const ComputeValueTable &Values() const { return values_; }
@@ -1551,27 +1682,37 @@ public:
     return values_.at(id);
   }
   std::set<int64_t> Expression(const Call &call, const DFBTable &dfbs) {
+    arith::Analyzer analyzer;
+    auto static_integer = [&](const PrimExpr &value, const char *label) {
+      CoreCoordinateSubstituter bind_core(current_core_x_, current_core_y_);
+      return RequireStaticInteger(
+          analyzer.Simplify(bind_core.VisitExpr(value)), label);
+    };
     std::set<int64_t> sources;
     for (size_t i = 1; i < call->args.size(); ++i)
-      sources.insert(
-          RequireStaticInteger(call->args[i], "expression DFB input"));
+      sources.insert(static_integer(call->args[i], "expression DFB input"));
     auto value_inputs = call->annotations.Get("tt.value_inputs");
     if (value_inputs.has_value()) {
-      auto ids = value_inputs.value().as<ffi::Array<Integer>>();
+      auto ids = value_inputs.value().as<ffi::Array<PrimExpr>>();
       Check(ids.has_value(), "invalid tt.value_inputs");
-      for (const Integer &id : ids.value())
-        CheckOwner(id->value);
+      for (const PrimExpr &id : ids.value())
+        CheckOwner(RequireStaticInteger(arith::Analyzer().Simplify(id),
+                                        "compute value input ID"));
     }
-    VerifyValueExpression(call, dfbs, values_, defined_);
+    VerifyValueExpression(call, dfbs, values_, defined_, &bound_loop_vars_,
+                          current_core_x_, current_core_y_);
     std::set<int64_t> roots;
     std::map<int64_t, int64_t> completed_k;
     auto inputs = call->annotations.Get("tt.value_inputs");
     if (inputs.has_value()) {
-      for (const Integer &id : Downcast<ffi::Array<Integer>>(inputs.value())) {
-        Read(id->value);
-        const auto &borrowed = sources_.at(id->value);
+      for (const PrimExpr &id_expr :
+           Downcast<ffi::Array<PrimExpr>>(inputs.value())) {
+        int64_t id = RequireStaticInteger(arith::Analyzer().Simplify(id_expr),
+                                          "compute value input ID");
+        Read(id);
+        const auto &borrowed = sources_.at(id);
         sources.insert(borrowed.begin(), borrowed.end());
-        for (const auto &[root, count] : value_k_.at(id->value)) {
+        for (const auto &[root, count] : value_k_.at(id)) {
           roots.insert(root);
           auto [it, inserted] = completed_k.emplace(root, count);
           if (!inserted)
@@ -1583,8 +1724,7 @@ public:
       }
     }
     for (size_t i = 1; i < call->args.size(); ++i) {
-      int64_t input =
-          RequireStaticInteger(call->args[i], "DFB provenance input");
+      int64_t input = static_integer(call->args[i], "DFB provenance input");
       auto found = dfb_roots_.find(input);
       if (found != dfb_roots_.end()) {
         for (int64_t root : found->second) {
@@ -1594,7 +1734,7 @@ public:
       }
     }
     if (call->op.same_as(compute_value())) {
-      int64_t id = RequireStaticInteger(call->args[0], "compute value output");
+      int64_t id = static_integer(call->args[0], "compute value output");
       const auto &entry = values_.at(id);
       if (roots.empty() && entry->accumulator_id >= 0) {
         auto acc = accumulators_.at(entry->accumulator_id);
@@ -1630,13 +1770,16 @@ public:
              entry->accumulator_id == previous->accumulator_id)) {
           bool reads_previous = false;
           if (inputs.has_value())
-            for (const Integer &input :
-                 Downcast<ffi::Array<Integer>>(inputs.value()))
-              reads_previous |= input->value == entry->previous_value_id;
+            for (const PrimExpr &input :
+                 Downcast<ffi::Array<PrimExpr>>(inputs.value()))
+              reads_previous |=
+                  RequireStaticInteger(arith::Analyzer().Simplify(input),
+                                       "compute value input ID") ==
+                  entry->previous_value_id;
           // Reentry is an identity load of the exact preceding version's
           // completed snapshot, never an untyped relabeling across DST modes.
           if (precision_regions_ && call->args.size() == 2) {
-            int64_t source = RequireStaticInteger(call->args[1], "reentry DFB");
+            int64_t source = static_integer(call->args[1], "reentry DFB");
             auto expression = call->annotations.Get("tt.expression");
             const auto *load = expression.has_value()
                                    ? expression.value().as<CallNode>()
@@ -1645,7 +1788,7 @@ public:
                 stored_values_.count(source) &&
                 stored_values_.at(source) == entry->previous_value_id && load &&
                 load->op.same_as(dfb_load()) && load->args.size() == 1 &&
-                RequireStaticInteger(load->args[0], "reentry DFB") == source;
+                static_integer(load->args[0], "reentry DFB") == source;
           }
           Check(
               reads_previous,
@@ -1657,8 +1800,17 @@ public:
       Define(id);
     }
     if (!call->op.same_as(compute_value())) {
-      dfb_roots_[RequireStaticInteger(call->args[0], "DFB provenance output")] =
-          roots;
+      int64_t output = static_integer(call->args[0], "DFB provenance output");
+      auto occurrence = pipeline_iterations_.find(output);
+      if (occurrence != pipeline_iterations_.end() && occurrence->second >= 0)
+        for (int64_t source : sources) {
+          auto input = pipeline_iterations_.find(source);
+          Check(input == pipeline_iterations_.end() ||
+                    input->second == -1 ||
+                    input->second == occurrence->second,
+                "compute value crosses pipeline iterations after release");
+        }
+      dfb_roots_[output] = roots;
     }
     return sources;
   }
@@ -1677,8 +1829,10 @@ public:
   std::set<int64_t> Gemm(const Call &call, const DFBTable &dfbs) {
     Check(call->args.size() == 6 && call->annotations.empty(),
           "compute_value_gemm requires six IDs/flags without annotations");
+    arith::Analyzer analyzer;
     auto integer = [&](size_t i) {
-      return RequireStaticInteger(call->args[i], "value GEMM operand");
+      return RequireStaticInteger(analyzer.Simplify(call->args[i]),
+                                  "value GEMM operand");
     };
     int64_t out = integer(0), lhs = integer(1), rhs = integer(2),
             old = integer(3);
@@ -1733,9 +1887,11 @@ public:
     Check(
         call->args.size() == 2 && call->annotations.empty(),
         "compute_value_store requires a value and DFB ID without annotations");
-    auto value =
-        Read(RequireStaticInteger(call->args[0], "stored compute value"));
-    int64_t id = RequireStaticInteger(call->args[1], "materialization DFB");
+    arith::Analyzer analyzer;
+    auto value = Read(RequireStaticInteger(analyzer.Simplify(call->args[0]),
+                                           "stored compute value"));
+    int64_t id = RequireStaticInteger(analyzer.Simplify(call->args[1]),
+                                      "materialization DFB");
     Check(dfbs.count(id), "compute value store references missing DFB");
     Check(value->buffer->dtype == dfbs.at(id)->element_dtype,
           "compute value materialization must preserve dtype");
@@ -1772,6 +1928,9 @@ public:
 
 private:
   bool enabled_{false};
+  bool current_device_{false};
+  int64_t current_core_x_{-1};
+  int64_t current_core_y_{-1};
   bool precision_regions_{false};
   int64_t precision_epoch_{0};
   std::map<int64_t, int64_t> value_epochs_;
@@ -1787,6 +1946,8 @@ private:
   std::map<int64_t, std::map<int64_t, int64_t>> value_k_;
   std::map<int64_t, std::set<int64_t>> sources_;
   std::map<int64_t, std::set<int64_t>> dfb_roots_;
+  std::map<int64_t, int64_t> pipeline_iterations_;
+  BoundVars bound_loop_vars_;
 };
 
 // Schema v3 preserves immutable DFB generations while assigning generations
@@ -2518,6 +2679,239 @@ void VerifyGeneralProgram(const IRModule &mod, const TensorTable &tensors,
 // Edges describe logical completion/readiness, not a claim about a NoC runtime.
 using CoreKey = std::pair<int64_t, int64_t>;
 
+struct CurrentStoragePlan {
+  std::map<int64_t, DFBStorageGroupDescriptor> groups;
+  std::map<int64_t, int64_t> resource_groups;
+  std::map<int64_t, int64_t> resource_ordinals;
+  std::map<int64_t, int64_t> resource_pipeline_iterations;
+  std::map<int64_t, std::map<int64_t, int64_t>> ordered_resources;
+};
+
+CurrentStoragePlan VerifyCurrentStoragePlan(const IRModule &mod,
+                                            const TensorTable &tensors,
+                                            const CoreCoord &launch_grid) {
+  Check(!mod->attrs->dict.count(kInternalDFBStorageGroupsAttr) &&
+            !mod->attrs->dict.count(kInternalDFBTransactionRelationsAttr) &&
+            !mod->attrs->dict.count(kPipelineRelationsAttr),
+        "current Device IR cannot persist concrete storage-group maps");
+  auto families = RequireModuleAttr<ffi::Array<DeviceIRDescriptorFamily>>(
+      mod, kDFBFamiliesAttr);
+  auto groups = RequireModuleAttr<ffi::Array<DFBStorageGroupDescriptor>>(
+      mod, kDFBStorageGroupsAttr);
+  auto relations = RequireModuleAttr<ffi::Array<DFBStorageGroupRelation>>(
+      mod, kDFBStorageGroupRelationsAttr);
+  Check(relations.size() == families.size() &&
+            groups.empty() == families.empty(),
+        "current Device IR requires one storage relation per DFB family");
+
+  CurrentStoragePlan result;
+  auto pipeline_stages = mod->GetAttr<Integer>(kPipelineStagesAttr);
+  auto pipeline_extent = mod->GetAttr<Integer>(kPipelineExtentAttr);
+  Check(pipeline_stages.has_value() == pipeline_extent.has_value(),
+        "pipeline stages and extent must be provided together");
+  int64_t pipeline_depth =
+      pipeline_stages.has_value()
+          ? std::min(pipeline_stages.value()->value,
+                     pipeline_extent.value()->value)
+          : 0;
+  for (size_t index = 0; index < groups.size(); ++index) {
+    const DFBStorageGroupDescriptor &group = groups[index];
+    Check(group.defined() &&
+              group->storage_group_id == static_cast<int64_t>(index),
+          "storage group IDs must be dense and deterministic");
+    Check(!group->element_dtype.is_void(),
+          "storage group has a void element dtype");
+    VerifyPositiveShape(group->tile_shape, "storage group tile shape");
+    VerifyPositiveShape(group->block_shape_in_tiles,
+                        "storage group block shape");
+    int64_t capacity =
+        RequireStaticInteger(group->block_count, "storage group capacity");
+    Check(capacity >= 1 && capacity <= 32,
+          "storage group capacity must be in [1,32]");
+    Check(IsSupportedSlot(group->producer_slot) &&
+              IsSupportedSlot(group->consumer_slot),
+          "storage group has an invalid producer or consumer slot");
+    VerifyDomain(group->producer_domain, launch_grid,
+                 "storage group producer domain");
+    VerifyDomain(group->consumer_domain, launch_grid,
+                 "storage group consumer domain");
+    if (group->storage_backing.has_value()) {
+      const TensorStorageBacking &backing = group->storage_backing.value();
+      Check(tensors.count(backing->global_arg_index),
+            "storage backing references a missing Tensor");
+      int64_t offset = RequireStaticInteger(backing->byte_offset,
+                                            "storage backing byte offset");
+      int64_t size = RequireStaticInteger(backing->byte_size,
+                                          "storage backing byte size");
+      Check(offset >= 0 && size > 0,
+            "storage backing byte range must be positive");
+      int64_t expected = capacity;
+      for (const PrimExpr &extent : group->tile_shape)
+        expected = CheckedProduct(expected,
+                                  RequireStaticInteger(extent, "tile extent"),
+                                  "storage backing byte size");
+      for (const PrimExpr &extent : group->block_shape_in_tiles)
+        expected = CheckedProduct(expected,
+                                  RequireStaticInteger(extent, "block extent"),
+                                  "storage backing byte size");
+      expected = CheckedProduct(expected, group->element_dtype.bytes(),
+                                "storage backing byte size");
+      Check(size == expected,
+            "storage backing byte size must equal the complete DFB capacity");
+    }
+    result.groups.emplace(group->storage_group_id, group);
+  }
+
+  for (size_t family_id = 0; family_id < families.size(); ++family_id) {
+    const DeviceIRDescriptorFamily &family = families[family_id];
+    const DFBStorageGroupRelation &relation = relations[family_id];
+    Check(relation.defined() &&
+              relation->dfb_family_id == static_cast<int64_t>(family_id) &&
+              family.defined() && family->positions.defined() &&
+              family->fields.count("dfb_id"),
+          "storage relation does not match its DFB family");
+    int64_t count = family->positions->count;
+    std::vector<int64_t> ids = ExpandDeviceIntColumn(
+        family->fields.at("dfb_id"), count);
+    std::vector<int64_t> group_ids =
+        ExpandDeviceIntColumn(relation->storage_group_ids, count);
+    std::vector<int64_t> ordinals =
+        ExpandDeviceIntColumn(relation->transaction_ordinals, count);
+    std::vector<int64_t> pipeline_iterations =
+        ExpandDeviceIntColumn(relation->pipeline_iterations, count);
+    auto prototype = family->prototype.as<DFBDescriptor>();
+    Check(prototype.has_value(), "DFB family has the wrong prototype type");
+    for (int64_t row = 0; row < count; ++row) {
+      int64_t id = ids[row], group_id = group_ids[row], ordinal = ordinals[row];
+      int64_t pipeline_iteration = pipeline_iterations[row];
+      Check(id >= 0 && result.groups.count(group_id) && ordinal >= 0,
+            "storage relation contains an invalid ID or ordinal");
+      Check(result.resource_groups.emplace(id, group_id).second &&
+                result.resource_ordinals.emplace(id, ordinal).second &&
+                result.resource_pipeline_iterations
+                    .emplace(id, pipeline_iteration)
+                    .second &&
+                result.ordered_resources[group_id].emplace(ordinal, id).second,
+            "storage relation has duplicate DFB identities or ordinals");
+      Check((pipeline_depth == 0 && pipeline_iteration == -1) ||
+                (pipeline_depth > 0 &&
+                 (pipeline_iteration == -1 ||
+                  (pipeline_iteration >= 0 &&
+                   pipeline_iteration < pipeline_extent.value()->value &&
+                   pipeline_iteration == ordinal))),
+            "storage relation has an invalid pipeline iteration");
+      const DFBStorageGroupDescriptor &group = result.groups.at(group_id);
+      const DFBDescriptor &dfb = prototype.value();
+      Check(group->element_dtype == dfb->element_dtype &&
+                ffi::StructuralEqual()(group->tile_shape, dfb->tile_shape) &&
+                ffi::StructuralEqual()(group->block_shape_in_tiles,
+                                       dfb->block_shape_in_tiles) &&
+                ffi::StructuralEqual()(group->block_count,
+                                       dfb->block_count) &&
+                group->producer_slot == dfb->producer_slot &&
+                ffi::StructuralEqual()(group->producer_domain,
+                                       dfb->producer_domain) &&
+                group->consumer_slot == dfb->consumer_slot &&
+                ffi::StructuralEqual()(group->consumer_domain,
+                                       dfb->consumer_domain),
+            "DFB family and storage group contracts disagree");
+    }
+  }
+  Check(result.resource_groups.empty() == families.empty(),
+        "current Device IR has incomplete storage-group resource relations");
+  for (const auto &[group_id, resources] : result.ordered_resources) {
+    Check(!resources.empty() && resources.begin()->first == 0,
+          "storage-group transaction ordinals must start at zero");
+    int64_t expected = 0;
+    for (const auto &[ordinal, resource] : resources)
+      Check(ordinal == expected++,
+            "storage-group transaction ordinals must be dense");
+    if (pipeline_depth > 0) {
+      std::set<int64_t> iterations;
+      for (const auto &[ordinal, resource] : resources)
+        iterations.insert(result.resource_pipeline_iterations.at(resource));
+      bool singleton = iterations.count(-1);
+      Check((singleton && resources.size() == 1 && iterations.size() == 1) ||
+                (!singleton &&
+                 resources.size() ==
+                     static_cast<size_t>(pipeline_extent.value()->value) &&
+                 *iterations.begin() == 0 &&
+                 *iterations.rbegin() == pipeline_extent.value()->value - 1),
+            "DFB transaction count disagrees with pipeline group coverage");
+      if (!singleton)
+        Check(RequireStaticInteger(result.groups.at(group_id)->block_count,
+                                   "pipeline storage-group capacity") >=
+                  pipeline_depth,
+              "pipeline storage-group capacity insufficient");
+    }
+  }
+  return result;
+}
+
+void VerifyCurrentL1Budget(
+    const IRModule &mod, const DFBTable &dfbs,
+    const std::map<int64_t, std::set<CoreKey>> &resource_cores,
+    const CurrentStoragePlan &storage) {
+  if (mod->attrs->dict.count(kPipelineStagesAttr) ||
+      mod->attrs->dict.count(kPipelineExtentAttr) ||
+      mod->attrs->dict.count("tt.pipeline_wait_policy")) {
+    int64_t stages = RequireModuleAttr<Integer>(mod, kPipelineStagesAttr)->value;
+    int64_t extent = RequireModuleAttr<Integer>(mod, kPipelineExtentAttr)->value;
+    Check(stages > 0 && stages <= 32 && extent > 0 && extent <= 1024,
+          "current Device pipeline stages/extent are outside supported bounds");
+    auto wait_policy =
+        RequireModuleAttr<ffi::String>(mod, "tt.pipeline_wait_policy");
+    Check(wait_policy == "conservative" || wait_policy == "delayed",
+          "current Device pipeline wait policy is invalid");
+  }
+
+  std::map<CoreKey, int64_t> payload;
+  int64_t total_payload = 0;
+  for (const auto &[group_id, group] : storage.groups) {
+    std::set<CoreKey> cores;
+    for (const auto &[ordinal, id] : storage.ordered_resources.at(group_id)) {
+      Check(dfbs.count(id), "storage relation references a missing DFB");
+      auto uses = resource_cores.find(id);
+      Check(uses != resource_cores.end() && !uses->second.empty(),
+            "current Device DFB has no body use: " + std::to_string(id));
+      cores.insert(uses->second.begin(), uses->second.end());
+    }
+    const std::string label =
+        "current Device storage group " + std::to_string(group_id);
+    int64_t bytes =
+        RequireStaticInteger(group->block_count, label + " block_count");
+    for (const PrimExpr &value : group->tile_shape)
+      bytes = CheckedProduct(bytes, RequireStaticInteger(value, label), label);
+    for (const PrimExpr &value : group->block_shape_in_tiles)
+      bytes = CheckedProduct(bytes, RequireStaticInteger(value, label), label);
+    bytes = CheckedProduct(bytes, group->element_dtype.bytes(), label);
+    Check(total_payload <= std::numeric_limits<int64_t>::max() - bytes,
+          "current Device L1 payload byte sum overflows");
+    total_payload += bytes;
+    for (const CoreKey &core : cores) {
+      Check(payload[core] <= std::numeric_limits<int64_t>::max() - bytes,
+            "current Device per-Core L1 payload byte sum overflows");
+      payload[core] += bytes;
+    }
+  }
+  auto budget = mod->GetAttr<Integer>(kL1CapacityBytesAttr);
+  if (budget.has_value()) {
+    Check(budget.value()->value > 0, "tt.l1_capacity_bytes must be positive");
+    for (const auto &[core, bytes] : payload)
+      Check(bytes <= budget.value()->value,
+            "Core (" + std::to_string(core.first) + "," +
+                std::to_string(core.second) +
+                ") L1 logical payload lower bound " + std::to_string(bytes) +
+                " bytes exceeds explicit tt.l1_capacity_bytes budget " +
+                std::to_string(budget.value()->value) +
+                "; physical allocation overhead is not included");
+  }
+  auto reported = mod->GetAttr<Integer>("tt.l1_payload_bytes");
+  if (reported.has_value())
+    Check(reported.value()->value == total_payload,
+          "tt.l1_payload_bytes disagrees with current Device storage pools");
+}
+
 CoreKey CoreOf(const CoreDomain &domain) {
   Check(domain->end->x == domain->begin->x + 1 &&
             domain->end->y == domain->begin->y + 1,
@@ -3221,7 +3615,1214 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
   }
 }
 
+IRModule VerifyCurrentDeviceModule(IRModule mod) {
+  auto diagnostic_expansion =
+      mod->GetAttr<Integer>("tt.current_device_table_expansion");
+  if (diagnostic_expansion.has_value()) {
+    Check(diagnostic_expansion.value()->value == 1 &&
+              mod->attrs->dict.count("tt.expanded_storage_group_descriptors"),
+          "invalid current Device diagnostic expansion marker");
+    IRModule parameterized = ParameterizeCurrentDeviceTables(mod);
+    VerifyCurrentDeviceModule(std::move(parameterized));
+    return mod;
+  }
+  IRModule parameterized = mod;
+  ffi::String stage =
+      RequireModuleAttr<ffi::String>(parameterized, "tt.ir_stage");
+  Check(stage == "device", "current Device IR requires tt.ir_stage='device'");
+  Check(!parameterized->attrs->dict.count(kDeviceIRVersionAttr),
+        "current Device IR must not carry a legacy version discriminator");
+  ffi::String target_arch =
+      RequireModuleAttr<ffi::String>(parameterized, kTargetArchAttr);
+  Check(target_arch == "wormhole_b0" || target_arch == "blackhole",
+        "unsupported tt.target_arch `" + std::string(target_arch) + "`");
+  CoreCoord launch_grid =
+      RequireModuleAttr<CoreCoord>(parameterized, kLaunchGridAttr);
+  Check(launch_grid->x > 0 && launch_grid->y > 0 && launch_grid->x <= 256 &&
+            launch_grid->y <= 256 && launch_grid->x * launch_grid->y <= 256,
+        "shared-grid Device IR requires 1..256 static Cores");
+  OperationIdentity operation =
+      RequireModuleAttr<OperationIdentity>(parameterized,
+                                           kOperationIdentityAttr);
+  Check(!operation->operation_id.empty(),
+        "tt.operation_identity has an empty operation_id");
+  ffi::Array<TensorDescriptor> tensors =
+      RequireModuleAttr<ffi::Array<TensorDescriptor>>(parameterized,
+                                                      kTensorTableAttr);
+  TensorTable tensor_table =
+      VerifyTensorTable(tensors, launch_grid, true, false);
+  CurrentStoragePlan storage =
+      VerifyCurrentStoragePlan(parameterized, tensor_table, launch_grid);
+  mod = ExpandCurrentDeviceTables(mod);
+  ffi::Array<DFBDescriptor> dfbs =
+      RequireModuleAttr<ffi::Array<DFBDescriptor>>(mod, kDFBTableAttr);
+  ffi::Array<PipeDescriptor> transports =
+      RequireModuleAttr<ffi::Array<PipeDescriptor>>(mod, "tt.transport_table");
+  auto communication = mod->GetAttr<ffi::Array<CommunicationDescriptor>>(
+      "tt.communication_table");
+  auto steps = RequireModuleAttr<ffi::Array<CommunicationStepDescriptor>>(
+      mod, "tt.communication_step_table");
+  ffi::Array<ffi::String> order =
+      RequireModuleAttr<ffi::Array<ffi::String>>(mod, kKernelOrderAttr);
+  Check(order.size() == 3 && mod->functions.size() == 3,
+        "current Device IR must contain exactly three shared slot functions");
+  const std::array<std::string, 3> suffixes = {"_trisc", "_ncrisc", "_brisc"};
+  for (size_t i = 0; i < order.size(); ++i) {
+    std::string symbol = order[i];
+    Check(symbol.size() >= suffixes[i].size() &&
+              symbol.compare(symbol.size() - suffixes[i].size(),
+                             suffixes[i].size(), suffixes[i]) == 0,
+          "tt.kernel_order must use TRISC/NCRISC/BRISC symbol order");
+  }
+  DFBTable dfb_table =
+      VerifyDFBTable(dfbs, tensor_table, launch_grid, true, false);
+  auto accumulators = mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(
+      kAccumulatorTableAttr);
+  std::map<int64_t, AccumulatorDescriptor> current_accumulators;
+  if (accumulators.has_value())
+    for (const AccumulatorDescriptor &accumulator : accumulators.value()) {
+      Check(accumulator.defined() && accumulator->accumulator_id >= 0,
+            "invalid accumulator descriptor");
+      Check(current_accumulators
+                .emplace(accumulator->accumulator_id, accumulator)
+                .second,
+            "duplicate accumulator descriptor ID");
+      VerifyDomain(accumulator->core_domain, launch_grid,
+                   "accumulator core domain");
+    }
+  auto values = mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
+      kComputeValueTableAttr);
+  if (values.has_value())
+    for (const ComputeValueDescriptor &value : values.value()) {
+      Check(value.defined() && value->value_id >= 0 && value->buffer.defined() &&
+                value->value_kind == "compute_fragment" &&
+                value->owner_slot == "trisc" &&
+                value->dtype == value->buffer->dtype &&
+                ffi::StructuralEqual()(value->logical_shape,
+                                       value->buffer->shape) &&
+                value->compute_tile_shape.size() == 2,
+            "invalid compute-local value descriptor");
+      VerifyDomain(value->core_domain, launch_grid,
+                   "compute value core domain");
+    }
+  for (const PipeDescriptor &transport : transports) {
+    Check(transport.defined() && transport->pipe_net_id >= 0 &&
+              transport->event_index >= 0,
+          "transport descriptor has an invalid identity");
+    VerifyCoord(transport->src_coord, launch_grid, "transport source");
+    VerifyDomain(CoreDomain(transport->dst_begin, transport->dst_end),
+                 launch_grid, "transport destination");
+    Check((transport->contract == "point_to_point" ||
+           transport->contract == "collective") &&
+              dfb_table.count(transport->payload_dfb_id),
+          "transport descriptor has an invalid contract or payload DFB");
+  }
+  VerifyFunctions(mod, target_arch, launch_grid, tensor_table, nullptr,
+                  /*general=*/true, /*multicore=*/false,
+                  /*require_span=*/false);
+
+  std::unordered_set<std::string> ordered_symbols;
+  for (const ffi::String &symbol : order)
+    Check(ordered_symbols.insert(symbol).second,
+          "tt.kernel_order contains duplicate symbols");
+  std::unordered_set<std::string> actual_symbols;
+  struct LocalLifecycle {
+    bool reserved{false};
+    bool produced{false};
+    bool waited{false};
+    bool released{false};
+    ffi::String reserve_slot;
+    ffi::String producer_slot;
+    ffi::String consumer_slot;
+    int64_t last_use{-1};
+    int64_t release_order{-1};
+  };
+  using LocalKey = std::tuple<int64_t, int64_t, int64_t>;
+  using SlotKey = std::tuple<int64_t, int64_t, std::string>;
+  std::map<LocalKey, LocalLifecycle> lifecycles;
+  std::map<int64_t, std::set<CoreKey>> resource_cores;
+  std::map<LocalKey, int64_t> reservation_transactions;
+  std::map<LocalKey, int64_t> reserve_events;
+  std::map<LocalKey, int64_t> release_events;
+  std::map<LocalKey, ffi::Array<PrimExpr>> tensor_load_shapes;
+  std::map<LocalKey, std::pair<int64_t, bool>> copy_issues;
+  std::map<LocalKey, int64_t> copy_completions;
+  std::map<LocalKey, std::vector<int64_t>> forwarding_completions;
+  struct InputShapeUse {
+    LocalKey key;
+    ffi::Array<PrimExpr> shape;
+  };
+  std::vector<InputShapeUse> input_shape_uses;
+  std::map<LocalKey, int64_t> producer_events;
+  std::map<LocalKey, std::vector<int64_t>> wait_events;
+  std::map<SlotKey, int64_t> last_slot_event;
+  std::map<int64_t, int> accumulator_state;
+  std::map<int64_t, int64_t> accumulator_k_tiles;
+  std::vector<std::vector<int64_t>> event_successors;
+  ComputeValueVerifier compute_values(mod);
+  std::vector<std::pair<int64_t, DataType>> value_exports;
+  std::vector<int64_t> step_ref_counts(steps.size(), 0);
+  std::vector<int64_t> step_ref_dynamic_counts(steps.size(), 0);
+  std::function<void(const Stmt &, std::vector<Call> *, std::vector<int64_t> *,
+                     int64_t, int64_t, const ffi::Map<Var, PrimExpr> &, int64_t)>
+      collect_calls = [&](const Stmt &stmt, std::vector<Call> *calls,
+                          std::vector<int64_t> *multipliers, int64_t core_x,
+                          int64_t core_y,
+                          const ffi::Map<Var, PrimExpr> &bindings,
+                          int64_t multiplier) {
+        if (const auto *seq = stmt.as<SeqStmtNode>()) {
+          for (const Stmt &child : seq->seq)
+            collect_calls(child, calls, multipliers, core_x, core_y, bindings,
+                          multiplier);
+        } else if (const auto *loop = stmt.as<ForNode>()) {
+          if (std::string(loop->loop_var->name_hint).rfind("tt_compact_", 0) ==
+              0) {
+            int64_t minimum =
+                RequireStaticInteger(loop->min, "compact loop minimum");
+            int64_t extent =
+                RequireStaticInteger(loop->extent, "compact loop extent");
+            for (int64_t offset = 0; offset < extent; ++offset) {
+              PrimExpr iteration =
+                  make_const(loop->loop_var.dtype(), minimum + offset);
+              ffi::Map<Var, PrimExpr> nested = bindings;
+              nested.Set(loop->loop_var, iteration);
+              collect_calls(
+                  Substitute(loop->body, {{loop->loop_var, iteration}}), calls,
+                  multipliers, core_x, core_y, nested, multiplier);
+            }
+          } else {
+            int64_t extent =
+                RequireStaticInteger(loop->extent, "Device loop extent");
+            collect_calls(
+                loop->body, calls, multipliers, core_x, core_y, bindings,
+                CheckedProduct(multiplier, extent,
+                               "Device operation dynamic multiplicity"));
+          }
+        } else if (const auto *branch = stmt.as<IfThenElseNode>()) {
+          collect_calls(branch->then_case, calls, multipliers, core_x, core_y,
+                        bindings, multiplier);
+          if (branch->else_case.has_value())
+            collect_calls(branch->else_case.value(), calls, multipliers,
+                          core_x, core_y, bindings, multiplier);
+        } else if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+          collect_calls(realize->block->body, calls, multipliers, core_x,
+                        core_y, bindings, multiplier);
+        } else if (const auto *evaluate = stmt.as<EvaluateNode>()) {
+          if (const auto *call = evaluate->value.as<CallNode>()) {
+            CoreCoordinateSubstituter bind_core(core_x, core_y);
+            Call concrete =
+                Downcast<Call>(bind_core.VisitExpr(ffi::GetRef<Call>(call)));
+            auto annotations = concrete->annotations;
+            auto concretize = [&](const PrimExpr &expr) {
+              return arith::Analyzer().Simplify(
+                  bind_core.VisitExpr(Substitute(expr, bindings)));
+            };
+            auto value_inputs = annotations.Get("tt.value_inputs");
+            if (value_inputs.has_value()) {
+              ffi::Array<PrimExpr> rewritten;
+              for (const PrimExpr &value :
+                   Downcast<ffi::Array<PrimExpr>>(value_inputs.value()))
+                rewritten.push_back(concretize(value));
+              annotations.Set("tt.value_inputs", rewritten);
+            }
+            auto expression = annotations.Get("tt.expression");
+            if (expression.has_value())
+              annotations.Set("tt.expression",
+                              concretize(Downcast<PrimExpr>(expression.value())));
+            auto step_refs = annotations.Get("tt_communication_step_refs");
+            if (step_refs.has_value()) {
+              ffi::Array<PrimExpr> rewritten;
+              for (const PrimExpr &ref :
+                   Downcast<ffi::Array<PrimExpr>>(step_refs.value()))
+                rewritten.push_back(concretize(ref));
+              annotations.Set("tt_communication_step_refs", rewritten);
+            }
+            if (!ffi::StructuralEqual()(annotations, concrete->annotations))
+              concrete = Call(concrete->dtype, concrete->op, concrete->args,
+                              annotations, concrete->span);
+            PostOrderVisit(concrete,
+                           [&](const ffi::ObjectRef &object) {
+                             if (const auto *nested = object.as<CallNode>()) {
+                               calls->push_back(ffi::GetRef<Call>(nested));
+                               multipliers->push_back(multiplier);
+                             }
+                           });
+          }
+        }
+      };
+  for (const auto &[global, base] : mod->functions) {
+    PrimFunc func = Downcast<PrimFunc>(base);
+    compute_values.BindFunction(func);
+    BoundVars bound_loop_vars;
+    PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
+      if (const auto *loop = object.as<ForNode>())
+        bound_loop_vars.insert(loop->loop_var.get());
+    });
+    ffi::String symbol =
+        func->GetAttr<ffi::String>(tvm::attr::kGlobalSymbol).value();
+    actual_symbols.insert(symbol);
+    CoreDomain domain = func->GetAttr<CoreDomain>(kCoreDomainAttr).value();
+    Check(domain->begin->x == 0 && domain->begin->y == 0 &&
+              domain->end->x == launch_grid->x &&
+              domain->end->y == launch_grid->y,
+          "shared slot tt.core_domain must equal the complete launch grid");
+    PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
+      const auto *node = object.as<CallNode>();
+      if (!node)
+        return;
+      Call call = ffi::GetRef<Call>(node);
+      const auto *op = call->op.as<OpNode>();
+      std::string name = op ? std::string(op->name) : "";
+      Check(name != "tl.tt.transfer" && name != "tl.tt.all_gather" &&
+                name != "tl.tt.all_reduce" &&
+                name.rfind("tl.tt.pipe_", 0) != 0,
+            "Device body retains a frontend communication operation");
+      auto check_dfb = [&](size_t index) {
+        Check(index < call->args.size(), "Device operation DFB operand missing");
+        const PrimExpr &operand = call->args[index];
+        const int64_t *constant = as_const_int(operand);
+        if (!constant) {
+          Check(operand.dtype().is_int() && operand.dtype().lanes() == 1 &&
+                    SideEffect(operand) <= CallEffectKind::kPure,
+                "loop-carried Device DFB ID must be a pure scalar integer");
+          return;
+        }
+        int64_t id = *constant;
+        Check(dfb_table.count(id), "Device operation references missing DFB " +
+                                       std::to_string(id));
+      };
+      if (call->op.same_as(dfb_reserve()) || call->op.same_as(dfb_wait()) ||
+          call->op.same_as(dfb_release()) ||
+          call->op.same_as(dfb_copy_wait()) || call->op.same_as(dfb_load()))
+        check_dfb(0);
+      else if (call->op.same_as(tensor_to_dfb_nd()) ||
+               call->op.same_as(dfb_pipe_send()) ||
+               call->op.same_as(dfb_pipe_recv()) ||
+               call->op.same_as(dfb_pipe_wait()))
+        check_dfb(1);
+      else if (call->op.same_as(dfb_to_tensor_nd()) ||
+               call->op.same_as(accumulator_materialize()) ||
+               call->op.same_as(compute_value_store()))
+        check_dfb(call->op.same_as(dfb_to_tensor_nd()) ? 0 : 1);
+      else if (call->op.same_as(gemm_update())) {
+        check_dfb(0);
+        check_dfb(1);
+      } else if (call->op.same_as(dfb_local_copy()) ||
+                 call->op.same_as(dfb_gather_copy())) {
+        check_dfb(0);
+        check_dfb(1);
+      } else if (call->op.same_as(dfb_collective_reduce())) {
+        check_dfb(0);
+        check_dfb(1);
+        check_dfb(2);
+      }
+      if (call->op.same_as(tensor_to_dfb_nd()) ||
+          call->op.same_as(dfb_to_tensor_nd())) {
+        bool load = call->op.same_as(tensor_to_dfb_nd());
+        size_t tensor_operand = load ? 0 : 1;
+        size_t dfb_operand = load ? 1 : 0;
+        const PrimExpr &tensor_expr = call->args[tensor_operand];
+        const int64_t *static_tensor = as_const_int(tensor_expr);
+        const int64_t *static_dfb = as_const_int(call->args[dfb_operand]);
+        if (!static_tensor || !static_dfb) {
+          Check(tensor_expr.dtype().is_int() &&
+                    tensor_expr.dtype().lanes() == 1 &&
+                    SideEffect(tensor_expr) <= CallEffectKind::kPure,
+                "parameterized Tensor ABI index must be a pure scalar integer");
+          return;
+        }
+        int64_t tensor_id = *static_tensor;
+        int64_t dfb_id = *static_dfb;
+        Check(tensor_table.count(tensor_id) && dfb_table.count(dfb_id),
+              "Tensor transfer references missing Tensor/DFB");
+        const TensorDescriptor &tensor = tensor_table.at(tensor_id);
+        const DFBDescriptor &dfb = dfb_table.at(dfb_id);
+        Check(dfb->tensor_backing.has_value() &&
+                  dfb->tensor_backing.value()->global_arg_index == tensor_id,
+              "Tensor transfer disagrees with DFB Tensor backing");
+        Check(call->args.size() == 2 + 2 * tensor->shape.size(),
+              "Tensor transfer rank/arity mismatch");
+        Check(tensor->shape.size() >= dfb->block_shape_in_tiles.size(),
+              "Tensor transfer rank is smaller than DFB rank");
+        size_t leading =
+            tensor->shape.size() - dfb->block_shape_in_tiles.size();
+        for (size_t axis = 0; axis < leading; ++axis)
+          Check(is_one(call->args[3 + 2 * axis]),
+                "Tensor transfer may remove only leading singleton slice axes");
+        for (size_t axis = 0; axis < tensor->shape.size(); ++axis) {
+          const PrimExpr &start = call->args[2 + 2 * axis];
+          const PrimExpr &extent = call->args[3 + 2 * axis];
+          if (as_const_int(start) && as_const_int(extent) &&
+              as_const_int(tensor->shape[axis]))
+            Check(*as_const_int(start) >= 0 && *as_const_int(extent) > 0 &&
+                      *as_const_int(start) + *as_const_int(extent) <=
+                          *as_const_int(tensor->shape[axis]),
+                  "Tensor transfer slice is out of bounds");
+        }
+      }
+    });
+    bool compute =
+        func->GetAttr<ffi::String>(kKernelSlotAttr).value() == "trisc";
+    auto requirements =
+        func->GetAttr<ComputeRequirements>(kComputeRequirementsAttr);
+    Check(!compute || requirements.has_value(),
+          "shared TRISC is missing tt.compute_requirements");
+    Check(compute || !requirements.has_value(),
+          "data-movement slot carries tt.compute_requirements");
+    if (compute)
+      Check(ffi::StructuralEqual()(requirements.value(),
+                                   DeriveComputeRequirements(mod, func)),
+            "tt.compute_requirements disagrees with actual Device operations across shared TRISC Core paths");
+    auto work_domain = [&](const SBlock &block) {
+      auto domain = block->annotations.Get("tt.core_domain");
+      if (domain.has_value())
+        return Downcast<CoreDomain>(domain.value());
+      int64_t x =
+          Downcast<Integer>(block->annotations.at("tt.core_x"))->value;
+      int64_t y =
+          Downcast<Integer>(block->annotations.at("tt.core_y"))->value;
+      return CoreDomain(CoreCoord(x, y), CoreCoord(x + 1, y + 1));
+    };
+    std::set<CoreKey> dispatched_cores;
+    std::function<void(const Stmt &)> verify_dispatch = [&](const Stmt &stmt) {
+      if (const auto *sequence = stmt.as<SeqStmtNode>()) {
+        for (const Stmt &child : sequence->seq)
+          verify_dispatch(child);
+        return;
+      }
+      ffi::Optional<PrimExpr> predicate = std::nullopt;
+      Stmt work = stmt;
+      if (const auto *branch = stmt.as<IfThenElseNode>()) {
+        Check(!branch->else_case.has_value(),
+              "Core work dispatch must not have an else branch");
+        predicate = branch->condition;
+        work = branch->then_case;
+      }
+      const auto *realize = work.as<SBlockRealizeNode>();
+      if (!realize) {
+        Check(IsCanonicalNoOp(work),
+              "shared slot body must contain only Core work dispatch or idle");
+        return;
+      }
+      Check(realize->block->name_hint == "tt_device_core_work",
+            "shared slot dispatch must realize tt_device_core_work");
+      CoreDomain domain = work_domain(realize->block);
+      VerifyDomain(domain, launch_grid, "Core work domain");
+      for (int64_t x = 0; x < launch_grid->x; ++x) {
+        for (int64_t y = 0; y < launch_grid->y; ++y) {
+          bool expected = x >= domain->begin->x && x < domain->end->x &&
+                          y >= domain->begin->y && y < domain->end->y;
+          bool actual = true;
+          if (predicate.has_value()) {
+            CoreCoordinateSubstituter bind_core(x, y);
+            PrimExpr value = bind_core(predicate.value());
+            const int64_t *constant = as_const_int(value);
+            Check(constant != nullptr,
+                  "Core work predicate must simplify for every static Core");
+            actual = *constant != 0;
+          }
+          Check(actual == expected,
+                "Core work predicate disagrees with tt.core_domain");
+          if (actual)
+            Check(dispatched_cores.insert({x, y}).second,
+                  "shared slot has overlapping Core work domains");
+        }
+      }
+    };
+    Stmt dispatch_body = func->body;
+    if (const auto *root = dispatch_body.as<SBlockRealizeNode>();
+        root && root->block->name_hint == "root") {
+      Check(root->iter_values.empty() && is_one(root->predicate) &&
+                root->block->iter_vars.empty() && root->block->reads.empty() &&
+                root->block->writes.empty() &&
+                root->block->annotations.empty() &&
+                root->block->alloc_buffers.empty() &&
+                root->block->match_buffers.empty() &&
+                !root->block->init.defined(),
+            "TVMScript root block must be an unannotated structural wrapper");
+      dispatch_body = root->block->body;
+    }
+    verify_dispatch(dispatch_body);
+    PostOrderVisit(func->body, [&](const ffi::ObjectRef &object) {
+      const auto *block = object.as<SBlockNode>();
+      if (!block || block->name_hint != "tt_device_core_work")
+        return;
+      CoreDomain instance_domain;
+      auto domain_annotation = block->annotations.Get("tt.core_domain");
+      if (domain_annotation.has_value()) {
+        instance_domain = Downcast<CoreDomain>(domain_annotation.value());
+      } else {
+        int64_t x =
+            Downcast<Integer>(block->annotations.at("tt.core_x"))->value;
+        int64_t y =
+            Downcast<Integer>(block->annotations.at("tt.core_y"))->value;
+        instance_domain =
+            CoreDomain(CoreCoord(x, y), CoreCoord(x + 1, y + 1));
+      }
+      VerifyDomain(instance_domain, launch_grid, "Core work domain");
+      ffi::String owner =
+          Downcast<ffi::String>(block->annotations.at("tt.owner_slot"));
+      Check(owner == func->GetAttr<ffi::String>(kKernelSlotAttr).value(),
+            "Core work owner disagrees with containing slot");
+      for (int64_t x = instance_domain->begin->x;
+           x < instance_domain->end->x; ++x) {
+        for (int64_t y = instance_domain->begin->y;
+             y < instance_domain->end->y; ++y) {
+      CoreCoordinateSubstituter bind_core(x, y);
+      Stmt core_body = bind_core(block->body);
+      if (compute_values.Enabled() && owner == "trisc")
+        compute_values.EnterCoreInstance(x, y);
+      std::vector<Call> calls;
+      std::vector<int64_t> call_multipliers;
+      collect_calls(core_body, &calls, &call_multipliers, x, y, {}, 1);
+      Check(calls.size() == call_multipliers.size(),
+            "Device call multiplicity analysis is incomplete");
+      std::map<int64_t, int64_t> block_reservations;
+      std::function<void(const Stmt &, int64_t)> count_reservations =
+          [&](const Stmt &stmt, int64_t multiplier) {
+            if (const auto *seq = stmt.as<SeqStmtNode>()) {
+              for (const Stmt &child : seq->seq)
+                count_reservations(child, multiplier);
+            } else if (const auto *loop = stmt.as<ForNode>()) {
+              Check(loop->HasTrivialStep(),
+                    "current Device structured loop requires unit step");
+              int64_t extent =
+                  RequireStaticInteger(loop->extent, "Device loop extent");
+              if (std::string(loop->loop_var->name_hint)
+                      .rfind("tt_compact_", 0) == 0) {
+                int64_t minimum =
+                    RequireStaticInteger(loop->min, "compact loop minimum");
+                for (int64_t offset = 0; offset < extent; ++offset)
+                  count_reservations(
+                      Substitute(
+                          loop->body,
+                          {{loop->loop_var,
+                            make_const(loop->loop_var.dtype(),
+                                       minimum + offset)}}),
+                      multiplier);
+              } else {
+                count_reservations(
+                    loop->body,
+                    CheckedProduct(multiplier, extent,
+                                   "Device DFB transaction count"));
+              }
+            } else if (const auto *branch = stmt.as<IfThenElseNode>()) {
+              count_reservations(branch->then_case, multiplier);
+              if (branch->else_case.has_value())
+                count_reservations(branch->else_case.value(), multiplier);
+            } else if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+              count_reservations(realize->block->body, multiplier);
+            } else if (const auto *evaluate = stmt.as<EvaluateNode>()) {
+              const auto *call = evaluate->value.as<CallNode>();
+              if (call && call->op.same_as(dfb_reserve())) {
+                PrimExpr resource_expr =
+                    arith::Analyzer().Simplify(call->args[0]);
+                int64_t resource = RequireStaticInteger(
+                    resource_expr, "reserved DFB transaction identity");
+                Check(block_reservations[resource] <=
+                          std::numeric_limits<int64_t>::max() - multiplier,
+                      "Device DFB transaction count overflows");
+                block_reservations[resource] += multiplier;
+              }
+            }
+          };
+      count_reservations(core_body, 1);
+      for (const auto &[resource, transactions] : block_reservations)
+        Check(reservation_transactions
+                  .emplace(LocalKey{x, y, resource}, transactions)
+                  .second,
+              "DFB generation is reserved by multiple Core work blocks");
+      int64_t ordinal = 0;
+      std::map<std::pair<int64_t, int64_t>, bool> sent_transfers;
+      std::set<std::pair<int64_t, int64_t>> received_transfers;
+      auto state = [&](int64_t id) -> LocalLifecycle & {
+        Check(dfb_table.count(id), "Core work references missing DFB " +
+                                       std::to_string(id));
+        resource_cores[id].insert({x, y});
+        return lifecycles[LocalKey{x, y, id}];
+      };
+      auto id = [&](const Call &call, size_t index) {
+        Check(index < call->args.size(), "Core work DFB operand is missing");
+        PrimExpr simplified = arith::Analyzer().Simplify(call->args[index]);
+        Check(as_const_int(simplified),
+              "Core work DFB IDs must be static inside preserved outer loops");
+        return *as_const_int(simplified);
+      };
+      auto use = [&](int64_t resource) {
+        auto &entry = state(resource);
+        if (entry.consumer_slot.empty())
+          entry.consumer_slot = owner;
+        Check(entry.consumer_slot == owner,
+              "one Core-local DFB generation has consumers in multiple slots");
+        entry.last_use = ordinal;
+      };
+      auto produce = [&](int64_t resource, int64_t event,
+                         bool partial = false) {
+        auto &entry = state(resource);
+        if (entry.producer_slot.empty())
+          entry.producer_slot = owner;
+        Check(entry.producer_slot == owner,
+              "one Core-local DFB generation has multiple producer slots");
+        LocalKey key{x, y, resource};
+        auto [producer, inserted] = producer_events.emplace(key, event);
+        Check(inserted || partial,
+              "DFB generation is published more than once");
+        if (partial)
+          producer->second = event;
+        entry.produced = true;
+      };
+      auto verify_step_refs = [&](const Call &call, int64_t dynamic_multiplier) {
+        bool pipe_send = call->op.same_as(dfb_pipe_send());
+        bool pipe_recv = call->op.same_as(dfb_pipe_recv());
+        bool pipe_wait = call->op.same_as(dfb_pipe_wait());
+        bool local_copy = call->op.same_as(dfb_local_copy());
+        bool gather_copy = call->op.same_as(dfb_gather_copy());
+        bool local_reduce = call->op.same_as(dfb_collective_reduce());
+        bool communication_op = pipe_send || pipe_recv || pipe_wait ||
+                                local_copy || gather_copy || local_reduce;
+        auto attribute = call->annotations.Get("tt_communication_step_refs");
+        Check(communication_op == attribute.has_value(),
+              communication_op
+                  ? "communication operation is missing step refs"
+                  : "non-communication operation carries step refs");
+        if (!communication_op)
+          return;
+        auto refs = attribute.value().as<ffi::Array<PrimExpr>>();
+        Check(refs.has_value() && !refs.value().empty(),
+              "communication step refs must be a nonempty expression array");
+        Check((pipe_wait && refs.value().size() <= 2) ||
+                  (!pipe_wait && refs.value().size() == 1),
+              "communication operation has the wrong number of step refs");
+        std::set<int64_t> unique;
+        for (size_t ref_index = 0; ref_index < refs.value().size();
+             ++ref_index) {
+          int64_t ref = RequireStaticInteger(refs.value()[ref_index],
+                                             "communication step ref");
+          Check(ref >= 0 && ref < static_cast<int64_t>(steps.size()) &&
+                    unique.insert(ref).second,
+                "communication operation has an invalid or duplicate step ref");
+          const CommunicationStepDescriptor &step = steps[ref];
+          Check(step.defined() && step->step_id == ref &&
+                    step->owner_slot == owner,
+                "communication step ref has the wrong identity or owner");
+          ++step_ref_counts[ref];
+          Check(step_ref_dynamic_counts[ref] <=
+                    std::numeric_limits<int64_t>::max() - dynamic_multiplier,
+                "communication step dynamic multiplicity overflows");
+          step_ref_dynamic_counts[ref] += dynamic_multiplier;
+          auto coord_is = [&](const ffi::Optional<CoreCoord> &coord) {
+            return coord.has_value() && coord.value()->x == x &&
+                   coord.value()->y == y;
+          };
+          if (pipe_send || pipe_recv || pipe_wait) {
+            int64_t transfer = id(call, 0);
+            int64_t resource = id(call, 1);
+            Check(as_const_int(step->parameter) &&
+                      *as_const_int(step->parameter) == transfer,
+                  "transport operation and step use different transfer IDs");
+            if (pipe_send) {
+              Check(step->kind == "send" && coord_is(step->source_core) &&
+                        step->source_dfb_id == resource,
+                    "Pipe send disagrees with its communication step");
+            } else if (pipe_recv) {
+              Check(step->kind == "receive" &&
+                        coord_is(step->destination_core) &&
+                        step->destination_dfb_id == resource,
+                    "Pipe receive disagrees with its communication step");
+            } else if (ref_index == 0) {
+              Check(step->kind == "completion" &&
+                        ((coord_is(step->source_core) &&
+                          step->source_dfb_id == resource) ||
+                         (coord_is(step->destination_core) &&
+                          step->destination_dfb_id == resource)),
+                    "Pipe wait disagrees with its completion step");
+            } else {
+              Check(step->kind == "publish" &&
+                        coord_is(step->destination_core) &&
+                        step->destination_dfb_id == resource,
+                    "Pipe wait disagrees with its publication step");
+            }
+            continue;
+          }
+          int64_t source = local_reduce ? id(call, 1) : id(call, 0);
+          int64_t destination = local_reduce ? id(call, 2) : id(call, 1);
+          PrimExpr parameter = local_copy ? PrimExpr(Integer(0))
+                               : gather_copy ? call->args[2]
+                                             : call->args[3];
+          ffi::String kind = Downcast<StringImm>(
+                                 call->annotations.at(
+                                     "tt.communication_step_kind"))
+                                 ->value;
+          int64_t site = Downcast<Integer>(
+                             call->annotations.at("tt.communication_site"))
+                             ->value;
+          int64_t occurrence =
+              Downcast<Integer>(call->annotations.at(
+                                    "tt.communication_occurrence"))
+                  ->value;
+          Check(step->kind == kind && step->communication_id == site &&
+                    step->occurrence == occurrence &&
+                    coord_is(step->source_core) &&
+                    coord_is(step->destination_core) &&
+                    step->source_dfb_id == source &&
+                    step->destination_dfb_id == destination &&
+                    ffi::StructuralEqual()(step->parameter, parameter),
+                "local communication operation disagrees with its step");
+        }
+      };
+      for (size_t call_index = 0; call_index < calls.size(); ++call_index) {
+        const Call &call = calls[call_index];
+        ++ordinal;
+        int64_t event = static_cast<int64_t>(event_successors.size());
+        event_successors.emplace_back();
+        SlotKey slot{x, y, std::string(owner)};
+        auto previous = last_slot_event.find(slot);
+        if (previous != last_slot_event.end())
+          event_successors[previous->second].push_back(event);
+        last_slot_event[slot] = event;
+        try {
+          verify_step_refs(call, call_multipliers[call_index]);
+          if (call->op.same_as(accumulator_init())) {
+          int64_t accumulator = id(call, 0);
+          Check(current_accumulators.count(accumulator),
+                "accumulator initialization references missing accumulator");
+          const CoreDomain &domain =
+              current_accumulators.at(accumulator)->core_domain;
+          Check(x >= domain->begin->x && x < domain->end->x &&
+                    y >= domain->begin->y && y < domain->end->y,
+                "accumulator initialization crosses Core ownership");
+          Check(accumulator_state[accumulator] == 0,
+                "accumulator initialized more than once");
+          accumulator_state[accumulator] = 1;
+        } else if (call->op.same_as(dfb_reserve())) {
+          auto &entry = state(id(call, 0));
+          Check(!entry.reserved, "DFB generation is reserved more than once");
+          entry.reserved = true;
+          entry.reserve_slot = owner;
+          Check(reserve_events.emplace(LocalKey{x, y, id(call, 0)}, event)
+                    .second,
+                "DFB generation has multiple reserve events");
+        } else if (call->op.same_as(dfb_wait())) {
+          auto &entry = state(id(call, 0));
+          entry.waited = true;
+          entry.last_use = ordinal;
+          wait_events[LocalKey{x, y, id(call, 0)}].push_back(event);
+          if (entry.consumer_slot.empty())
+            entry.consumer_slot = owner;
+        } else if (call->op.same_as(dfb_release())) {
+          auto &entry = state(id(call, 0));
+          Check(!entry.released, "DFB generation is released more than once");
+          entry.released = true;
+          entry.release_order = ordinal;
+          Check(release_events.emplace(LocalKey{x, y, id(call, 0)}, event)
+                    .second,
+                "DFB generation has multiple release events");
+        } else if (call->op.same_as(tensor_to_dfb_nd())) {
+          int64_t resource = id(call, 1);
+          int64_t tensor = RequireStaticInteger(
+              call->args[0], "Tensor load ABI index");
+          Check(tensor_table.count(tensor) &&
+                    dfb_table.at(resource)->tensor_backing.has_value() &&
+                    dfb_table.at(resource)
+                            ->tensor_backing.value()
+                            ->global_arg_index == tensor,
+                "Tensor load disagrees with DFB backing metadata");
+          Check(copy_issues
+                    .emplace(LocalKey{x, y, resource},
+                             std::make_pair(event, true))
+                    .second,
+                "DFB generation has multiple asynchronous copy issues");
+          ffi::Array<PrimExpr> shape;
+          for (size_t index = 3; index < call->args.size(); index += 2)
+            shape.push_back(call->args[index]);
+          Check(tensor_load_shapes.emplace(LocalKey{x, y, resource}, shape)
+                    .second,
+                "Tensor-backed DFB generation has multiple load shapes");
+        } else if (call->op.same_as(dfb_to_tensor_nd())) {
+          int64_t resource = id(call, 0);
+          int64_t tensor = RequireStaticInteger(
+              call->args[1], "Tensor store ABI index");
+          Check(tensor_table.count(tensor) &&
+                    dfb_table.at(resource)->tensor_backing.has_value() &&
+                    dfb_table.at(resource)
+                            ->tensor_backing.value()
+                            ->global_arg_index == tensor,
+                "Tensor store disagrees with DFB backing metadata");
+          use(resource);
+          Check(copy_issues
+                    .emplace(LocalKey{x, y, resource},
+                             std::make_pair(event, false))
+                    .second,
+                "DFB generation has multiple asynchronous copy issues");
+        } else if (call->op.same_as(dfb_copy_wait())) {
+          int64_t resource = id(call, 0);
+          LocalKey key{x, y, resource};
+          auto issue = copy_issues.find(key);
+          Check(issue != copy_issues.end(),
+                "DFB copy completion has no matching issue");
+          Check(copy_completions.emplace(key, event).second,
+                "DFB generation has multiple copy completions");
+          if (issue->second.second)
+            produce(resource, event);
+        } else if (call->op.same_as(dfb_compute())) {
+          produce(id(call, 0), event);
+          for (size_t index = 1; index < call->args.size(); ++index)
+            use(id(call, index));
+          auto shapes = call->annotations.Get("tt.input_shapes");
+          if (shapes.has_value()) {
+            auto typed =
+                shapes.value().as<ffi::Array<ffi::Array<PrimExpr>>>();
+            Check(typed.has_value() &&
+                      typed.value().size() == call->args.size() - 1,
+                  "dfb_compute input shapes must cover every input operand");
+            for (size_t index = 1; index < call->args.size(); ++index)
+              input_shape_uses.push_back(
+                  {LocalKey{x, y, id(call, index)}, typed.value()[index - 1]});
+          }
+        } else if (call->op.same_as(compute_value()) ||
+                   call->op.same_as(compute_value_gemm())) {
+          size_t begin = call->op.same_as(compute_value()) ? 1 : 1;
+          size_t end = call->op.same_as(compute_value_gemm()) ? 3
+                                                              : call->args.size();
+          for (size_t index = begin; index < end; ++index)
+            use(id(call, index));
+        } else if (call->op.same_as(compute_value_store())) {
+          produce(id(call, 1), event);
+        } else if (call->op.same_as(gemm_update())) {
+          use(id(call, 0));
+          use(id(call, 1));
+          int64_t accumulator = id(call, 2);
+          Check(current_accumulators.count(accumulator),
+                "GEMM update references missing accumulator");
+          Check(accumulator_state[accumulator] == 1,
+                "GEMM update requires a live initialized accumulator");
+          int64_t transpose_a = id(call, 3), transpose_b = id(call, 4);
+          Check((transpose_a == 0 || transpose_a == 1) &&
+                    (transpose_b == 0 || transpose_b == 1),
+                "GEMM transpose flags must be Boolean");
+          const DFBDescriptor &lhs = dfb_table.at(id(call, 0));
+          const DFBDescriptor &rhs = dfb_table.at(id(call, 1));
+          int64_t k = RequireStaticInteger(
+              lhs->block_shape_in_tiles[transpose_a ? 0 : 1],
+              "GEMM K tiles");
+          Check(k == RequireStaticInteger(
+                         rhs->block_shape_in_tiles[transpose_b ? 1 : 0],
+                         "GEMM K tiles"),
+                "GEMM update K shapes disagree");
+          const AccumulatorDescriptor &descriptor =
+              current_accumulators.at(accumulator);
+          Check(accumulator_k_tiles[accumulator] <=
+                    descriptor->full_k_tiles - k,
+                "GEMM updates exceed accumulator full-K updates");
+          accumulator_k_tiles[accumulator] += k;
+        } else if (call->op.same_as(accumulator_materialize())) {
+          int64_t accumulator = id(call, 0);
+          Check(current_accumulators.count(accumulator),
+                "materialization references missing accumulator");
+          Check(accumulator_state[accumulator] == 1,
+                "materialization requires a live initialized accumulator");
+          Check(accumulator_k_tiles[accumulator] ==
+                    current_accumulators.at(accumulator)->full_k_tiles,
+                "materialization must follow all full-K updates");
+          accumulator_state[accumulator] = 2;
+          produce(id(call, 1), event);
+        } else if (call->op.same_as(dfb_pipe_send())) {
+          int64_t transfer = id(call, 0);
+          int64_t resource = id(call, 1);
+          const DFBDescriptor &descriptor = dfb_table.at(resource);
+          bool forwarding = owner == descriptor->producer_slot &&
+                            descriptor->tensor_backing.has_value();
+          if (forwarding) {
+            auto &entry = state(resource);
+            Check(entry.produced,
+                  "producer forwarding must follow Tensor copy completion");
+          } else {
+            use(resource);
+          }
+          Check(sent_transfers.emplace(std::make_pair(transfer, resource),
+                                       forwarding)
+                    .second,
+                "Pipe transfer is sent more than once in one Core work item");
+        } else if (call->op.same_as(dfb_pipe_recv())) {
+          int64_t transfer = id(call, 0);
+          int64_t resource = id(call, 1);
+          state(resource);
+          Check(received_transfers.insert({transfer, resource}).second,
+                "Pipe transfer is received more than once in one Core work item");
+        } else if (call->op.same_as(dfb_pipe_wait())) {
+          int64_t transfer = id(call, 0);
+          int64_t resource = id(call, 1);
+          auto sent = sent_transfers.find({transfer, resource});
+          if (sent != sent_transfers.end() && sent->second) {
+            forwarding_completions[LocalKey{x, y, resource}].push_back(event);
+          } else if (received_transfers.count({transfer, resource})) {
+            produce(resource, event);
+          } else if (sent != sent_transfers.end()) {
+            use(resource);
+          } else {
+            Check(false, "Pipe completion has no matching send or receive");
+          }
+        } else if (call->op.same_as(dfb_local_copy()) ||
+                   call->op.same_as(dfb_gather_copy())) {
+          use(id(call, 0));
+          produce(id(call, 1), event, /*partial=*/true);
+        } else if (call->op.same_as(dfb_collective_reduce())) {
+          use(id(call, 0));
+          use(id(call, 1));
+          produce(id(call, 2), event, /*partial=*/true);
+        } else if (call->op.same_as(dfb_load())) {
+          use(id(call, 0));
+        }
+          if (compute_values.Enabled()) {
+            if (call->op.same_as(compute_value()) ||
+                call->op.same_as(dfb_compute()))
+              compute_values.Expression(call, dfb_table);
+            else if (call->op.same_as(compute_value_gemm()))
+              compute_values.Gemm(call, dfb_table);
+            else if (call->op.same_as(compute_value_store()))
+              compute_values.Store(call, dfb_table);
+            else if (call->op.same_as(dfb_to_tensor_nd())) {
+              int64_t resource = id(call, 0);
+              int64_t tensor = RequireStaticInteger(
+                  call->args[1], "Tensor export ABI index");
+              Check(tensor_table.count(tensor),
+                    "Tensor export references missing ABI descriptor");
+              value_exports.emplace_back(resource,
+                                         tensor_table.at(tensor)->dtype);
+            }
+          } else if (call->op.same_as(dfb_compute())) {
+            VerifyGeneralCompute(call, dfb_table, &bound_loop_vars);
+          }
+        } catch (const ffi::Error &error) {
+          Fail(OperationContext(func, Evaluate(call)) + error.what());
+        }
+      }
+        }
+      }
+    });
+  }
+  if (!compute_values.Enabled())
+    for (const auto &[id, accumulator] : current_accumulators)
+      Check(accumulator_state[id] == 2,
+            "accumulator lifetime is missing final materialization");
+  for (const auto &[key, waits] : wait_events) {
+    auto producer = producer_events.find(key);
+    Check(producer != producer_events.end(),
+          "DFB wait has no matching producer publication");
+    for (int64_t wait : waits)
+      event_successors[producer->second].push_back(wait);
+  }
+  for (const auto &[key, issue] : copy_issues) {
+    auto completion = copy_completions.find(key);
+    Check(completion != copy_completions.end(),
+          "DFB asynchronous copy is missing completion");
+    event_successors[issue.first].push_back(completion->second);
+    if (!issue.second) {
+      auto release = release_events.find(key);
+      Check(release != release_events.end(),
+            "Tensor export DFB is missing release");
+      event_successors[completion->second].push_back(release->second);
+    }
+  }
+  for (const auto &[key, completions] : forwarding_completions) {
+    auto release = release_events.find(key);
+    Check(release != release_events.end(),
+          "producer-forwarded DFB is missing final release");
+    for (int64_t completion : completions)
+      event_successors[completion].push_back(release->second);
+  }
+  struct GroupReserve {
+    int64_t ordinal;
+    int64_t resource;
+    int64_t event;
+  };
+  std::map<std::tuple<int64_t, int64_t, int64_t>,
+           std::vector<GroupReserve>>
+      group_reserves;
+  for (const auto &[key, event] : reserve_events) {
+    int64_t x = std::get<0>(key), y = std::get<1>(key);
+    int64_t resource = std::get<2>(key);
+    Check(storage.resource_groups.count(resource) &&
+              storage.resource_ordinals.count(resource),
+          "reserved DFB has no storage-group relation");
+    int64_t group = storage.resource_groups.at(resource);
+    group_reserves[{x, y, group}].push_back(
+        {storage.resource_ordinals.at(resource), resource, event});
+  }
+  for (auto &[key, events] : group_reserves) {
+    std::sort(events.begin(), events.end(),
+              [](const GroupReserve &a, const GroupReserve &b) {
+                return a.event < b.event;
+              });
+    int64_t group = std::get<2>(key);
+    int64_t capacity = RequireStaticInteger(
+        storage.groups.at(group)->block_count, "storage group capacity");
+    for (size_t index = 1; index < events.size(); ++index)
+      Check(events[index - 1].ordinal < events[index].ordinal,
+            "Device body order disagrees with pipeline transaction relation");
+    std::sort(events.begin(), events.end(),
+              [](const GroupReserve &a, const GroupReserve &b) {
+                return std::tie(a.ordinal, a.event) <
+                       std::tie(b.ordinal, b.event);
+              });
+    for (size_t index = static_cast<size_t>(capacity); index < events.size();
+         ++index) {
+      const GroupReserve &old = events[index - capacity];
+      const GroupReserve &next = events[index];
+      auto release = release_events.find(
+          LocalKey{std::get<0>(key), std::get<1>(key), old.resource});
+      Check(release != release_events.end(),
+            "storage-group reuse is missing release-before-reserve dependency");
+      event_successors[release->second].push_back(next.event);
+    }
+  }
+  std::vector<int64_t> indegree(event_successors.size(), 0);
+  for (const auto &successors : event_successors)
+    for (int64_t successor : successors)
+      ++indegree[successor];
+  std::vector<int64_t> ready;
+  for (size_t event = 0; event < indegree.size(); ++event)
+    if (indegree[event] == 0)
+      ready.push_back(static_cast<int64_t>(event));
+  size_t visited = 0;
+  while (!ready.empty()) {
+    int64_t event = ready.back();
+    ready.pop_back();
+    ++visited;
+    for (int64_t successor : event_successors[event])
+      if (--indegree[successor] == 0)
+        ready.push_back(successor);
+  }
+  Check(visited == event_successors.size(),
+        "cross-slot Device transaction dependency cycle");
+  for (const InputShapeUse &use : input_shape_uses) {
+    auto loaded = tensor_load_shapes.find(use.key);
+    if (loaded != tensor_load_shapes.end()) {
+      Check(loaded->second.size() >= use.shape.size(),
+            "dfb_compute input rank exceeds its Tensor producer");
+      size_t leading = loaded->second.size() - use.shape.size();
+      for (size_t axis = 0; axis < leading; ++axis)
+        Check(is_one(loaded->second[axis]),
+              "dfb_compute may remove only leading singleton Tensor axes");
+      for (size_t axis = 0; axis < use.shape.size(); ++axis)
+        Check(ffi::StructuralEqual()(loaded->second[leading + axis],
+                                     use.shape[axis]),
+              "dfb_compute input logical shape disagrees with its Tensor producer");
+    }
+  }
+  Check(actual_symbols == ordered_symbols,
+        "tt.kernel_order does not match Device function symbols");
+  for (const auto &[key, state] : lifecycles) {
+    int64_t resource = std::get<2>(key);
+    const DFBDescriptor &descriptor = dfb_table.at(resource);
+    if (state.reserved) {
+      auto transactions = reservation_transactions.find(key);
+      Check(transactions != reservation_transactions.end() &&
+                transactions->second ==
+                    RequireStaticInteger(
+                        descriptor->transaction_count_or_loop_relation,
+                        "DFB transaction count"),
+            "DFB transaction count disagrees with its structured loop relation");
+    }
+    Check(!state.reserved || state.produced,
+          "reserved DFB generation is never published");
+    Check(!state.produced || state.reserved,
+          "DFB producer writes without reserve");
+    if (!state.producer_slot.empty())
+      Check(state.producer_slot == descriptor->producer_slot,
+            "DFB producer slot disagrees with descriptor");
+    if (!state.consumer_slot.empty())
+      Check(state.consumer_slot == descriptor->consumer_slot,
+            "DFB consumer slot disagrees with descriptor");
+    if (!state.producer_slot.empty() && !state.consumer_slot.empty() &&
+        state.producer_slot != state.consumer_slot)
+      Check(state.waited, "cross-slot DFB use is missing consumer wait");
+    Check(!state.released || state.release_order >= state.last_use,
+          "DFB release precedes its last local use");
+    Check(!state.produced || state.released,
+          "published DFB generation is missing release");
+  }
+  VerifyCurrentL1Budget(mod, dfb_table, resource_cores, storage);
+  compute_values.Finish();
+  for (const auto &[resource, dtype] : value_exports)
+    compute_values.Export(resource, dtype);
+
+  if (communication.has_value()) {
+    int64_t expected_site = 0;
+    for (const CommunicationDescriptor &entry : communication.value()) {
+      Check(entry.defined() && entry->communication_id == expected_site++,
+            "communication site IDs must be dense and deterministic");
+      Check(entry->kind == "transfer" || entry->kind == "all_gather" ||
+                entry->kind == "all_reduce",
+            "unknown high-level communication kind");
+      Check(entry->source_region.defined() &&
+                entry->destination_region.defined() &&
+                entry->group_begin.size() == 2 && entry->group_end.size() == 2,
+            "communication descriptor is incomplete");
+      Check(!entry->algorithm.empty(),
+            "communication descriptor has no selected algorithm");
+      Check((entry->kind == "transfer" &&
+             (entry->algorithm == "direct_p2p" ||
+              entry->algorithm == "direct_broadcast")) ||
+                (entry->kind == "all_gather" &&
+                 entry->algorithm == "direct_all_to_all") ||
+                (entry->kind == "all_reduce" &&
+                 entry->algorithm == "root0_left_fold_broadcast"),
+            "communication kind and selected algorithm disagree");
+    }
+  }
+  for (size_t index = 0; index < steps.size(); ++index) {
+    const CommunicationStepDescriptor &step = steps[index];
+    Check(step.defined() && step->step_id == static_cast<int64_t>(index),
+          "communication step IDs must be dense and deterministic");
+    Check(communication.has_value() && step->communication_id >= 0 &&
+              step->communication_id <
+                  static_cast<int64_t>(communication.value().size()),
+          "communication step references a missing site");
+    Check(step->owner_slot == "trisc" || step->owner_slot == "ncrisc" ||
+              step->owner_slot == "brisc",
+          "communication step has an invalid owner slot");
+    Check(step->kind == "send" || step->kind == "receive" ||
+              step->kind == "completion" || step->kind == "publish" ||
+              step->kind == "local_copy" ||
+              step->kind == "local_reduce",
+          "communication step has an unknown kind");
+    Check(step_ref_counts[index] == 1,
+          "communication step must be referenced by exactly one body operation");
+    for (const Integer &dependency : step->dependencies)
+      Check(dependency->value >= 0 && dependency->value < step->step_id,
+            "communication step dependency must reference an earlier step");
+    if (step->source_dfb_id >= 0)
+      Check(dfb_table.count(step->source_dfb_id),
+            "communication step source DFB is missing");
+    if (step->destination_dfb_id >= 0)
+      Check(dfb_table.count(step->destination_dfb_id),
+            "communication step destination DFB is missing");
+  }
+  if (communication.has_value()) {
+    using TransferPair = std::tuple<int64_t, int64_t, int64_t, int64_t>;
+    for (const CommunicationDescriptor &entry : communication.value()) {
+      bool collective = entry->kind == "all_gather" ||
+                        entry->kind == "all_reduce";
+      int64_t bx = 0, by = 0, ex = launch_grid->x, ey = launch_grid->y;
+      if (collective) {
+        bx = RequireStaticInteger(entry->group_begin[0],
+                                  "communication group begin x");
+        by = RequireStaticInteger(entry->group_begin[1],
+                                  "communication group begin y");
+        ex = RequireStaticInteger(entry->group_end[0],
+                                  "communication group end x");
+        ey = RequireStaticInteger(entry->group_end[1],
+                                  "communication group end y");
+        Check(bx >= 0 && by >= 0 && bx < ex && by < ey &&
+                  ex <= launch_grid->x && ey <= launch_grid->y,
+              "communication group is outside the launch grid");
+      }
+      int64_t group_size = CheckedProduct(ex - bx, ey - by,
+                                          "communication group size");
+      int64_t occurrence_count = 1;
+      for (const PrimExpr &extent : entry->occurrence_extents)
+        occurrence_count = CheckedProduct(
+            occurrence_count,
+            RequireStaticInteger(extent, "communication occurrence extent"),
+            "communication occurrence count");
+      Check(occurrence_count > 0,
+            "communication occurrence domain must be nonempty");
+
+      std::map<int64_t, std::vector<CommunicationStepDescriptor>> by_occurrence;
+      for (const CommunicationStepDescriptor &step : steps)
+        if (step->communication_id == entry->communication_id)
+          by_occurrence[step->occurrence].push_back(step);
+      Check(!by_occurrence.empty() &&
+                occurrence_count %
+                        static_cast<int64_t>(by_occurrence.size()) ==
+                    0,
+            "communication steps and enclosing loops do not cover every site occurrence");
+      int64_t static_occurrences = by_occurrence.size();
+      int64_t dynamic_multiplier = occurrence_count / static_occurrences;
+      for (int64_t occurrence = 0; occurrence < static_occurrences;
+           ++occurrence) {
+        Check(by_occurrence.count(occurrence),
+              "communication occurrence IDs must be dense");
+        std::map<std::string, int64_t> kinds;
+        std::set<TransferPair> sends, receives;
+        for (const CommunicationStepDescriptor &step :
+             by_occurrence.at(occurrence)) {
+          Check(step_ref_dynamic_counts[step->step_id] == dynamic_multiplier,
+                "communication step dynamic multiplicity disagrees with its occurrence relation");
+          ++kinds[std::string(step->kind)];
+          if (step->kind != "send" && step->kind != "receive")
+            continue;
+          Check(step->source_core.has_value() &&
+                    step->destination_core.has_value(),
+                "transport step is missing endpoint coordinates");
+          CoreCoord source = step->source_core.value();
+          CoreCoord destination = step->destination_core.value();
+          Check((!collective ||
+                 (source->x >= bx && source->x < ex && source->y >= by &&
+                  source->y < ey)) &&
+                    destination->x >= bx &&
+                    destination->x < ex && destination->y >= by &&
+                    destination->y < ey &&
+                    (source->x != destination->x ||
+                     source->y != destination->y),
+                "transport step has an invalid or loopback group endpoint");
+          TransferPair pair{source->x, source->y, destination->x,
+                            destination->y};
+          Check((step->kind == "send" ? sends : receives)
+                    .insert(pair)
+                    .second,
+                "communication occurrence has a duplicate transport endpoint");
+        }
+        Check(sends == receives,
+              "communication send/receive endpoint coverage disagrees");
+        Check(kinds["completion"] == 2 * static_cast<int64_t>(sends.size()) &&
+                  kinds["publish"] == static_cast<int64_t>(sends.size()),
+              "communication completion/publication coverage is incomplete");
+
+        if (entry->kind == "all_gather") {
+          int64_t axis = RequireStaticInteger(entry->parameter,
+                                              "all_gather axis");
+          Check(axis == 0 || axis == 1,
+                "all_gather axis must be normalized to zero or one");
+          std::set<TransferPair> expected;
+          for (int64_t sx = bx; sx < ex; ++sx)
+            for (int64_t sy = by; sy < ey; ++sy)
+              for (int64_t dx = bx; dx < ex; ++dx)
+                for (int64_t dy = by; dy < ey; ++dy)
+                  if (sx != dx || sy != dy)
+                    expected.insert({sx, sy, dx, dy});
+          Check(sends == expected &&
+                    kinds["local_copy"] == group_size * group_size &&
+                    kinds["local_reduce"] == 0,
+                "direct all_gather does not cover every source/destination contribution");
+        } else if (entry->kind == "all_reduce") {
+          const auto *reduction = entry->parameter.as<StringImmNode>();
+          Check(reduction &&
+                    (reduction->value == "sum" || reduction->value == "max" ||
+                     reduction->value == "min"),
+                "all_reduce has an unsupported reduction operation");
+          std::set<TransferPair> expected;
+          for (int64_t x = bx; x < ex; ++x)
+            for (int64_t y = by; y < ey; ++y)
+              if (x != bx || y != by) {
+                expected.insert({x, y, bx, by});
+                expected.insert({bx, by, x, y});
+              }
+          Check(sends == expected && kinds["local_copy"] == 1 &&
+                    kinds["local_reduce"] == group_size - 1,
+                "direct all_reduce has incomplete gather/reduce/broadcast coverage");
+        }
+      }
+    }
+  }
+  return parameterized;
+}
+
 IRModule VerifyModule(IRModule mod) {
+  auto stage = mod->GetAttr<ffi::String>("tt.ir_stage");
+  if (stage.has_value())
+    return VerifyCurrentDeviceModule(std::move(mod));
   Integer version = RequireModuleAttr<Integer>(mod, kDeviceIRVersionAttr);
   Check(version->value == kDeviceIRVersion || version->value == 2 ||
             version->value == 3 || version->value == 4 || version->value == 5 ||

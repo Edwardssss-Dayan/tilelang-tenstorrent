@@ -52,12 +52,169 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   RegisterMetadataPrinter<AccumulatorDescriptor>();
   RegisterMetadataPrinter<ComputeValueDescriptor>();
   RegisterMetadataPrinter<ComputeRequirements>();
+  RegisterMetadataPrinter<TTAccessDescriptor>();
+  RegisterMetadataPrinter<NormalizedTopologyDescriptor>();
+  RegisterMetadataPrinter<CommunicationDescriptor>();
+  RegisterMetadataPrinter<CommunicationStepDescriptor>();
+  RegisterMetadataPrinter<DFBStorageGroupDescriptor>();
+  RegisterMetadataPrinter<DFBStorageGroupRelation>();
   RegisterMetadataPrinter<PipeTransferDescriptor>();
   RegisterMetadataPrinter<DeviceIRDescriptorFamily>();
   RegisterMetadataPrinter<DeviceIRIntColumn>();
 }
 
 } // namespace
+
+TTAccessDescriptor::TTAccessDescriptor(
+    int64_t access_id, tirx::Buffer buffer, ffi::String access_kind,
+    tirx::BufferRegion logical_region, ffi::Array<Integer> access_map,
+    ffi::String broadcast_kind, ffi::Array<Integer> broadcast_axes,
+    Span source_span) {
+  auto node = ffi::make_object<TTAccessDescriptorNode>();
+  node->access_id = access_id;
+  node->buffer = std::move(buffer);
+  node->access_kind = std::move(access_kind);
+  node->logical_region = std::move(logical_region);
+  node->access_map = std::move(access_map);
+  node->broadcast_kind = std::move(broadcast_kind);
+  node->broadcast_axes = std::move(broadcast_axes);
+  node->source_span = std::move(source_span);
+  data_ = std::move(node);
+}
+
+void TTAccessDescriptorNode::RegisterReflection() {
+  ffi::reflection::ObjectDef<TTAccessDescriptorNode>()
+      .def_ro("access_id", &TTAccessDescriptorNode::access_id)
+      .def_ro("buffer", &TTAccessDescriptorNode::buffer)
+      .def_ro("access_kind", &TTAccessDescriptorNode::access_kind)
+      .def_ro("logical_region", &TTAccessDescriptorNode::logical_region)
+      .def_ro("access_map", &TTAccessDescriptorNode::access_map)
+      .def_ro("broadcast_kind", &TTAccessDescriptorNode::broadcast_kind)
+      .def_ro("broadcast_axes", &TTAccessDescriptorNode::broadcast_axes)
+      .def_ro("source_span", &TTAccessDescriptorNode::source_span);
+}
+
+NormalizedTopologyDescriptor::NormalizedTopologyDescriptor(
+    int64_t site_id, ffi::String kind, tirx::BufferRegion source_region,
+    tirx::BufferRegion destination_region, ffi::Array<PrimExpr> source_coord,
+    ffi::Array<PrimExpr> group_begin, ffi::Array<PrimExpr> group_end,
+    PrimExpr parameter, ffi::String contract, PrimExpr guard,
+    ffi::Array<PrimExpr> occurrence_extents, Span source_span) {
+  auto node = ffi::make_object<NormalizedTopologyDescriptorNode>();
+  node->site_id = site_id;
+  node->kind = std::move(kind);
+  node->source_region = std::move(source_region);
+  node->destination_region = std::move(destination_region);
+  node->source_coord = std::move(source_coord);
+  node->group_begin = std::move(group_begin);
+  node->group_end = std::move(group_end);
+  node->parameter = std::move(parameter);
+  node->contract = std::move(contract);
+  node->guard = std::move(guard);
+  node->occurrence_extents = std::move(occurrence_extents);
+  node->source_span = std::move(source_span);
+  data_ = std::move(node);
+}
+
+void NormalizedTopologyDescriptorNode::RegisterReflection() {
+  ffi::reflection::ObjectDef<NormalizedTopologyDescriptorNode>()
+      .def_ro("site_id", &NormalizedTopologyDescriptorNode::site_id)
+      .def_ro("kind", &NormalizedTopologyDescriptorNode::kind)
+      .def_ro("source_region", &NormalizedTopologyDescriptorNode::source_region)
+      .def_ro("destination_region",
+              &NormalizedTopologyDescriptorNode::destination_region)
+      .def_ro("source_coord", &NormalizedTopologyDescriptorNode::source_coord)
+      .def_ro("group_begin", &NormalizedTopologyDescriptorNode::group_begin)
+      .def_ro("group_end", &NormalizedTopologyDescriptorNode::group_end)
+      .def_ro("parameter", &NormalizedTopologyDescriptorNode::parameter)
+      .def_ro("contract", &NormalizedTopologyDescriptorNode::contract)
+      .def_ro("guard", &NormalizedTopologyDescriptorNode::guard)
+      .def_ro("occurrence_extents",
+              &NormalizedTopologyDescriptorNode::occurrence_extents)
+      .def_ro("source_span", &NormalizedTopologyDescriptorNode::source_span);
+}
+
+CommunicationDescriptor::CommunicationDescriptor(
+    int64_t communication_id, ffi::String kind, ffi::String algorithm,
+    tirx::BufferRegion source_region, tirx::BufferRegion destination_region,
+    ffi::Array<PrimExpr> source_coord, ffi::Array<PrimExpr> group_begin,
+    ffi::Array<PrimExpr> group_end, PrimExpr parameter, ffi::String contract,
+    ffi::Array<PrimExpr> occurrence_extents, Span source_span) {
+  auto node = ffi::make_object<CommunicationDescriptorNode>();
+  node->communication_id = communication_id;
+  node->kind = std::move(kind);
+  node->algorithm = std::move(algorithm);
+  node->source_region = std::move(source_region);
+  node->destination_region = std::move(destination_region);
+  node->source_coord = std::move(source_coord);
+  node->group_begin = std::move(group_begin);
+  node->group_end = std::move(group_end);
+  node->parameter = std::move(parameter);
+  node->contract = std::move(contract);
+  node->occurrence_extents = std::move(occurrence_extents);
+  node->source_span = std::move(source_span);
+  data_ = std::move(node);
+}
+
+void CommunicationDescriptorNode::RegisterReflection() {
+  ffi::reflection::ObjectDef<CommunicationDescriptorNode>()
+      .def_ro("communication_id",
+              &CommunicationDescriptorNode::communication_id)
+      .def_ro("kind", &CommunicationDescriptorNode::kind)
+      .def_ro("algorithm", &CommunicationDescriptorNode::algorithm)
+      .def_ro("source_region", &CommunicationDescriptorNode::source_region)
+      .def_ro("destination_region",
+              &CommunicationDescriptorNode::destination_region)
+      .def_ro("source_coord", &CommunicationDescriptorNode::source_coord)
+      .def_ro("group_begin", &CommunicationDescriptorNode::group_begin)
+      .def_ro("group_end", &CommunicationDescriptorNode::group_end)
+      .def_ro("parameter", &CommunicationDescriptorNode::parameter)
+      .def_ro("contract", &CommunicationDescriptorNode::contract)
+      .def_ro("occurrence_extents",
+              &CommunicationDescriptorNode::occurrence_extents)
+      .def_ro("source_span", &CommunicationDescriptorNode::source_span);
+}
+
+CommunicationStepDescriptor::CommunicationStepDescriptor(
+    int64_t step_id, int64_t communication_id, int64_t occurrence,
+    ffi::String kind, ffi::Optional<CoreCoord> source_core,
+    ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
+    int64_t destination_dfb_id, ffi::String owner_slot,
+    ffi::Array<Integer> dependencies, PrimExpr parameter, Span source_span) {
+  auto node = ffi::make_object<CommunicationStepDescriptorNode>();
+  node->step_id = step_id;
+  node->communication_id = communication_id;
+  node->occurrence = occurrence;
+  node->kind = std::move(kind);
+  node->source_core = std::move(source_core);
+  node->destination_core = std::move(destination_core);
+  node->source_dfb_id = source_dfb_id;
+  node->destination_dfb_id = destination_dfb_id;
+  node->owner_slot = std::move(owner_slot);
+  node->dependencies = std::move(dependencies);
+  node->parameter = std::move(parameter);
+  node->source_span = std::move(source_span);
+  data_ = std::move(node);
+}
+
+void CommunicationStepDescriptorNode::RegisterReflection() {
+  ffi::reflection::ObjectDef<CommunicationStepDescriptorNode>()
+      .def_ro("step_id", &CommunicationStepDescriptorNode::step_id)
+      .def_ro("communication_id",
+              &CommunicationStepDescriptorNode::communication_id)
+      .def_ro("occurrence", &CommunicationStepDescriptorNode::occurrence)
+      .def_ro("kind", &CommunicationStepDescriptorNode::kind)
+      .def_ro("source_core", &CommunicationStepDescriptorNode::source_core)
+      .def_ro("destination_core",
+              &CommunicationStepDescriptorNode::destination_core)
+      .def_ro("source_dfb_id", &CommunicationStepDescriptorNode::source_dfb_id)
+      .def_ro("destination_dfb_id",
+              &CommunicationStepDescriptorNode::destination_dfb_id)
+      .def_ro("owner_slot", &CommunicationStepDescriptorNode::owner_slot)
+      .def_ro("dependencies", &CommunicationStepDescriptorNode::dependencies)
+      .def_ro("parameter", &CommunicationStepDescriptorNode::parameter)
+      .def_ro("source_span", &CommunicationStepDescriptorNode::source_span);
+}
 
 bool IsSupportedAccumulatorDTypeTriple(DataType input, DataType accumulation,
                                        DataType output) {
@@ -71,7 +228,17 @@ bool IsSupportedAccumulatorDTypeTriple(DataType input, DataType accumulation,
 AccumulatorDescriptor::AccumulatorDescriptor(
     int64_t accumulator_id, tirx::BufferRegion accumulator_region,
     DataType input_dtype, DataType accumulation_dtype, DataType output_dtype,
-    int64_t full_k_tiles, Span source_span) {
+    int64_t full_k_tiles, Span source_span)
+    : AccumulatorDescriptor(accumulator_id, std::move(accumulator_region),
+                            input_dtype, accumulation_dtype, output_dtype,
+                            full_k_tiles,
+                            CoreDomain(CoreCoord(0, 0), CoreCoord(1, 1)),
+                            std::move(source_span)) {}
+
+AccumulatorDescriptor::AccumulatorDescriptor(
+    int64_t accumulator_id, tirx::BufferRegion accumulator_region,
+    DataType input_dtype, DataType accumulation_dtype, DataType output_dtype,
+    int64_t full_k_tiles, CoreDomain core_domain, Span source_span) {
   auto node = ffi::make_object<AccumulatorDescriptorNode>();
   node->accumulator_id = accumulator_id;
   node->accumulator_region = std::move(accumulator_region);
@@ -79,6 +246,7 @@ AccumulatorDescriptor::AccumulatorDescriptor(
   node->accumulation_dtype = accumulation_dtype;
   node->output_dtype = output_dtype;
   node->full_k_tiles = full_k_tiles;
+  node->core_domain = std::move(core_domain);
   node->source_span = std::move(source_span);
   data_ = std::move(node);
 }
@@ -92,17 +260,38 @@ void AccumulatorDescriptorNode::RegisterReflection() {
               &AccumulatorDescriptorNode::accumulation_dtype)
       .def_ro("output_dtype", &AccumulatorDescriptorNode::output_dtype)
       .def_ro("full_k_tiles", &AccumulatorDescriptorNode::full_k_tiles)
+      .def_ro("core_domain", &AccumulatorDescriptorNode::core_domain)
       .def_ro("source_span", &AccumulatorDescriptorNode::source_span);
 }
 ComputeValueDescriptor::ComputeValueDescriptor(
     int64_t value_id, tirx::Buffer buffer, int64_t version,
-    int64_t previous_value_id, int64_t accumulator_id, Span source_span) {
+    int64_t previous_value_id, int64_t accumulator_id, Span source_span)
+    : ComputeValueDescriptor(
+          value_id, buffer, version, previous_value_id, accumulator_id,
+          "compute_fragment", buffer->shape, {Integer(32), Integer(32)},
+          buffer->dtype, "trisc", CoreDomain(CoreCoord(0, 0), CoreCoord(1, 1)),
+          {}, std::move(source_span)) {}
+
+ComputeValueDescriptor::ComputeValueDescriptor(
+    int64_t value_id, tirx::Buffer buffer, int64_t version,
+    int64_t previous_value_id, int64_t accumulator_id, ffi::String value_kind,
+    ffi::Array<PrimExpr> logical_shape,
+    ffi::Array<PrimExpr> compute_tile_shape, DataType dtype,
+    ffi::String owner_slot, CoreDomain core_domain,
+    ffi::Array<Integer> materialization_refs, Span source_span) {
   auto node = ffi::make_object<ComputeValueDescriptorNode>();
   node->value_id = value_id;
   node->buffer = std::move(buffer);
   node->version = version;
   node->previous_value_id = previous_value_id;
   node->accumulator_id = accumulator_id;
+  node->value_kind = std::move(value_kind);
+  node->logical_shape = std::move(logical_shape);
+  node->compute_tile_shape = std::move(compute_tile_shape);
+  node->dtype = dtype;
+  node->owner_slot = std::move(owner_slot);
+  node->core_domain = std::move(core_domain);
+  node->materialization_refs = std::move(materialization_refs);
   node->source_span = std::move(source_span);
   data_ = std::move(node);
 }
@@ -114,6 +303,15 @@ void ComputeValueDescriptorNode::RegisterReflection() {
       .def_ro("previous_value_id",
               &ComputeValueDescriptorNode::previous_value_id)
       .def_ro("accumulator_id", &ComputeValueDescriptorNode::accumulator_id)
+      .def_ro("value_kind", &ComputeValueDescriptorNode::value_kind)
+      .def_ro("logical_shape", &ComputeValueDescriptorNode::logical_shape)
+      .def_ro("compute_tile_shape",
+              &ComputeValueDescriptorNode::compute_tile_shape)
+      .def_ro("dtype", &ComputeValueDescriptorNode::dtype)
+      .def_ro("owner_slot", &ComputeValueDescriptorNode::owner_slot)
+      .def_ro("core_domain", &ComputeValueDescriptorNode::core_domain)
+      .def_ro("materialization_refs",
+              &ComputeValueDescriptorNode::materialization_refs)
       .def_ro("source_span", &ComputeValueDescriptorNode::source_span);
 }
 ComputeRequirements::ComputeRequirements(
@@ -190,6 +388,24 @@ void TensorBackingNode::RegisterReflection() {
   refl::ObjectDef<TensorBackingNode>()
       .def_ro("global_arg_index", &TensorBackingNode::global_arg_index)
       .def_ro("byte_offset", &TensorBackingNode::byte_offset);
+}
+
+TensorStorageBacking::TensorStorageBacking(int64_t global_arg_index,
+                                           PrimExpr byte_offset,
+                                           PrimExpr byte_size) {
+  auto node = ffi::make_object<TensorStorageBackingNode>();
+  node->global_arg_index = global_arg_index;
+  node->byte_offset = std::move(byte_offset);
+  node->byte_size = std::move(byte_size);
+  data_ = std::move(node);
+}
+
+void TensorStorageBackingNode::RegisterReflection() {
+  ffi::reflection::ObjectDef<TensorStorageBackingNode>()
+      .def_ro("global_arg_index",
+              &TensorStorageBackingNode::global_arg_index)
+      .def_ro("byte_offset", &TensorStorageBackingNode::byte_offset)
+      .def_ro("byte_size", &TensorStorageBackingNode::byte_size);
 }
 
 OperationIdentity::OperationIdentity(ffi::String operation_id,
@@ -292,6 +508,48 @@ void DFBDescriptorNode::RegisterReflection() {
       .def_ro("transaction_count_or_loop_relation",
               &DFBDescriptorNode::transaction_count_or_loop_relation)
       .def_ro("source_span", &DFBDescriptorNode::source_span);
+}
+
+DFBStorageGroupDescriptor::DFBStorageGroupDescriptor(
+    int64_t storage_group_id, DataType element_dtype,
+    ffi::Array<PrimExpr> tile_shape,
+    ffi::Array<PrimExpr> block_shape_in_tiles, PrimExpr block_count,
+    ffi::String producer_slot, CoreDomain producer_domain,
+    ffi::String consumer_slot, CoreDomain consumer_domain,
+    ffi::Optional<TensorStorageBacking> storage_backing, Span source_span) {
+  auto node = ffi::make_object<DFBStorageGroupDescriptorNode>();
+  node->storage_group_id = storage_group_id;
+  node->element_dtype = element_dtype;
+  node->tile_shape = std::move(tile_shape);
+  node->block_shape_in_tiles = std::move(block_shape_in_tiles);
+  node->block_count = std::move(block_count);
+  node->producer_slot = std::move(producer_slot);
+  node->producer_domain = std::move(producer_domain);
+  node->consumer_slot = std::move(consumer_slot);
+  node->consumer_domain = std::move(consumer_domain);
+  node->storage_backing = std::move(storage_backing);
+  node->source_span = std::move(source_span);
+  data_ = std::move(node);
+}
+
+void DFBStorageGroupDescriptorNode::RegisterReflection() {
+  ffi::reflection::ObjectDef<DFBStorageGroupDescriptorNode>()
+      .def_ro("storage_group_id",
+              &DFBStorageGroupDescriptorNode::storage_group_id)
+      .def_ro("element_dtype", &DFBStorageGroupDescriptorNode::element_dtype)
+      .def_ro("tile_shape", &DFBStorageGroupDescriptorNode::tile_shape)
+      .def_ro("block_shape_in_tiles",
+              &DFBStorageGroupDescriptorNode::block_shape_in_tiles)
+      .def_ro("block_count", &DFBStorageGroupDescriptorNode::block_count)
+      .def_ro("producer_slot", &DFBStorageGroupDescriptorNode::producer_slot)
+      .def_ro("producer_domain",
+              &DFBStorageGroupDescriptorNode::producer_domain)
+      .def_ro("consumer_slot", &DFBStorageGroupDescriptorNode::consumer_slot)
+      .def_ro("consumer_domain",
+              &DFBStorageGroupDescriptorNode::consumer_domain)
+      .def_ro("storage_backing",
+              &DFBStorageGroupDescriptorNode::storage_backing)
+      .def_ro("source_span", &DFBStorageGroupDescriptorNode::source_span);
 }
 
 PipeDescriptor::PipeDescriptor(int64_t pipe_net_id, int64_t event_index,
@@ -501,9 +759,15 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   CoreDomainNode::RegisterReflection();
   ShardSpecNode::RegisterReflection();
   TensorBackingNode::RegisterReflection();
+  TensorStorageBackingNode::RegisterReflection();
   OperationIdentityNode::RegisterReflection();
   TensorDescriptorNode::RegisterReflection();
+  TTAccessDescriptorNode::RegisterReflection();
+  NormalizedTopologyDescriptorNode::RegisterReflection();
+  CommunicationDescriptorNode::RegisterReflection();
+  CommunicationStepDescriptorNode::RegisterReflection();
   DFBDescriptorNode::RegisterReflection();
+  DFBStorageGroupDescriptorNode::RegisterReflection();
   PipeDescriptorNode::RegisterReflection();
   PipeTransferDescriptorNode::RegisterReflection();
   LogicalKernelNode::RegisterReflection();
@@ -528,6 +792,71 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.tenstorrent.TensorBacking",
            [](int64_t global_arg_index, PrimExpr byte_offset) {
              return TensorBacking(global_arg_index, std::move(byte_offset));
+           })
+      .def("tl.tenstorrent.TensorStorageBacking",
+           [](int64_t global_arg_index, PrimExpr byte_offset,
+              PrimExpr byte_size) {
+             return TensorStorageBacking(global_arg_index,
+                                         std::move(byte_offset),
+                                         std::move(byte_size));
+           })
+      .def("tl.tenstorrent.TTAccessDescriptor",
+           [](int64_t access_id, tirx::Buffer buffer, ffi::String access_kind,
+              tirx::BufferRegion logical_region,
+              ffi::Array<Integer> access_map, ffi::String broadcast_kind,
+              ffi::Array<Integer> broadcast_axes, Span source_span) {
+             return TTAccessDescriptor(
+                 access_id, std::move(buffer), std::move(access_kind),
+                 std::move(logical_region), std::move(access_map),
+                 std::move(broadcast_kind), std::move(broadcast_axes),
+                 std::move(source_span));
+           })
+      .def("tl.tenstorrent.NormalizedTopologyDescriptor",
+           [](int64_t site_id, ffi::String kind,
+              tirx::BufferRegion source_region,
+              tirx::BufferRegion destination_region,
+              ffi::Array<PrimExpr> source_coord,
+              ffi::Array<PrimExpr> group_begin,
+              ffi::Array<PrimExpr> group_end, PrimExpr parameter,
+              ffi::String contract, PrimExpr guard,
+              ffi::Array<PrimExpr> occurrence_extents, Span source_span) {
+             return NormalizedTopologyDescriptor(
+                 site_id, std::move(kind), std::move(source_region),
+                 std::move(destination_region), std::move(source_coord),
+                 std::move(group_begin), std::move(group_end),
+                 std::move(parameter), std::move(contract), std::move(guard),
+                 std::move(occurrence_extents), std::move(source_span));
+           })
+      .def("tl.tenstorrent.CommunicationDescriptor",
+           [](int64_t communication_id, ffi::String kind,
+              ffi::String algorithm, tirx::BufferRegion source_region,
+              tirx::BufferRegion destination_region,
+              ffi::Array<PrimExpr> source_coord,
+              ffi::Array<PrimExpr> group_begin,
+              ffi::Array<PrimExpr> group_end, PrimExpr parameter,
+              ffi::String contract, ffi::Array<PrimExpr> occurrence_extents,
+              Span source_span) {
+             return CommunicationDescriptor(
+                 communication_id, std::move(kind), std::move(algorithm),
+                 std::move(source_region), std::move(destination_region),
+                 std::move(source_coord), std::move(group_begin),
+                 std::move(group_end), std::move(parameter),
+                 std::move(contract), std::move(occurrence_extents),
+                 std::move(source_span));
+           })
+      .def("tl.tenstorrent.CommunicationStepDescriptor",
+           [](int64_t step_id, int64_t communication_id, int64_t occurrence,
+              ffi::String kind, ffi::Optional<CoreCoord> source_core,
+              ffi::Optional<CoreCoord> destination_core,
+              int64_t source_dfb_id, int64_t destination_dfb_id,
+              ffi::String owner_slot, ffi::Array<Integer> dependencies,
+              PrimExpr parameter, Span source_span) {
+             return CommunicationStepDescriptor(
+                 step_id, communication_id, occurrence, std::move(kind),
+                 std::move(source_core), std::move(destination_core),
+                 source_dfb_id, destination_dfb_id, std::move(owner_slot),
+                 std::move(dependencies), std::move(parameter),
+                 std::move(source_span));
            })
       .def("tl.tenstorrent.OperationIdentity",
            [](ffi::String operation_id, Span source_span) {
@@ -564,6 +893,22 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                  std::move(consumer_slot), std::move(consumer_domain),
                  std::move(transaction_count_or_loop_relation),
                  std::move(source_span));
+           })
+      .def("tl.tenstorrent.DFBStorageGroupDescriptor",
+           [](int64_t storage_group_id, DataType element_dtype,
+              ffi::Array<PrimExpr> tile_shape,
+              ffi::Array<PrimExpr> block_shape_in_tiles,
+              PrimExpr block_count, ffi::String producer_slot,
+              CoreDomain producer_domain, ffi::String consumer_slot,
+              CoreDomain consumer_domain,
+              ffi::Optional<TensorStorageBacking> storage_backing,
+              Span source_span) {
+             return DFBStorageGroupDescriptor(
+                 storage_group_id, element_dtype, std::move(tile_shape),
+                 std::move(block_shape_in_tiles), std::move(block_count),
+                 std::move(producer_slot), std::move(producer_domain),
+                 std::move(consumer_slot), std::move(consumer_domain),
+                 std::move(storage_backing), std::move(source_span));
            })
       .def("tl.tenstorrent.IsSupportedAccumulatorDTypeTriple",
            IsSupportedAccumulatorDTypeTriple)

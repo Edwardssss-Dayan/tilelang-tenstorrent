@@ -2,6 +2,8 @@
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="legacy v9 active compaction was replaced by the current shared-grid Device schema")
+
 from tilelang import tvm
 from tilelang.tenstorrent import device_ir as D, lower_tenstorrent_ir, transform
 from tilelang.tenstorrent.pipeline import TENSTORRENT_LOWER_PASS_ORDER

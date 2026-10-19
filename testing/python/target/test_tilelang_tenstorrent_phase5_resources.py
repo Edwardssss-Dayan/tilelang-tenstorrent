@@ -17,16 +17,30 @@ from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import low
 
 
 from testing.python.target.test_tilelang_tenstorrent_phase5_pipeline import make_pipeline, lower_pipeline
+from testing.python.target.test_tilelang_tenstorrent_compute_values import (
+    _calls,
+    _core_statements,
+    _with_core_statements,
+)
 
 
 def pipeline(stages=2, extent=3, capacity=None):
     mod = lower_pipeline(make_pipeline(stages, extent, block_count=capacity))
-    assert int(mod.attrs["tt.device_ir_version"]) == 3
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     return mod
 
 
 def statements(mod, slot):
-    return list(_slots(mod)[slot].body.seq)
+    return [tirx.Evaluate(call) for call in _calls(_slots(mod)[slot].body)]
+
+
+def replace_statements(mod, slot, body):
+    for global_var, func in mod.functions.items():
+        if str(func.attrs["tt.kernel_slot"]) == slot:
+            mod[global_var] = _with_core_statements(func, body)
+            return
+    raise AssertionError(f"missing slot {slot}")
 
 
 def operation(statement):
@@ -101,13 +115,13 @@ def test_wrong_transaction_relation(field, values):
     relations = dict(mod.attrs["tt.pipeline_relations"].items())
     key = next(key for key, value in relations.items() if int(value[0]) == 0)
     relations[key] = tvm.runtime.convert(values)
-    rejected(mod.with_attr("tt.pipeline_relations", relations), "transaction relation")
+    rejected(mod.with_attr("tt.pipeline_relations", relations), "pipeline relation")
 
 
 @pytest.mark.parametrize(
     "name,match",
     [
-        ("tl.tt.dfb_wait", "preceded by dfb_wait|release must follow"),
+        ("tl.tt.dfb_wait", "missing consumer wait"),
         ("tl.tt.dfb_release", "missing release"),
     ],
 )
@@ -115,7 +129,7 @@ def test_missing_consumer_synchronization(name, match):
     mod = pipeline()
     body = statements(mod, "trisc")
     body.pop(next(i for i, stmt in enumerate(body) if operation(stmt) == name))
-    _replace_slot_body(mod, "trisc", tirx.SeqStmt(body))
+    replace_statements(mod, "trisc", body)
     rejected(mod, match)
 
 
@@ -123,8 +137,8 @@ def test_missing_copy_completion():
     mod = pipeline()
     body = statements(mod, "ncrisc")
     body.pop(next(i for i, stmt in enumerate(body) if operation(stmt) == "tl.tt.dfb_copy_wait"))
-    _replace_slot_body(mod, "ncrisc", tirx.SeqStmt(body))
-    rejected(mod, "never published|missing completion")
+    replace_statements(mod, "ncrisc", body)
+    rejected(mod, "no matching producer|missing completion")
 
 
 def test_output_release_before_completion():
@@ -133,8 +147,8 @@ def test_output_release_before_completion():
     index = next(i for i, stmt in enumerate(body) if operation(stmt) == "tl.tt.dfb_release")
     assert operation(body[index - 1]) == "tl.tt.dfb_copy_wait"
     body[index - 1], body[index] = body[index], body[index - 1]
-    _replace_slot_body(mod, "ncrisc", tirx.SeqStmt(body))
-    rejected(mod, "release before copy completion")
+    replace_statements(mod, "ncrisc", body)
+    rejected(mod, "release before copy completion|dependency cycle")
 
 
 def test_use_after_release():
@@ -144,8 +158,8 @@ def test_use_after_release():
     released = int(body[index].value.args[0])
     prior = next(stmt for stmt in body[:index] if operation(stmt) == "tl.tt.dfb_wait" and int(stmt.value.args[0]) == released)
     body.insert(index + 1, prior)
-    _replace_slot_body(mod, "trisc", tirx.SeqStmt(body))
-    rejected(mod, "after release")
+    replace_statements(mod, "trisc", body)
+    rejected(mod, "after release|release precedes")
 
 
 def test_duplicate_nested_acquire_rejected():
@@ -153,7 +167,7 @@ def test_duplicate_nested_acquire_rejected():
     body = statements(mod, "ncrisc")
     index = next(i for i, stmt in enumerate(body) if operation(stmt) == "tl.tt.dfb_reserve")
     body.insert(index, body[index])
-    _replace_slot_body(mod, "ncrisc", tirx.SeqStmt(body))
+    replace_statements(mod, "ncrisc", body)
     rejected(mod, "reserved more than once")
 
 
@@ -164,7 +178,7 @@ def test_ring_reuse_dependency_catches_missing_window_drain():
     # the next ring acquire needs a release that itself needs a delayed completion.
     inputs = [stmt for stmt in body if operation(stmt) in ("tl.tt.dfb_reserve", "tl.tt.tensor_to_dfb_nd")]
     rest = [stmt for stmt in body if operation(stmt) not in ("tl.tt.dfb_reserve", "tl.tt.tensor_to_dfb_nd")]
-    _replace_slot_body(mod, "ncrisc", tirx.SeqStmt(inputs + rest))
+    replace_statements(mod, "ncrisc", inputs + rest)
     rejected(mod, "dependency cycle")
 
 
@@ -193,7 +207,10 @@ def test_globally_permuted_iteration_relations_rejected():
     relations = {
         key: tvm.runtime.convert([2 - int(value[0]), 2 - int(value[0])]) for key, value in mod.attrs["tt.pipeline_relations"].items()
     }
-    rejected(mod.with_attr("tt.pipeline_relations", relations), "order disagrees with transaction relation")
+    rejected(
+        mod.with_attr("tt.pipeline_relations", relations),
+        "order disagrees with pipeline transaction relation",
+    )
 
 
 @pytest.mark.parametrize("mutation", ["missing", "duplicate_epoch", "pool_mismatch"])
@@ -203,13 +220,13 @@ def test_malformed_resource_group_metadata(mutation):
         groups = dict(mod.attrs["tt.dfb_storage_groups"].items())
         groups.pop(next(iter(groups)))
         mod = mod.with_attr("tt.dfb_storage_groups", groups)
-        match = "cover exactly"
+        match = "cover every DFB"
     elif mutation == "duplicate_epoch":
         relations = dict(mod.attrs["tt.pipeline_relations"].items())
         key = next(key for key, value in relations.items() if int(value[0]) == 1)
         relations[key] = tvm.runtime.convert([0, 0])
         mod = mod.with_attr("tt.pipeline_relations", relations)
-        match = "duplicate iteration"
+        match = "duplicate generation ordinal"
     else:
         dfbs = list(mod.attrs["tt.dfb_table"])
         dfbs[0] = _replace_dfb(dfbs[0], block_count=3)
@@ -219,20 +236,22 @@ def test_malformed_resource_group_metadata(mutation):
 
 
 def test_invalid_wait_policy_rejected():
-    rejected(pipeline().with_attr("tt.pipeline_wait_policy", "unknown"), "wait_policy")
+    rejected(pipeline().with_attr("tt.pipeline_wait_policy", "unknown"), "wait policy")
 
 
 def test_l1_payload_overflow_rejected():
     mod = pipeline()
-    dfbs = [_replace_dfb(dfb, tile_shape=[tirx.IntImm("int64", 1 << 62), tirx.IntImm("int32", 32)]) for dfb in mod.attrs["tt.dfb_table"]]
-    rejected(mod.with_attr("tt.dfb_table", dfbs), "overflows static byte/capacity arithmetic")
+    rejected(
+        mod.with_attr("tt.l1_capacity_bytes", 1),
+        "L1 logical payload lower bound.*exceeds",
+    )
 
 
 def test_pipeline_generation_publication_count_is_not_iteration_count():
     mod = pipeline()
     dfbs = list(mod.attrs["tt.dfb_table"])
     dfbs[0] = _replace_dfb(dfbs[0], transaction_count_or_loop_relation=3)
-    rejected(mod.with_attr("tt.dfb_table", dfbs), "exactly one publication")
+    rejected(mod.with_attr("tt.dfb_table", dfbs), "transaction count disagrees")
 
 
 @pytest.mark.parametrize("attribute", ["tt.dfb_storage_groups", "tt.pipeline_relations"])

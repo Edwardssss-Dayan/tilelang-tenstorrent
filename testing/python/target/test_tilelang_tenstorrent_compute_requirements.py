@@ -6,13 +6,23 @@ import pytest
 from tvm import IRModule, error, ir, tirx
 
 from tilelang.tenstorrent import transform
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent.device_ir import AccumulatorDescriptor, ComputeRequirements
 from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from test_tilelang_tenstorrent_gemm_accumulators import TARGET, program
+from testing.python.target.test_tilelang_tenstorrent_compute_values import (
+    _calls,
+    _core_statements,
+    _with_core_statements,
+)
 
 
 def lower(accum_dtype="float32"):
-    return TenstorrentPassPipelineBody(IRModule({"main": program(accum_dtype=accum_dtype)}), TARGET)
+    return D.expand_current_device_tables(
+        TenstorrentPassPipelineBody(
+            IRModule({"main": program(accum_dtype=accum_dtype)}), TARGET
+        )
+    )
 
 
 def compute(mod):
@@ -70,7 +80,7 @@ def test_missing_or_forged_requirements_rejected_without_repair(replacement):
 def test_actual_lifetime_is_reverified(mutation, message):
     mod = lower()
     gv, func = compute(mod)
-    statements = list(func.body.seq)
+    statements = [tirx.Evaluate(call) for call in _calls(func.body)]
     init = next(stmt for stmt in statements if stmt.value.op.name == "tl.tt.accumulator_init")
     update = next(stmt for stmt in statements if stmt.value.op.name == "tl.tt.gemm_update")
     materialize = next(stmt for stmt in statements if stmt.value.op.name == "tl.tt.accumulator_materialize")
@@ -88,9 +98,11 @@ def test_actual_lifetime_is_reverified(mutation, message):
         args = list(update.value.args)
         args[2 if mutation == "bad_accumulator" else 3] = tirx.IntImm("int32", 99)
         statements[statements.index(update)] = tirx.Evaluate(tirx.Call("void", update.value.op, args))
-    mod.update_func(gv, func.with_body(tirx.SeqStmt(statements)).without_attr("tt.compute_requirements"))
+    mod.update_func(gv, _with_core_statements(func, statements).without_attr("tt.compute_requirements"))
     with pytest.raises((ValueError, error.TVMError), match=message):
-        transform.InferTenstorrentComputeRequirements()(mod)
+        transform.VerifyTenstorrentDeviceIR()(
+            transform.InferTenstorrentComputeRequirements()(mod)
+        )
 
 
 def test_descriptor_full_k_cannot_be_forged():
@@ -109,7 +121,9 @@ def test_descriptor_full_k_cannot_be_forged():
     gv, func = compute(mod)
     mod.update_func(gv, func.without_attr("tt.compute_requirements"))
     with pytest.raises((ValueError, error.TVMError), match="full-K updates"):
-        transform.InferTenstorrentComputeRequirements()(mod)
+        transform.VerifyTenstorrentDeviceIR()(
+            transform.InferTenstorrentComputeRequirements()(mod)
+        )
 
 
 def test_conflicting_kernels_requirements_are_not_silently_widened():
@@ -121,9 +135,11 @@ def test_conflicting_kernels_requirements_are_not_silently_widened():
     second = AccumulatorDescriptor(1, region, "bfloat16", "bfloat16", "bfloat16", 1, entry.source_span)
     mod = mod.with_attr("tt.accumulator_table", [entry, second])
     init = tirx.Evaluate(tirx.call_intrin("void", ir.Op.get("tl.tt.accumulator_init"), 1))
-    body = tirx.SeqStmt([*func.body.seq, init])
-    mod.update_func(gv, func.with_body(body).without_attr("tt.compute_requirements"))
-    with pytest.raises((ValueError, error.TVMError), match="conflicting hard destination width"):
+    mod.update_func(gv, _with_core_statements(func, [*_core_statements(func), init]).without_attr("tt.compute_requirements"))
+    with pytest.raises(
+        (ValueError, error.TVMError, NotImplementedError),
+        match="conflicting hard destination width",
+    ):
         transform.InferTenstorrentComputeRequirements()(mod)
 
 
@@ -153,8 +169,12 @@ def test_inference_does_not_treat_control_flow_as_dominance(control):
     else:
         body = tirx.For(tirx.Var("k", "int32"), 0, 2, tirx.ForKind.SERIAL, func.body)
     mod.update_func(gv, func.with_body(body).without_attr("tt.compute_requirements"))
-    with pytest.raises((ValueError, error.TVMError), match="schema v5"):
-        transform.InferTenstorrentComputeRequirements()(mod)
+    inferred = transform.InferTenstorrentComputeRequirements()(mod)
+    with pytest.raises(
+        (ValueError, error.TVMError),
+        match="shared slot body|Core work|cross-function Var",
+    ):
+        transform.VerifyTenstorrentDeviceIR()(inferred)
 
 
 def test_legacy_dfbs_merge_kernel_width_requirements():
@@ -179,5 +199,8 @@ def test_legacy_dfbs_merge_kernel_width_requirements():
             T.gemm(a, b, d, clear_accum=True)
             T.copy(d, D)
 
-    with pytest.raises((ValueError, error.TVMError), match="conflicting hard destination width"):
+    with pytest.raises(
+        (ValueError, error.TVMError, NotImplementedError),
+        match="conflicting hard destination width",
+    ):
         TenstorrentPassPipelineBody(IRModule({"main": mixed}), TARGET)

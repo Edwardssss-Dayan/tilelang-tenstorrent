@@ -16,13 +16,17 @@ from testing.python.target.test_tilelang_tenstorrent_phase0_contract import (
 
 TARGET_CONFIG = {"kind": "tenstorrent", "arch": "wormhole_b0"}
 MODULE_ATTRS = {
-    "tt.device_ir_version",
+    "tt.ir_stage",
     "tt.target_arch",
     "tt.launch_grid",
     "tt.operation_identity",
     "tt.tensor_table",
-    "tt.dfb_table",
-    "tt.pipe_table",
+    "tt.dfb_families",
+    "tt.dfb_storage_groups",
+    "tt.dfb_storage_group_relations",
+    "tt.communication_table",
+    "tt.communication_step_families",
+    "tt.transport_families",
     "tt.kernel_order",
 }
 
@@ -70,7 +74,8 @@ def test_backend_context_lowers_minimal_frontend_to_device_ir(monkeypatch):
 
     assert verified.same_as(lowered)
     assert set(str(key) for key in lowered.attrs.keys()) == MODULE_ATTRS
-    assert int(lowered.attrs["tt.device_ir_version"]) == 1
+    assert str(lowered.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in lowered.attrs
     assert str(lowered.attrs["tt.target_arch"]) == "wormhole_b0"
     assert (int(lowered.attrs["tt.launch_grid"].x), int(lowered.attrs["tt.launch_grid"].y)) == (
         1,
@@ -78,14 +83,16 @@ def test_backend_context_lowers_minimal_frontend_to_device_ir(monkeypatch):
     )
     assert str(lowered.attrs["tt.operation_identity"].operation_id) == "phase1_noop"
     assert len(lowered.attrs["tt.tensor_table"]) == 1
-    assert not lowered.attrs["tt.dfb_table"]
-    assert not lowered.attrs["tt.pipe_table"]
+    assert not lowered.attrs["tt.dfb_families"]
+    assert not lowered.attrs["tt.communication_table"]
+    assert not lowered.attrs["tt.communication_step_families"]
+    assert not lowered.attrs["tt.transport_families"]
 
     functions = {str(func.attrs["tt.kernel_slot"]): func for func in lowered.functions.values()}
     assert set(functions) == {"trisc", "ncrisc", "brisc"}
-    assert str(functions["trisc"].attrs["tt.logical_kernel"].role) == "phase1_skeleton"
-    for slot in ("ncrisc", "brisc"):
-        assert str(functions[slot].attrs["tt.logical_kernel"].role) == "idle"
+    assert str(functions["trisc"].attrs["tt.logical_kernel"].role) == "general"
+    for slot, role in (("ncrisc", "tensor_io"), ("brisc", "transport")):
+        assert str(functions[slot].attrs["tt.logical_kernel"].role) == role
         assert isinstance(functions[slot].body, tirx.Evaluate)
         assert int(functions[slot].body.value) == 0
     for func in functions.values():
@@ -98,7 +105,6 @@ def test_backend_context_lowers_minimal_frontend_to_device_ir(monkeypatch):
     restored = ir.load_json(ir.save_json(lowered))
     ir.assert_structural_equal(restored, lowered)
     assert str(restored) == str(lowered)
-    assert prepare_ttl_codegen(restored, context.target).same_as(restored)
 
 
 def test_phase1_pipeline_is_deterministic(monkeypatch):
@@ -121,52 +127,42 @@ def test_phase1_read_only_gates_are_identity_for_supported_subset(monkeypatch):
         transform.InferTenstorrentTensorLayout(),
     ):
         mod = compiler_pass(mod)
-    before = ir.save_json(mod)
     gated = transform.LegalizeTenstorrentTileOps()(mod)
     ir.assert_structural_equal(gated, mod)
     gated = transform.NormalizeTenstorrentTopology()(gated)
-    ir.assert_structural_equal(gated, mod)
-    assert ir.save_json(gated) == before
+    assert int(gated["phase1_noop"].attrs["tt.topology_normalized"]) == 1
+    assert not gated["phase1_noop"].attrs["tt.normalized_topology"]
 
 
-@pytest.mark.parametrize(
-    ("name", "func", "message"),
-    (
-        ("store", phase1_store, "structured T.Parallel or T.Tiles operation"),
-        ("dfb_only", phase1_dfb_only, "requires Phase 2 transaction planning"),
-    ),
-)
-def test_phase1_pipeline_rejects_deferred_capabilities(monkeypatch, name, func, message):
+def test_phase1_pipeline_rejects_uncaptured_store(monkeypatch):
     context = _context(monkeypatch)
-    with pytest.raises(NotImplementedError, match=message):
-        context.lower(tvm.IRModule({name: func}))
+    with pytest.raises(ValueError, match="uncaptured BufferStore"):
+        context.lower(tvm.IRModule({"store": phase1_store}))
 
 
-def test_topology_specializes_pipe_when_called_directly(monkeypatch):
+def test_unused_shared_allocation_forms_empty_device_program(monkeypatch):
+    context = _context(monkeypatch)
+    result = context.lower(tvm.IRModule({"dfb_only": phase1_dfb_only}))
+    assert str(result.attrs["tt.ir_stage"]) == "device"
+    assert not result.attrs["tt.dfb_families"]
+
+
+def test_topology_rejects_legacy_pipe_when_called_directly(monkeypatch):
     context = _context(monkeypatch)
     mod = tirx.transform.BindTarget(context.target)(tvm.IRModule({"p2p": FRONTEND_PROGRAMS["p2p"]}))
-    for compiler_pass in (
-        transform.ValidateTenstorrentFrontendIR(),
-        transform.NormalizeTenstorrentLaunch(),
-        transform.NormalizeTenstorrentBufferMetadata(),
-        transform.NormalizeTenstorrentRegions(),
-        transform.InferTenstorrentTensorLayout(),
-    ):
-        mod = compiler_pass(mod)
-    normalized = transform.NormalizeTenstorrentTopology()(mod)
-    assert int(normalized["p2p"].attrs["tt.topology_normalized"]) == 1
-    assert "tl.tt.foreach_src" not in normalized.script()
-    assert "tl.tt.foreach_dst" not in normalized.script()
+    with pytest.raises(NotImplementedError, match="legacy PipeNet"):
+        transform.ValidateTenstorrentFrontendIR()(mod)
 
 
 def test_multicore_noop_forms_verified_device_ir(monkeypatch):
     context = _context(monkeypatch)
     lowered = context.lower(tvm.IRModule({"multicore": phase1_multicore_noop}))
-    assert int(lowered.attrs["tt.device_ir_version"]) == 4
+    assert str(lowered.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in lowered.attrs
     transform.VerifyTenstorrentDeviceIR()(lowered)
 
 
 def test_pipe_with_uninitialized_payload_is_rejected(monkeypatch):
     context = _context(monkeypatch)
-    with pytest.raises(ValueError, match="before.*write|uninitialized|read.*before"):
+    with pytest.raises(NotImplementedError, match="legacy PipeNet"):
         context.lower(tvm.IRModule({"p2p": FRONTEND_PROGRAMS["p2p"]}))

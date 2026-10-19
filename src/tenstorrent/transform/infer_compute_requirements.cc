@@ -15,6 +15,7 @@
 #include "../op/builtin.h"
 #include "compact_device_program.h"
 #include "device_metadata_interner.h"
+#include "device_table_compaction.h"
 
 namespace tvm {
 namespace tl {
@@ -24,6 +25,10 @@ using namespace tirx;
 void Check(bool valid, const std::string &message) {
   if (!valid)
     TVM_FFI_THROW(ValueError) << "[TenstorrentComputeRequirements] " << message;
+}
+[[noreturn]] void Unsupported(const std::string &message) {
+  TVM_FFI_THROW(NotImplementedError)
+      << "[TenstorrentComputeRequirements] " << message;
 }
 int64_t IntegerValue(const PrimExpr &value) {
   const auto *imm = value.as<IntImmNode>();
@@ -42,8 +47,108 @@ ffi::String StringAnnotation(const Call &call, const char *key) {
 
 ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
                                               const tirx::PrimFunc &func) {
-  if (mod->GetAttr<Integer>(kDeviceIRVersionAttr).value_or(Integer(0))->value ==
-      8) {
+  int64_t legacy_version =
+      mod->GetAttr<Integer>(kDeviceIRVersionAttr).value_or(Integer(0))->value;
+  bool current_device =
+      mod->GetAttr<ffi::String>("tt.ir_stage").value_or("") == "device";
+  if (current_device) {
+    if (func->GetAttr<ffi::String>(kKernelSlotAttr).value_or("") != "trisc")
+      return ComputeRequirements("unconstrained", "allowed", {});
+    bool requires_fp32 = false;
+    bool has_fp32_dfb_gemm = false;
+    bool has_bf16_dfb_gemm = false;
+    for (const ComputeValueDescriptor &value :
+         mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
+                kComputeValueTableAttr)
+             .value_or(ffi::Array<ComputeValueDescriptor>()))
+      requires_fp32 |= value->dtype == DataType::Float(32);
+    PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
+      if (const auto *cast = node.as<CastNode>())
+        requires_fp32 |= cast->dtype == DataType::Float(32) &&
+                         cast->value.dtype() != DataType::Float(32);
+      const auto *call = node.as<CallNode>();
+      if (!call)
+        return;
+      if (call->op.same_as(dfb_compute())) {
+        auto kind = call->annotations.Get("tt.compute_kind");
+        auto accumulation = call->annotations.Get("tt.accum_dtype");
+        if (kind.has_value() && accumulation.has_value() &&
+            Downcast<StringImm>(kind.value())->value == "gemm") {
+          ffi::String dtype =
+              Downcast<StringImm>(accumulation.value())->value;
+          Check(dtype == "float32" || dtype == "bfloat16",
+                "unsupported GEMM accumulation dtype");
+          has_fp32_dfb_gemm |= dtype == "float32";
+          has_bf16_dfb_gemm |= dtype == "bfloat16";
+        }
+      }
+      auto expression = call->annotations.Get("tt.expression");
+      if (!expression.has_value())
+        return;
+      auto typed = expression.value().as<PrimExpr>();
+      Check(typed.has_value(), "invalid compute precision expression");
+      PostOrderVisit(typed.value(), [&](const ffi::ObjectRef &item) {
+        if (auto value = item.as<PrimExpr>())
+          requires_fp32 |= value.value().dtype() == DataType::Float(32);
+      });
+    });
+    ffi::String width = requires_fp32 ? "bits32_required" : "unconstrained";
+    ffi::String full = "allowed";
+    if (has_fp32_dfb_gemm) {
+      width = "bits32_required";
+      full = "allowed";
+    }
+    if (has_bf16_dfb_gemm) {
+      if (width == "bits32_required")
+        Unsupported("conflicting hard destination width requirements in one "
+                    "shared compute kernel");
+      width = "bits16_required";
+      full = "forbidden";
+    }
+    ffi::Array<AccumulatorDescriptor> requirements;
+    ffi::Array<AccumulatorDescriptor> table =
+        mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr)
+            .value_or(ffi::Array<AccumulatorDescriptor>());
+    for (const AccumulatorDescriptor &accumulator : table) {
+      Check(accumulator.defined() &&
+                IsSupportedAccumulatorDTypeTriple(
+                    accumulator->input_dtype,
+                    accumulator->accumulation_dtype,
+                    accumulator->output_dtype),
+            "invalid or unsupported accumulator dtype triple");
+      bool fp32 = accumulator->accumulation_dtype == DataType::Float(32);
+      ffi::String next_width = fp32 ? "bits32_required" : "bits16_required";
+      ffi::String next_full = fp32 ? "required" : "forbidden";
+      bool compatible =
+          (width == "unconstrained" || width == next_width) &&
+          (full == "allowed" || full == next_full);
+      if (!compatible)
+        Unsupported("conflicting hard destination width requirements in one "
+                    "shared compute kernel");
+      width = next_width;
+      full = next_full;
+      bool duplicate = false;
+      for (const AccumulatorDescriptor &existing : requirements)
+        duplicate |=
+            existing->input_dtype == accumulator->input_dtype &&
+            existing->accumulation_dtype == accumulator->accumulation_dtype &&
+            existing->output_dtype == accumulator->output_dtype &&
+            existing->full_k_tiles == accumulator->full_k_tiles &&
+            existing->accumulator_region->buffer->name ==
+                accumulator->accumulator_region->buffer->name &&
+            ffi::StructuralEqual()(
+                existing->accumulator_region->buffer->shape,
+                accumulator->accumulator_region->buffer->shape) &&
+            ffi::StructuralEqual()(existing->accumulator_region->region,
+                                   accumulator->accumulator_region->region) &&
+            ffi::StructuralEqual()(existing->source_span,
+                                   accumulator->source_span);
+      if (!duplicate)
+        requirements.push_back(accumulator);
+    }
+    return ComputeRequirements(width, full, requirements);
+  }
+  if (!current_device && legacy_version == 8) {
     auto regions = DeriveRegionComputeRequirements(mod, func);
     ffi::Array<AccumulatorDescriptor> accumulators;
     std::set<int64_t> seen;
@@ -55,8 +160,8 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
                                                : "region_scoped",
                                "allowed", accumulators);
   }
-  if (mod->GetAttr<Integer>(kDeviceIRVersionAttr).value_or(Integer(0))->value ==
-      7) {
+  if (legacy_version == 7 ||
+      (current_device && mod->attrs->dict.count(kComputeValueTableAttr))) {
     auto values = mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
         kComputeValueTableAttr);
     Check(values.has_value(), "v7 missing compute value table");
@@ -79,17 +184,29 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
               "invalid or duplicate accumulator descriptor");
       }
     std::set<int64_t> used;
-    PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
-      const auto *call = node.as<CallNode>();
-      if (call && (call->op.same_as(compute_value()) ||
-                   call->op.same_as(compute_value_gemm()))) {
-        Check(!call->args.empty(), "compute value definition missing ID");
-        int64_t id = IntegerValue(call->args[0]);
-        Check(by_id.count(id), "compute value references missing descriptor");
-        requires_fp32 |= by_id.at(id)->buffer->dtype == DataType::Float(32);
+    if (current_device) {
+      for (const auto &[id, value] : by_id) {
+        requires_fp32 |= value->buffer->dtype == DataType::Float(32);
+        if (value->accumulator_id >= 0)
+          used.insert(value->accumulator_id);
       }
-      if (call && (call->op.same_as(compute_value()) ||
-                   call->op.same_as(dfb_compute()))) {
+      PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
+        const auto *cast = node.as<CastNode>();
+        requires_fp32 |= cast && cast->dtype == DataType::Float(32) &&
+                         cast->value.dtype() != DataType::Float(32);
+      });
+    } else {
+      PostOrderVisit(func->body, [&](const ffi::ObjectRef &node) {
+        const auto *call = node.as<CallNode>();
+        if (call && (call->op.same_as(compute_value()) ||
+                     call->op.same_as(compute_value_gemm()))) {
+          Check(!call->args.empty(), "compute value definition missing ID");
+          int64_t id = IntegerValue(call->args[0]);
+          Check(by_id.count(id), "compute value references missing descriptor");
+          requires_fp32 |= by_id.at(id)->buffer->dtype == DataType::Float(32);
+        }
+        if (call && (call->op.same_as(compute_value()) ||
+                     call->op.same_as(dfb_compute()))) {
         auto expression = call->annotations.Get("tt.expression");
         if (expression.has_value()) {
           auto expr = expression.value().as<PrimExpr>();
@@ -99,15 +216,17 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
               requires_fp32 |= value.value().dtype() == DataType::Float(32);
           });
         }
-      }
-      if (!call || !call->op.same_as(compute_value_gemm()))
-        return;
-      Check(call->args.size() == 6, "value GEMM arity mismatch");
-      int64_t id = IntegerValue(call->args[0]);
-      Check(by_id.count(id) && accumulators.count(by_id.at(id)->accumulator_id),
-            "value GEMM references missing accumulator");
-      used.insert(by_id.at(id)->accumulator_id);
-    });
+        }
+        if (!call || !call->op.same_as(compute_value_gemm()))
+          return;
+        Check(call->args.size() == 6, "value GEMM arity mismatch");
+        int64_t id = IntegerValue(call->args[0]);
+        Check(by_id.count(id) &&
+                  accumulators.count(by_id.at(id)->accumulator_id),
+              "value GEMM references missing accumulator");
+        used.insert(by_id.at(id)->accumulator_id);
+      });
+    }
     ffi::Array<AccumulatorDescriptor> requirements;
     ffi::String full = "allowed",
                 width = requires_fp32 ? "bits32_required" : "unconstrained";
@@ -119,10 +238,14 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       bool fp32 = acc->accumulation_dtype == DataType::Float(32);
       ffi::String next_width = fp32 ? "bits32_required" : "bits16_required";
       ffi::String next_full = fp32 ? "required" : "forbidden";
-      Check((width == "unconstrained" || width == next_width) &&
-                (full == "allowed" || full == next_full),
-            "conflicting hard destination width requirements in one compute "
-            "kernel");
+      bool compatible =
+          (width == "unconstrained" || width == next_width) &&
+          (full == "allowed" || full == next_full);
+      if (current_device && !compatible)
+        Unsupported("conflicting hard destination width requirements in one "
+                    "shared compute kernel");
+      Check(compatible,
+            "conflicting hard destination width requirements in one compute kernel");
       width = next_width;
       full = next_full;
       requirements.push_back(acc);
@@ -153,6 +276,29 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
               "accumulator operations cross Core or processor ownership");
       });
     }
+  }
+  if (current_device && entries.has_value()) {
+    auto is_core_dispatch = [](const Stmt &statement) {
+      const auto *branch = statement.as<IfThenElseNode>();
+      if (!branch)
+        return false;
+      bool has_core_query = false;
+      PostOrderVisit(branch->condition, [&](const ffi::ObjectRef &node) {
+        const auto *call = node.as<CallNode>();
+        has_core_query |= call &&
+                          (call->op.same_as(tenstorrent::core_x()) ||
+                           call->op.same_as(tenstorrent::core_y()));
+      });
+      return has_core_query;
+    };
+    bool canonical = is_core_dispatch(func->body);
+    if (const auto *sequence = func->body.as<SeqStmtNode>()) {
+      canonical = !sequence->seq.empty();
+      for (const Stmt &statement : sequence->seq)
+        canonical &= is_core_dispatch(statement);
+    }
+    Check(canonical,
+          "shared Device accumulator lifetime has unverified outer control flow");
   }
   std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual> storage;
   if (entries.has_value()) {
@@ -232,9 +378,13 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       if (const auto *call = evaluate->value.as<CallNode>())
         calls.push_back(ffi::GetRef<Call>(call));
     } else if (const auto *loop = stmt.as<ForNode>()) {
-      Check(table.empty(),
-            "schema v5 requires statically expanded serial K updates");
       collect(loop->body);
+    } else if (const auto *branch = stmt.as<IfThenElseNode>()) {
+      collect(branch->then_case);
+      if (branch->else_case.has_value())
+        collect(branch->else_case.value());
+    } else if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+      collect(realize->block->body);
     } else {
       Check(table.empty(),
             "schema v5 lifetime must contain only scheduled operations");
@@ -469,6 +619,8 @@ tvm::transform::Pass InferTenstorrentComputeRequirements() {
     bool was_compact = mod->GetAttr<Integer>(kDeviceIRVersionAttr)
                            .value_or(Integer(0))
                            ->value == 9;
+    bool current_families = HasCurrentDeviceFamilies(mod);
+    mod = ExpandCurrentDeviceTables(mod);
     mod = ExpandDeviceProgram(mod);
     IRModule result = mod;
     result.CopyOnWrite();
@@ -504,8 +656,12 @@ tvm::transform::Pass InferTenstorrentComputeRequirements() {
                      "tt.compute_region_requirements", regions));
       }
     }
-    return CompactDeviceProgram(DeviceMetadataInterner::Rewrite(result),
-                                was_compact);
+    result = DeviceMetadataInterner::Rewrite(result);
+    if (current_families) {
+      result = DiscardCurrentDeviceExpansionMetadata(result);
+      return ParameterizeCurrentDeviceTables(result);
+    }
+    return CompactDeviceProgram(result, was_compact);
   };
   return tvm::transform::CreateModulePass(
       pass_func, 0, "tl.tenstorrent.InferTenstorrentComputeRequirements", {});

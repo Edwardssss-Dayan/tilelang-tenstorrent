@@ -5,6 +5,7 @@ import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform
+from tilelang.tenstorrent import device_ir as D
 from tvm import ir, tirx
 
 from testing.python.target.test_tilelang_tenstorrent_compute_value_verifier import check_rejected, device, rewrite_calls
@@ -26,15 +27,18 @@ def attention_row_program(dtype="float32", cores=1):
                 output[i, j] = column[i, 0]
             T.copy(output, C[1, 0, x * 32 : (x + 1) * 32, :])
 
-    return lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
+    return D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
+    )
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("cores", [1, 2])
 def test_attention_row_metadata_roundtrip(dtype, cores):
     mod = attention_row_program(dtype, cores)
-    assert int(mod.attrs["tt.device_ir_version"]) == 7
-    assert len(mod.functions) == cores * 3
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
+    assert len(mod.functions) == 3
     assert all(len(tensor.shape) == 4 for tensor in mod.attrs["tt.tensor_table"])
     assert any(tuple(int(n) for n in value.buffer.shape) == (32, 1) for value in mod.attrs["tt.compute_value_table"])
     restored = ir.load_json(ir.save_json(mod))
@@ -64,8 +68,11 @@ def test_tensor_rank_mapping_rejects_non_singleton_axis(cores):
 def test_shared_only_tensor_rank_mapping_keeps_slice_checks():
     from testing.python.target.test_tilelang_tenstorrent_attention_regions import tensor_slice_program
 
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": tensor_slice_program()}), TARGET)
-    assert int(mod.attrs["tt.device_ir_version"]) == 2
+    mod = D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": tensor_slice_program()}), TARGET)
+    )
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
 
     def edit(call):
         if call.op.name != "tl.tt.tensor_to_dfb_nd":

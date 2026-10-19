@@ -39,6 +39,10 @@ TVM_DLL const Op &pipe_dst_range();
 TVM_DLL const Op &pipe_send();
 TVM_DLL const Op &pipe_recv();
 
+/*! \brief Logical Core coordinates of the current shared-grid kernel instance. */
+TVM_DLL const Op &core_x();
+TVM_DLL const Op &core_y();
+
 /*!
  * \brief Describe one source-exclusive, logically synchronous Core transfer.
  *
@@ -89,6 +93,8 @@ TVM_DLL const Op &tile_add();
 TVM_DLL const Op &tile_compute();
 TVM_DLL const Op &dfb_compute();
 TVM_DLL const Op &dfb_load();
+/*! \brief Pure structured-expression leaf referencing one typed access ID. */
+TVM_DLL const Op &compute_access();
 // Schema v7 immutable compute-local definitions, references and stores.
 TVM_DLL const Op &compute_precision();
 TVM_DLL const Op &compute_value();
@@ -135,6 +141,10 @@ TVM_DLL const Op &dfb_pipe_wait();
 TVM_DLL const Op &tensor_to_dfb();
 TVM_DLL const Op &dfb_to_tensor();
 TVM_DLL const Op &dfb_add();
+/*! \brief Current Device-IR local copy/collective assembly operations. */
+TVM_DLL const Op &dfb_local_copy();
+TVM_DLL const Op &dfb_gather_copy();
+TVM_DLL const Op &dfb_collective_reduce();
 
 /*!
  * \brief Schema v2 transfers with rank-preserving Tensor slices.

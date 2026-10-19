@@ -26,6 +26,15 @@ bool DeviceTablesFitExpansionBudget(const IRModule &mod);
 /*! \brief Validate and restore compact tables in their original order. */
 IRModule ExpandDeviceTables(IRModule mod);
 
+/*! \brief Replace current-stage concrete tables with typed relation families. */
+IRModule ParameterizeCurrentDeviceTables(IRModule mod);
+/*! \brief Restore current-stage concrete tables for bounded internal proof. */
+IRModule ExpandCurrentDeviceTables(IRModule mod);
+/*! \brief Remove diagnostic expansion markers before rebuilding families. */
+IRModule DiscardCurrentDeviceExpansionMetadata(IRModule mod);
+/*! \brief Whether any current-stage family attribute is present. */
+bool HasCurrentDeviceFamilies(const IRModule &mod);
+
 } // namespace tenstorrent
 } // namespace tl
 } // namespace tvm

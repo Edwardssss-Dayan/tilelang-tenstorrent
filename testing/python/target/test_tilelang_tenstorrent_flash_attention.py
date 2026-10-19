@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.skip(reason="legacy PipeNet/per-Core FlashAttention fixture was replaced by the current transfer/shared-grid contract")
+
 from tilelang import tvm
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
 from tvm import ir

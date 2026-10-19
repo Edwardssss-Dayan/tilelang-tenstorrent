@@ -94,11 +94,10 @@ NormalizedRegion NormalizeRegion(const BufferRegion &region,
       // Static pipeline binders will be substituted by formation. Prove the
       // complete range now so delayed specialization cannot hide an invalid
       // iteration or turn a dynamic/runtime index into an accepted transfer.
+      arith::ConstIntBound bound =
+          loop_analyzer->const_int_bound(minimum_expr);
       if (SideEffect(minimum_expr) > CallEffectKind::kPure ||
-          !loop_analyzer->CanProve(minimum_expr >= 0) ||
-          !loop_analyzer->CanProve(minimum_expr +
-                                       IntImm(minimum_expr.dtype(), extent) <=
-                                   IntImm(minimum_expr.dtype(), shape))) {
+          bound->min_value < 0 || bound->max_value > shape - extent) {
         ThrowMalformed(endpoint +
                        " pipeline region is out of bounds or "
                        "unproven for buffer '" +
@@ -252,6 +251,14 @@ public:
       : expand_accumulator_loops_(expand_accumulator_loops) {}
 
   Stmt VisitStmt_(const ForNode *op) final {
+    if (op->annotations.count("tt.logical_core_axis")) {
+      loop_analyzer_.Bind(op->loop_var,
+                          Range::FromMinExtent(op->min, op->extent));
+      ++symbolic_region_depth_;
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      --symbolic_region_depth_;
+      return result;
+    }
     if (op->annotations.count("num_stages")) {
       int64_t extent = RequireStaticInteger(op->extent, "pipeline extent");
       int64_t minimum = RequireStaticInteger(op->min, "pipeline minimum");
@@ -274,41 +281,29 @@ public:
       aliases_ = std::move(saved_aliases);
       return result;
     }
-    // The single-Core path does not run topology specialization. Retain its
-    // canonical launch prefix while resolving coordinates and scalar aliases.
-    if (op->annotations.count("tt.logical_core_axis") && is_one(op->extent)) {
-      AccumulatorIterationSubstituter substitute(op->loop_var, op->min);
-      For loop = ffi::GetRef<For>(op);
-      loop.CopyOnWrite()->body = VisitStmt(substitute(op->body));
-      return loop;
+    if (op->kind == ForKind::kSerial && op->annotations.empty() &&
+        (!op->step.has_value() || is_one(op->step.value()))) {
+      int64_t extent = RequireStaticInteger(op->extent, "serial loop extent");
+      int64_t minimum = RequireStaticInteger(op->min, "serial loop minimum");
+      if (extent <= 0 || extent > 1024)
+        ThrowUnsupported("serial region proof requires extent in [1, 1024]");
+      loop_analyzer_.Bind(
+          op->loop_var,
+          Range::FromMinExtent(IntImm(op->loop_var.dtype(), minimum),
+                               IntImm(op->loop_var.dtype(), extent)));
+      auto saved_aliases = aliases_;
+      ++symbolic_region_depth_;
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      --symbolic_region_depth_;
+      aliases_ = std::move(saved_aliases);
+      return result;
     }
-    if (!expand_accumulator_loops_)
-      return StmtExprMutator::VisitStmt_(op);
-    if (!op->annotations.empty())
-      return StmtExprMutator::VisitStmt_(op);
-    int64_t extent =
-        RequireStaticInteger(op->extent, "accumulator K loop extent");
-    int64_t minimum =
-        RequireStaticInteger(op->min, "accumulator K loop minimum");
-    if (op->kind != ForKind::kSerial || extent <= 0 || extent > 1024 ||
-        (op->step.has_value() && !is_one(op->step.value())))
-      ThrowUnsupported(
-          "accumulator K loop requires serial unit step and extent <= 1024");
-    ffi::Array<Stmt> iterations;
-    for (int64_t i = 0; i < extent; ++i) {
-      if (++expanded_iterations_ > 65536)
-        ThrowUnsupported(
-            "accumulator static loop expansion exceeds 65536 iterations");
-      AccumulatorIterationSubstituter substitute(
-          op->loop_var, IntImm(op->loop_var.dtype(), minimum + i));
-      iterations.push_back(VisitStmt(substitute(op->body)));
-    }
-    return iterations.size() == 1 ? iterations[0]
-                                  : SeqStmt(iterations, op->span);
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const BindNode *op) final {
-    if (pipeline_depth_ && op->var.dtype().is_int() &&
+    if ((pipeline_depth_ || symbolic_region_depth_) &&
+        op->var.dtype().is_int() &&
         SideEffect(op->value) == CallEffectKind::kPure) {
       aliases_[op->var] = VisitExpr(op->value);
       return Evaluate(Integer(0), op->span);
@@ -337,6 +332,11 @@ public:
     if (call->op.same_as(Copy::Get())) {
       return NormalizeCopy(ffi::GetRef<Evaluate>(op), call);
     }
+    if (call->op.same_as(tenstorrent::transfer()) ||
+        call->op.same_as(tenstorrent::all_gather()) ||
+        call->op.same_as(tenstorrent::all_reduce())) {
+      return NormalizeCommunication(ffi::GetRef<Evaluate>(op), call);
+    }
     if (call->op.same_as(tenstorrent::pipe_send())) {
       ValidatePipeRegion(call, 0, kAccessRead, "Pipe source");
       return ffi::GetRef<Stmt>(op);
@@ -352,6 +352,7 @@ private:
   bool expand_accumulator_loops_;
   size_t expanded_iterations_{0};
   int pipeline_depth_{0};
+  int symbolic_region_depth_{0};
   arith::Analyzer loop_analyzer_;
   std::unordered_map<Var, PrimExpr, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       aliases_;
@@ -374,6 +375,62 @@ private:
     }
   }
 
+  static void RequireCompleteRegion(const BufferRegion &region,
+                                    const std::string &endpoint) {
+    arith::Analyzer analyzer;
+    if (region->region.size() != region->buffer->shape.size())
+      ThrowMalformed(endpoint + " rank disagrees with its Buffer");
+    for (size_t axis = 0; axis < region->region.size(); ++axis)
+      if (!analyzer.CanProveEqual(region->region[axis]->min, Integer(0)) ||
+          !analyzer.CanProveEqual(region->region[axis]->extent,
+                                  region->buffer->shape[axis]))
+        ThrowMalformed(endpoint + " must cover the complete Buffer");
+  }
+
+  Stmt NormalizeCommunication(const Evaluate &evaluate, const Call &call) {
+    BufferRegion source =
+        NormalizeToAccessRegion(call->args[0], kAccessRead).region;
+    BufferRegion destination =
+        NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
+    NormalizedRegion normalized_source =
+        NormalizeRegion(source, "communication source");
+    NormalizedRegion normalized_destination =
+        NormalizeRegion(destination, "communication destination");
+    RequireCompleteRegion(normalized_source.region, "communication source");
+    RequireCompleteRegion(normalized_destination.region,
+                          "communication destination");
+    if (source->buffer->dtype != destination->buffer->dtype)
+      ThrowMalformed("communication source/destination dtypes differ");
+    if (call->op.same_as(tenstorrent::transfer()) ||
+        call->op.same_as(tenstorrent::all_reduce())) {
+      ValidateMatchingExtents(normalized_source.region,
+                              normalized_destination.region);
+    } else {
+      const auto *axis = call->args[6].as<IntImmNode>();
+      if (!axis || axis->value < 0 || axis->value > 1)
+        ThrowMalformed("all_gather axis is not normalized");
+      arith::Analyzer analyzer;
+      PrimExpr members = analyzer.Simplify((call->args[4] - call->args[2]) *
+                                           (call->args[5] - call->args[3]));
+      for (size_t i = 0; i < source->buffer->shape.size(); ++i) {
+        PrimExpr expected = source->buffer->shape[i] *
+                            (i == static_cast<size_t>(axis->value)
+                                 ? members
+                                 : Integer(1));
+        if (!analyzer.CanProveEqual(destination->buffer->shape[i], expected))
+          ThrowMalformed("all_gather destination shape disagrees with group rank coverage");
+      }
+    }
+    if (!normalized_source.changed && !normalized_destination.changed)
+      return evaluate;
+    auto args = call->args;
+    args.Set(0, normalized_source.region->ToPrimExpr());
+    args.Set(1, normalized_destination.region->ToPrimExpr());
+    return Evaluate(Call(call->dtype, call->op, args, call->annotations,
+                         call->span),
+                    evaluate->span);
+  }
+
   Stmt NormalizeCopy(const Evaluate &evaluate, const Call &call) {
     if (call->args.size() < 2) {
       ThrowMalformed("T.copy requires source and destination BufferRegions");
@@ -382,7 +439,8 @@ private:
     BufferRegion source(copy->src, copy->src_range);
     BufferRegion destination(copy->dst, copy->dst_range);
 
-    arith::Analyzer *analyzer = pipeline_depth_ ? &loop_analyzer_ : nullptr;
+    arith::Analyzer *analyzer =
+        (pipeline_depth_ || symbolic_region_depth_) ? &loop_analyzer_ : nullptr;
     NormalizedRegion normalized_source =
         NormalizeRegion(source, "source", analyzer);
     NormalizedRegion normalized_destination =

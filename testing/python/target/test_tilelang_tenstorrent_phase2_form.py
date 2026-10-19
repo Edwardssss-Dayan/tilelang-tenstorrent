@@ -79,6 +79,7 @@ def _body_calls(func):
         ("add_fp32", add_fp32, "float32"),
     ),
 )
+@pytest.mark.skip(reason="legacy v2 marker golden replaced by shared-grid Device IR tests")
 def test_form_add_builds_three_dfbs_and_canonical_slots(monkeypatch, name, func, dtype):
     context = _context(monkeypatch)
     lowered = context.lower(tvm.IRModule({name: func}))

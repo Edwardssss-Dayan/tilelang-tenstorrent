@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from tilelang import tvm
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
@@ -100,6 +101,7 @@ def expression(expr, values, maps, domain):
 
 
 def run_device(mod, inputs):
+    mod = D.expand_current_device_tables(mod)
     """Schedule the three slot streams, stalling wait until publication."""
     VerifyTenstorrentDeviceIR()(mod)
     loops = [func.body for func in mod.functions.values() if isinstance(func.body, tirx.For)]
@@ -121,15 +123,10 @@ def run_device(mod, inputs):
     tensors = [cast(value, desc.dtype).copy() for value, desc in zip(inputs, mod.attrs["tt.tensor_table"])]
     values = {}
     streams = []
+    from testing.python.target.test_tilelang_tenstorrent_compute_values import _calls
+
     for func in mod.functions.values():
-        statements = list(func.body.seq) if isinstance(func.body, tirx.SeqStmt) else [func.body]
-        streams.append(
-            [
-                statement.value
-                for statement in statements
-                if not (isinstance(statement, tirx.Evaluate) and isinstance(statement.value, tirx.IntImm))
-            ]
-        )
+        streams.append(list(_calls(func.body)))
     positions = [0] * len(streams)
     while any(position < len(stream) for position, stream in zip(positions, streams)):
         progressed = False
@@ -142,7 +139,7 @@ def run_device(mod, inputs):
             args = [int(arg) for arg in call.args]
             if name == "tl.tt.dfb_wait" and args[0] not in values:
                 continue
-            if name in ("tl.tt.dfb_wait", "tl.tt.dfb_reserve"):
+            if name in ("tl.tt.dfb_wait", "tl.tt.dfb_reserve", "tl.tt.dfb_copy_wait"):
                 pass
             elif name in ("tl.tt.tensor_to_dfb_nd", "tl.tt.dfb_to_tensor_nd"):
                 to_dfb = name == "tl.tt.tensor_to_dfb_nd"
@@ -189,6 +186,8 @@ def run_device(mod, inputs):
                 else:
                     raise AssertionError(kind)
                 values[output] = cast(result, attrs["tt.compute_dtype"].value).copy()
+            elif name == "tl.tt.dfb_release":
+                values.pop(args[0], None)
             else:
                 raise AssertionError(f"Unsupported reference Device op: {name}")
             positions[slot] += 1
@@ -199,9 +198,11 @@ def run_device(mod, inputs):
 
 def lower(func, arch="wormhole_b0"):
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
-    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), target)
-    assert int(mod.attrs["tt.device_ir_version"]) == 2
-    assert "tt.ir_stage" not in mod.attrs
+    mod = D.expand_current_device_tables(
+        TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), target)
+    )
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     restored = ir.load_json(ir.save_json(mod))
     ir.assert_structural_equal(restored, mod)
     return restored

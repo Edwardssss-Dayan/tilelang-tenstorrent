@@ -3,10 +3,12 @@
 import pytest
 
 from tilelang import tvm
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
 from tvm import ir, tirx
+from testing.python.target.test_tilelang_tenstorrent_compute_values import _calls
 
 
 def pipeline_shared(block_count=None):
@@ -40,13 +42,14 @@ def make_pipeline(stages=2, extent=5, start=0, block_count=None, inout=False, wa
 
 def lower_pipeline(func, arch="wormhole_b0"):
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
-    return TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), target)
+    return D.expand_current_device_tables(
+        TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), target)
+    )
 
 
 def slot_calls(mod, slot):
     func = next(f for f in mod.functions.values() if str(f.attrs["tt.kernel_slot"]) == slot)
-    statements = list(func.body.seq) if isinstance(func.body, tirx.SeqStmt) else [func.body]
-    return [s.value for s in statements if isinstance(s, tirx.Evaluate) and isinstance(s.value, tirx.Call)]
+    return list(_calls(func.body))
 
 
 @pytest.mark.parametrize("stages,extent,start", [(1, 1, 0), (1, 5, 0), (2, 5, 0), (3, 7, 4), (8, 2, 3), (32, 1, 0)])
@@ -54,7 +57,8 @@ def slot_calls(mod, slot):
 def test_pipeline_materializes_bounded_windows(stages, extent, start, arch):
     func = make_pipeline(stages, extent, start)
     mod = lower_pipeline(func, arch)
-    assert int(mod.attrs["tt.device_ir_version"]) == 3
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     assert int(mod.attrs["tt.pipeline_stages"]) == stages
     assert int(mod.attrs["tt.pipeline_extent"]) == extent
     depth = min(stages, extent)
@@ -103,7 +107,7 @@ def test_pipeline_explicit_capacity_preserved_and_insufficient_diagnosed():
         lower_pipeline(make_pipeline(3, 5, block_count=2))
 
 
-@pytest.mark.parametrize("stages,extent,diagnostic", [(33, 2, "num_stages <= 32"), (2, 1025, "extent <= 1024"), (2, 0, "extent.*positive")])
+@pytest.mark.parametrize("stages,extent,diagnostic", [(33, 2, "num_stages <= 32"), (2, 1025, "extent <= 1024"), (2, 0, "positive.*bounds|extent.*positive")])
 def test_pipeline_static_limits(stages, extent, diagnostic):
     with pytest.raises((ValueError, NotImplementedError), match=diagnostic):
         lower_pipeline(make_pipeline(stages, extent))
@@ -125,7 +129,7 @@ def loop_carried(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "float3
 
 
 def test_pipeline_rejects_loop_carried_dfb():
-    with pytest.raises(ValueError, match="read-before-write"):
+    with pytest.raises(ValueError, match="read-before-write|before definite initialization"):
         lower_pipeline(loop_carried)
 
 
@@ -164,7 +168,8 @@ def test_pipeline_rejects_manual_scheduling_annotations():
 
 def test_pipeline_zero_stages_preserves_serial_phase4_lower():
     mod = lower_pipeline(make_pipeline(stages=0, extent=3))
-    assert int(mod.attrs["tt.device_ir_version"]) == 2
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     assert "tt.pipeline_stages" not in mod.attrs
 
 
@@ -209,7 +214,8 @@ def copy_pipeline(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "float
 
 def test_pipeline_copy_only_materializes_snapshot_and_closed_lifetime():
     mod = lower_pipeline(copy_pipeline)
-    assert int(mod.attrs["tt.device_ir_version"]) == 3
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     assert len(mod.attrs["tt.dfb_table"]) == 6
     computes = [call for call in slot_calls(mod, "trisc") if call.op.name == "tl.tt.dfb_compute"]
     assert len(computes) == 3

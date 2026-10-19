@@ -6,6 +6,7 @@ NumPy. The expected results are independent whole-array frontend formulas.
 
 import numpy as np
 from tilelang import tvm
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import lower_tenstorrent_ir
 from tvm import tirx
@@ -23,20 +24,108 @@ def _round(value, dtype):
     return value
 
 
-def _calls(body):
+def _specialize_expr(expr, bindings, core):
+    expr = tirx.stmt_functor.substitute(expr, bindings)
+    if core is not None:
+
+        def rewrite(node):
+            if isinstance(node, tirx.Call) and node.op.name == "tl.tt.core_x":
+                return tirx.IntImm(node.dtype, core[0])
+            if isinstance(node, tirx.Call) and node.op.name == "tl.tt.core_y":
+                return tirx.IntImm(node.dtype, core[1])
+            return None
+
+        expr = tirx.stmt_functor.ir_transform(
+            tirx.Evaluate(expr), rewrite, None, ["tirx.Call"]
+        ).value
+    return tvm.arith.Analyzer().simplify(expr)
+
+
+def _specialize_call(call, bindings, core):
+    args = [_specialize_expr(arg, bindings, core) for arg in call.args]
+    annotations = {key: value for key, value in call.annotations.items()}
+    if "tt.value_inputs" in annotations:
+        annotations["tt.value_inputs"] = [
+            _specialize_expr(value, bindings, core)
+            for value in annotations["tt.value_inputs"]
+        ]
+    if "tt.expression" in annotations:
+        annotations["tt.expression"] = _specialize_expr(
+            annotations["tt.expression"], bindings, core
+        )
+    return tirx.Call(call.dtype, call.op, args, annotations, call.span)
+
+
+def _calls(body, bindings=None, core=None):
+    bindings = {} if bindings is None else bindings
     if isinstance(body, tirx.SeqStmt):
         for stmt in body.seq:
-            yield from _calls(stmt)
+            yield from _calls(stmt, bindings, core)
     elif isinstance(body, tirx.Evaluate) and isinstance(body.value, tirx.Call):
-        yield body.value
+        yield _specialize_call(body.value, bindings, core)
     elif isinstance(body, tirx.Evaluate) and int(body.value) == 0:
         return
+    elif isinstance(body, tirx.IfThenElse):
+        yield from _calls(body.then_case, bindings, core)
+        if body.else_case is not None:
+            yield from _calls(body.else_case, bindings, core)
+    elif isinstance(body, tirx.SBlockRealize):
+        domain = body.block.annotations.get("tt.core_domain")
+        if domain is not None and core is None:
+            for x in range(int(domain.begin.x), int(domain.end.x)):
+                for y in range(int(domain.begin.y), int(domain.end.y)):
+                    yield from _calls(body.block.body, bindings, (x, y))
+        else:
+            yield from _calls(body.block.body, bindings, core)
+    elif isinstance(body, tirx.For):
+        minimum = int(body.min)
+        step = int(body.step) if body.step is not None else 1
+        for offset in range(int(body.extent)):
+            iteration = tirx.IntImm(body.loop_var.dtype, minimum + offset * step)
+            nested = dict(bindings)
+            nested[body.loop_var] = iteration
+            yield from _calls(body.body, nested, core)
     else:
         raise AssertionError(f"Unexpected Device statement: {body}")
 
 
+def _core_statements(func):
+    dispatch = func.body
+    if isinstance(dispatch, tirx.SeqStmt):
+        assert len(dispatch.seq) == 1
+        dispatch = dispatch.seq[0]
+    realize = dispatch.then_case if isinstance(dispatch, tirx.IfThenElse) else dispatch
+    assert isinstance(realize, tirx.SBlockRealize)
+    body = realize.block.body
+    return list(body.seq) if isinstance(body, tirx.SeqStmt) else [body]
+
+
+def _with_core_statements(func, statements):
+    dispatch = func.body
+    realize = dispatch.then_case if isinstance(dispatch, tirx.IfThenElse) else dispatch
+    assert isinstance(realize, tirx.SBlockRealize)
+    block = realize.block
+    body = tirx.SeqStmt(statements) if len(statements) != 1 else statements[0]
+    updated = tirx.SBlock(
+        block.iter_vars,
+        block.reads,
+        block.writes,
+        block.name_hint,
+        body,
+        init=block.init,
+        alloc_buffers=block.alloc_buffers,
+        match_buffers=block.match_buffers,
+        annotations=block.annotations,
+    )
+    realize = tirx.SBlockRealize(realize.iter_values, realize.predicate, updated)
+    if isinstance(dispatch, tirx.IfThenElse):
+        return func.with_body(tirx.IfThenElse(dispatch.condition, realize, dispatch.else_case))
+    return func.with_body(realize)
+
+
 def interpret_values(mod, tensors):
     """Run streams with waits, preserving snapshots after input DFB release."""
+    mod = D.expand_current_device_tables(mod)
     arrays = [np.array(value, copy=True) for value in tensors]
     dfbs, values = {}, {}
     descriptors = {int(value.value_id): value for value in mod.attrs["tt.compute_value_table"]}
@@ -150,7 +239,7 @@ def interpret_values(mod, tensors):
             elif name == "tl.tt.dfb_release":
                 del dfbs[args[0]]
             else:
-                assert name in ("tl.tt.dfb_reserve", "tl.tt.dfb_wait"), name
+                assert name in ("tl.tt.dfb_reserve", "tl.tt.dfb_wait", "tl.tt.dfb_copy_wait"), name
             cursors[index] += 1
             advanced = True
         assert advanced, "Device streams deadlocked"
@@ -192,8 +281,11 @@ def value_chain():
 
 
 def test_old_values_survive_updates_broadcast_loop_and_input_release():
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": value_chain()}), TARGET)
-    assert int(mod.attrs["tt.device_ir_version"]) == 7
+    mod = D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": value_chain()}), TARGET)
+    )
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     rng = np.random.default_rng(12)
     a, b = rng.normal(size=(64, 64)).astype("float32"), rng.normal(size=(32, 64)).astype("float32")
     outputs, snapshots = interpret_values(mod, [a, b, np.zeros_like(a), np.zeros_like(a)])
@@ -249,7 +341,9 @@ def gemm_snapshots():
 
 
 def test_full_k_accumulator_fresh_epilogue_and_multiple_consumers():
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": gemm_snapshots()}), TARGET)
+    mod = D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": gemm_snapshots()}), TARGET)
+    )
     rng = np.random.default_rng(31)
     a = _round(rng.normal(size=(32, 64)), "bfloat16")
     b = _round(rng.normal(size=(64, 32)), "bfloat16")
@@ -283,7 +377,9 @@ def gemm_fragment_operand():
 
 
 def test_fragment_dfb_only_consumer_materializes_exactly_when_needed():
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": gemm_fragment_operand()}), TARGET)
+    mod = D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": gemm_fragment_operand()}), TARGET)
+    )
     stores = [call for func in mod.functions.values() for call in _calls(func.body) if call.op.name == "tl.tt.compute_value_store"]
     assert len(stores) == 1
     descriptors = {int(value.value_id): value for value in mod.attrs["tt.compute_value_table"]}
@@ -316,7 +412,9 @@ def independent_gemm_lifetimes():
 
 
 def test_outer_serial_iterations_have_distinct_accumulator_lifetimes():
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": independent_gemm_lifetimes()}), TARGET)
+    mod = D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": independent_gemm_lifetimes()}), TARGET)
+    )
     assert len(mod.attrs["tt.accumulator_table"]) == 2
     assert {int(value.accumulator_id) for value in mod.attrs["tt.compute_value_table"]} == {0, 1}
     rng = np.random.default_rng(71)
@@ -350,7 +448,9 @@ def combined_gemm_roots():
 
 
 def test_two_accumulator_roots_combine_and_preserve_transitive_provenance():
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": combined_gemm_roots()}), TARGET)
+    mod = D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": combined_gemm_roots()}), TARGET)
+    )
     assert len(mod.attrs["tt.accumulator_table"]) == 2
     derived = [value for value in mod.attrs["tt.compute_value_table"] if value.buffer.name in ("combined", "epilogue")]
     assert len(derived) == 2

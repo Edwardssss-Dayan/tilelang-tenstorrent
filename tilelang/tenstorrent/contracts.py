@@ -16,9 +16,9 @@ EXECUTION_BACKEND_ORDER = ("ttnn",)
 TTNN_ENABLE_HOST_CODEGEN = False
 TTNN_ENABLE_DEVICE_COMPILE = False
 
+# Legacy versioned artifact constants. The active Lower/Codegen contract uses
+# tt.ir_stage="device" and must not read or emit any of these discriminators.
 DEVICE_IR_VERSION = 1
-# Version 1 remains the construction default for existing Add/idle modules.
-# General computation uses version 2; consumers must dispatch on the version.
 GENERAL_DEVICE_IR_VERSION = 2
 PIPELINE_DEVICE_IR_VERSION = 3
 MULTICORE_DEVICE_IR_VERSION = 4
@@ -183,7 +183,7 @@ INITIAL_TTL_DEFERRED = (
 
 DEFERRED_FRONTEND_CAPABILITIES = ("tt.tensor_backed",)
 
-TTLANG_REFERENCE_COMMIT = "6e3051bb9b2f7bfbd5fd045aa38deb68b7a6e6bd"
+TTLANG_REFERENCE_COMMIT = "e49ce12c2bcd2350565632d9b51239e9eafb2546"
 TTLANG_REFERENCE_VERSION = "1.1.9.dev51"
 TTLANG_LEGACY_REFERENCE_COMMIT = "e49ce12c2bcd2350565632d9b51239e9eafb2546"
 TTLANG_PUBLIC_BINDING_MODULES = (

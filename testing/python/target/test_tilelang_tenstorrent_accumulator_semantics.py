@@ -8,15 +8,18 @@ import numpy as np
 import pytest
 
 from tilelang import tvm
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
 from tvm import ir, tirx
 
 from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import cast
+from testing.python.target.test_tilelang_tenstorrent_compute_values import _calls
 
 
 def execute_accumulators(mod, inputs, *, inject_intermediate_bf16_pack=False):
+    mod = D.expand_current_device_tables(mod)
     """Execute final slot streams with waits, using only typed Device contracts."""
     VerifyTenstorrentDeviceIR()(mod)
     tensors = [cast(value, desc.dtype).copy() for value, desc in zip(inputs, mod.attrs["tt.tensor_table"])]
@@ -25,8 +28,7 @@ def execute_accumulators(mod, inputs, *, inject_intermediate_bf16_pack=False):
     accumulators, values, materializations = {}, {}, []
     streams = []
     for func in mod.functions.values():
-        statements = list(func.body.seq) if isinstance(func.body, tirx.SeqStmt) else [func.body]
-        streams.append([stmt.value for stmt in statements if isinstance(stmt.value, tirx.Call)])
+        streams.append(list(_calls(func.body)))
     positions = [0] * len(streams)
     while any(position < len(stream) for position, stream in zip(positions, streams)):
         progressed = False
@@ -37,7 +39,7 @@ def execute_accumulators(mod, inputs, *, inject_intermediate_bf16_pack=False):
             name, args = call.op.name, [int(arg) for arg in call.args]
             if name == "tl.tt.dfb_wait" and args[0] not in values:
                 continue
-            if name in {"tl.tt.dfb_wait", "tl.tt.dfb_reserve"}:
+            if name in {"tl.tt.dfb_wait", "tl.tt.dfb_reserve", "tl.tt.dfb_copy_wait"}:
                 pass
             elif name in {"tl.tt.tensor_to_dfb_nd", "tl.tt.dfb_to_tensor_nd"}:
                 to_dfb = name == "tl.tt.tensor_to_dfb_nd"
@@ -69,6 +71,8 @@ def execute_accumulators(mod, inputs, *, inject_intermediate_bf16_pack=False):
                 assert call.annotations["tt.compute_kind"].value == "copy"
                 output, source = args
                 values[output] = values[source].copy()
+            elif name == "tl.tt.dfb_release":
+                values.pop(args[0], None)
             else:
                 raise AssertionError(f"Unsupported accumulator reference op: {name}")
             positions[slot] += 1
@@ -102,7 +106,8 @@ def reduction_program(blocks, accumulation_dtype, input_dtype="bfloat16", output
 def lower(func, arch):
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
     mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), target)
-    assert int(mod.attrs["tt.device_ir_version"]) == 5
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     restored = ir.load_json(ir.save_json(mod))
     ir.assert_structural_equal(restored, mod)
     return restored

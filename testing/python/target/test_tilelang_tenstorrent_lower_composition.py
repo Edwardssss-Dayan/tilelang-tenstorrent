@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 from tilelang import tvm
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
 from tvm import ir, tirx
 
@@ -11,14 +12,20 @@ from testing.python.target.test_tilelang_tenstorrent_compute_values import TARGE
 
 def lower(program, version=7):
     mod = lower_tenstorrent_ir(tvm.IRModule({"main": program}), TARGET)
-    assert int(mod.attrs["tt.device_ir_version"]) == version
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     ir.assert_structural_equal(mod, ir.load_json(ir.save_json(mod)))
     assert transform.VerifyTenstorrentDeviceIR()(mod).same_as(mod)
-    return mod
+    return D.expand_current_device_tables(mod)
+
+
+def lower_result(program):
+    return lower_tenstorrent_ir(tvm.IRModule({"main": program}), TARGET)
 
 
 def interpret(mod, inputs, seed=0):
     """Execute value, DFB, and point-delivery contracts independently of lowering."""
+    mod = D.expand_current_device_tables(mod)
     tensors = [np.array(value, copy=True) for value in inputs]
     values, dfbs, deliveries, accumulators = {}, {}, {}, {}
     pending = {}
@@ -238,13 +245,30 @@ def multicore_values():
 
 def test_multicore_values_have_isolated_versions_and_numeric_outputs():
     mod = lower(multicore_values())
-    assert len(mod.functions) == 6
+    assert len(mod.functions) == 3
+    assert [str(symbol) for symbol in mod.attrs["tt.kernel_order"]] == [
+        "main_trisc",
+        "main_ncrisc",
+        "main_brisc",
+    ]
     a = np.arange(64 * 32, dtype="float32").reshape(64, 32)
     outputs, _ = interpret(mod, [a, np.zeros_like(a)])
     np.testing.assert_array_equal(outputs[1], (a + 1) * 2)
     definitions = list(mod.attrs["tt.compute_value_table"])
     assert len({int(value.value_id) for value in definitions}) == len(definitions)
-    assert not definitions[0].buffer.data.same_as(definitions[-1].buffer.data)
+    # One logical Buffer family is shared by the function; Core domain plus
+    # value identity distinguishes the independent local instances.
+    assert definitions[0].buffer.data.same_as(definitions[-1].buffer.data)
+    domains = {
+        (
+            int(value.core_domain.begin.x),
+            int(value.core_domain.begin.y),
+            int(value.core_domain.end.x),
+            int(value.core_domain.end.y),
+        )
+        for value in definitions
+    }
+    assert domains == {(0, 0, 1, 1), (1, 0, 2, 1)}
 
 
 def pipe_values():
@@ -271,12 +295,9 @@ def pipe_values():
     return main
 
 
-def test_pipe_materialized_values_and_receiver_local_epilogue():
-    mod = lower(pipe_values())
-    a = np.random.default_rng(8).normal(size=(32, 32)).astype("float32")
-    outputs, _ = interpret(mod, [a, np.zeros_like(a)])
-    np.testing.assert_array_equal(outputs[1], a * 2 + 3)
-    assert len(mod.attrs["tt.pipe_transfer_table"]) == 1
+def test_legacy_pipe_materialized_values_require_high_level_communication():
+    with pytest.raises(NotImplementedError, match="legacy Pipe/PipeRef"):
+        lower_result(pipe_values())
 
 
 def pipeline_values(stages=2, extent=5):
@@ -373,12 +394,9 @@ def pipeline_pipe_values(extent=5, stages=2):
 
 @pytest.mark.parametrize("seed", [0, 11, 71])
 def test_pipeline_pipe_values_finite_pool_lifetimes(seed):
-    mod = lower(pipeline_pipe_values())
-    a = np.random.default_rng(19).normal(size=(32, 32)).astype("float32")
-    actual, _ = interpret(mod, [a, np.zeros_like(a)], seed)
-    np.testing.assert_array_equal(actual[1], (a + 4) * 2)
-    assert len(mod.attrs["tt.pipe_transfer_table"]) == 5
-    assert {int(t.occurrence) for t in mod.attrs["tt.pipe_transfer_table"]} == set(range(5))
+    del seed
+    with pytest.raises(NotImplementedError, match="legacy Pipe/PipeRef"):
+        lower_result(pipeline_pipe_values())
 
 
 def uninitialized_remote_fragment():
@@ -395,7 +413,10 @@ def uninitialized_remote_fragment():
 
 
 def test_fragment_definition_on_other_core_does_not_dominate():
-    with pytest.raises(ValueError, match="uninitialized|read-before|dominat|before.*definition"):
+    with pytest.raises(
+        ValueError,
+        match="uninitialized|read-before|dominat|before.*definition|before definite initialization",
+    ):
         lower(uninitialized_remote_fragment())
 
 
@@ -504,17 +525,9 @@ def pipeline_summa(core_m=2, core_n=2, stages=5, block_m=32, block_n=32, block_k
     return summa
 
 
-@pytest.mark.parametrize("seed", [0, 11, 71])
-def test_full_k_summa_pipeline_with_finite_pools(seed):
-    mod = lower(pipeline_summa(), version=6)
-    rng = np.random.default_rng(199)
-    a = _round(rng.normal(size=(64, 160)), "bfloat16")
-    b = _round(rng.normal(size=(160, 64)), "bfloat16")
-    outputs, _ = interpret(mod, [a, b, np.zeros((64, 64), "float32")], seed)
-    expected = sum(a[:, k : k + 32] @ b[k : k + 32, :] for k in range(0, 160, 32))
-    np.testing.assert_array_equal(outputs[2], _round(expected, "bfloat16"))
-    assert len(mod.attrs["tt.pipe_transfer_table"]) == 20
-    assert all(int(acc.full_k_tiles) == 5 for acc in mod.attrs["tt.accumulator_table"])
+def test_legacy_pipe_summa_requires_high_level_communication():
+    with pytest.raises(NotImplementedError, match="legacy Pipe/PipeRef"):
+        lower_result(pipeline_summa())
 
 
 def test_pipeline_slice_range_proof_rejects_last_iteration_overrun():
@@ -538,8 +551,9 @@ def pipeline_tensor_inout():
 
 
 def test_fragment_tensor_inout_cannot_be_prefetched():
-    with pytest.raises(NotImplementedError, match="inout Tensor"):  # codespell:ignore inout
-        lower(pipeline_tensor_inout())
+    mod = lower_result(pipeline_tensor_inout())
+    assert str(mod.attrs["tt.ir_stage"]) == "structured"
+    assert any("inout Tensor" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])  # codespell:ignore inout
 
 
 def pipeline_carried_fragment():
@@ -557,5 +571,9 @@ def pipeline_carried_fragment():
 
 
 def test_loop_carried_ordinary_fragment_requires_explicit_spill_plan():
-    with pytest.raises(NotImplementedError, match="carries a value across iterations"):
-        lower(pipeline_carried_fragment())
+    mod = lower_result(pipeline_carried_fragment())
+    assert str(mod.attrs["tt.ir_stage"]) == "structured"
+    assert any(
+        "carries a value across iterations" in str(reason)
+        for reason in mod.attrs["tt.deferred_reasons"]
+    )

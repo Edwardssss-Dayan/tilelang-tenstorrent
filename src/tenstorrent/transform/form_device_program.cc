@@ -12,6 +12,9 @@
 #include "../../op/utils.h"
 #include "../ir/device_ir.h"
 #include "../op/builtin.h"
+#include "device_metadata_interner.h"
+#include "device_statement_compaction.h"
+#include "device_table_compaction.h"
 #include "verify_device_ir.h"
 
 #include <tvm/arith/analyzer.h>
@@ -33,7 +36,9 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <numeric>
 #include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -103,7 +108,7 @@ Span RequireSourceSpan(const Span &preferred, const Span &fallback,
   if (fallback.defined()) {
     return fallback;
   }
-  ThrowMalformed(owner + " has no source span");
+  return Span();
 }
 
 Stmt StripLogicalCoreLoops(const PrimFunc &func,
@@ -578,13 +583,14 @@ Stmt BuildAddNCRISCBody(const AddDataflowPlan &plan) {
       span);
 }
 
-// Phase 4 assigns an immutable resource to every write.  This deliberately
-// avoids capacity reuse, cyclic schedules, and cross-Core communication.
+// Assign an immutable generation to every write. Logical storage reuse is
+// planned only after the complete cross-slot transaction schedule is known.
 struct ResourceVersion {
   TTBufferMetadata metadata;
   ffi::String producer;
   ffi::String consumer;
   ffi::Optional<TensorBacking> backing;
+  int64_t generation{0};
   int64_t pool{-1};
   int64_t iteration{-1};
 };
@@ -601,6 +607,16 @@ public:
       const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
                                ffi::ObjectPtrEqual> &values)
       : inputs_(inputs), values_(&values) {}
+  DeviceExpressionRewriter(
+      const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
+                               ffi::ObjectPtrEqual> &inputs,
+      const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
+                               ffi::ObjectPtrEqual> &values,
+      std::unordered_map<int64_t, int64_t> dfb_accesses,
+      std::unordered_map<int64_t, int64_t> value_accesses)
+      : inputs_(inputs), values_(&values),
+        dfb_accesses_(std::move(dfb_accesses)),
+        value_accesses_(std::move(value_accesses)) {}
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     if (values_) {
       auto value = values_->find(op->buffer);
@@ -615,12 +631,38 @@ public:
     return Call(op->dtype, tenstorrent::dfb_load(), {Integer(found->second)},
                 {}, op->span);
   }
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = ffi::GetRef<Call>(op);
+    if (!call->op.same_as(tenstorrent::compute_access()))
+      return StmtExprMutator::VisitExpr_(op);
+    if (call->args.size() != 1 || !as_const_int(call->args[0]))
+      ThrowMalformed("compute_access requires one static access_id");
+    int64_t access_id = *as_const_int(call->args[0]);
+    auto value = value_accesses_.find(access_id);
+    if (value != value_accesses_.end())
+      return Call(op->dtype, tenstorrent::compute_value_load(),
+                  {Integer(value->second)}, {}, op->span);
+    auto dfb = dfb_accesses_.find(access_id);
+    if (dfb == dfb_accesses_.end()) {
+      std::string known;
+      for (const auto &[id, resource] : dfb_accesses_)
+        known += (known.empty() ? "" : ",") + std::to_string(id);
+      for (const auto &[id, resource] : value_accesses_)
+        known += (known.empty() ? "" : ",") + std::to_string(id);
+      ThrowMalformed("compute expression references undeclared access_id " +
+                     std::to_string(access_id) + " (known: " + known + ")");
+    }
+    return Call(op->dtype, tenstorrent::dfb_load(), {Integer(dfb->second)}, {},
+                op->span);
+  }
 
 private:
   const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
                            ffi::ObjectPtrEqual> &inputs_;
   const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
                            ffi::ObjectPtrEqual> *values_{nullptr};
+  std::unordered_map<int64_t, int64_t> dfb_accesses_;
+  std::unordered_map<int64_t, int64_t> value_accesses_;
 };
 
 // TVM's generic expression mutator substitutes PrimExpr call annotations, but
@@ -677,6 +719,7 @@ struct PipeEndpoint {
   ffi::Array<Integer> record;
   int64_t x, y, dfb_id;
   bool source;
+  bool producer_forwarding;
   Span span;
 };
 using TransferKeys =
@@ -719,6 +762,11 @@ public:
         metadata_(IndexBufferMetadata(metadata)),
         tensor_reads_(frontend->params.size(), false),
         tensor_writes_(frontend->params.size(), false) {
+    auto grid = frontend_->GetAttr<ffi::Array<PrimExpr>>(kLaunchGridAttr);
+    if (!grid.has_value() || grid.value().size() != 2)
+      ThrowMalformed("planner requires normalized launch grid");
+    grid_x_ = RequirePositiveStaticInteger(grid.value()[0], "launch grid x");
+    grid_y_ = RequirePositiveStaticInteger(grid.value()[1], "launch grid y");
     bool bf16_gemm = false, fp32_compute = false;
     PostOrderVisit(frontend->body, [&](const ffi::ObjectRef &object) {
       auto call = object.as<Call>();
@@ -755,8 +803,11 @@ public:
         compute_value_mode_ |= region->buffer.scope() == "local.fragment";
       }
     });
-    precision_regions_ = bf16_gemm && fp32_compute;
-    compute_value_mode_ |= precision_regions_;
+    // Current shared-grid Device IR has one Kernel-level compute requirement.
+    // Preserve compute values for mixed expression analysis, but never create
+    // legacy v8 region-scoped precision modes inside one shared TRISC.
+    precision_regions_ = false;
+    compute_value_mode_ |= bf16_gemm && fp32_compute;
   }
 
   bool HasComputeValues() const { return compute_value_mode_; }
@@ -771,6 +822,23 @@ public:
 
   const std::vector<PipeEndpoint> &Endpoints() const { return endpoints_; }
   int64_t ResourceCount() const { return resources_.size(); }
+  ffi::String ResourceIdentity(int64_t id) const {
+    if (id < 0 || id >= static_cast<int64_t>(resources_.size()))
+      ThrowMalformed("resource identity index is out of range");
+    const ResourceVersion &resource = resources_[id];
+    return resource.metadata->buffer_id + ".generation" +
+           std::to_string(resource.generation) + "." + resource.producer +
+           "." + resource.consumer;
+  }
+  std::string ResourceStorageIdentity(int64_t id) const {
+    if (id < 0 || id >= static_cast<int64_t>(resources_.size()))
+      ThrowMalformed("resource storage identity index is out of range");
+    const ResourceVersion &resource = resources_[id];
+    return std::string(resource.metadata->buffer_id) + "|" +
+           std::string(resource.producer) + "|" +
+           std::string(resource.consumer);
+  }
+  bool ResourceIsLive(int64_t id) const { return live_.count(id) != 0; }
   int64_t AccumulatorCount() const { return accumulators_.size(); }
   bool HasProducerForwarding() const { return has_producer_forwarding_; }
   Stmt PipeBody() const { return Body(pipe_); }
@@ -1024,6 +1092,16 @@ public:
         int64_t output = *as_const_int(call->args[0]);
         for (size_t i = 1; i < call->args.size(); ++i)
           inputs[output].push_back(*as_const_int(call->args[i]));
+      } else if (call->op.same_as(tenstorrent::dfb_local_copy())) {
+        inputs[*as_const_int(call->args[1])].push_back(
+            *as_const_int(call->args[0]));
+      } else if (call->op.same_as(tenstorrent::dfb_gather_copy())) {
+        inputs[*as_const_int(call->args[1])].push_back(
+            *as_const_int(call->args[0]));
+      } else if (call->op.same_as(tenstorrent::dfb_collective_reduce())) {
+        int64_t output = *as_const_int(call->args[2]);
+        inputs[output].push_back(*as_const_int(call->args[0]));
+        inputs[output].push_back(*as_const_int(call->args[1]));
       }
     }
     for (const auto &state : accumulators_) {
@@ -1044,6 +1122,8 @@ public:
     }
     for (const PipeEndpoint &endpoint : endpoints_)
       mark(endpoint.dfb_id);
+    for (int64_t id : observable_resources_)
+      mark(id);
     auto filter = [&](const ffi::Array<Stmt> &body) {
       ffi::Array<Stmt> result;
       for (const Stmt &statement : body) {
@@ -1187,6 +1267,12 @@ public:
     if (transfers_ && (call->op.same_as(tenstorrent::pipe_send()) ||
                        call->op.same_as(tenstorrent::pipe_recv()))) {
       PlanPipe(call);
+    } else if (transfers_ && call->op.same_as(tenstorrent::transfer())) {
+      PlanHighLevelTransfer(call);
+    } else if (transfers_ && call->op.same_as(tenstorrent::all_gather())) {
+      PlanAllGather(call);
+    } else if (transfers_ && call->op.same_as(tenstorrent::all_reduce())) {
+      PlanAllReduce(call);
     } else if (call->op.same_as(Copy::Get())) {
       PlanCopy(Downcast<Copy>(ParseOperator(call)), call);
     } else if (call->op.same_as(tenstorrent::tile_add())) {
@@ -1447,6 +1533,13 @@ private:
       } else if (call->op.same_as(tenstorrent::gemm_update())) {
         last_use[*as_const_int(call->args[0])] = index;
         last_use[*as_const_int(call->args[1])] = index;
+      } else if (call->op.same_as(tenstorrent::dfb_local_copy())) {
+        last_use[*as_const_int(call->args[0])] = index;
+      } else if (call->op.same_as(tenstorrent::dfb_gather_copy())) {
+        last_use[*as_const_int(call->args[0])] = index;
+      } else if (call->op.same_as(tenstorrent::dfb_collective_reduce())) {
+        last_use[*as_const_int(call->args[0])] = index;
+        last_use[*as_const_int(call->args[1])] = index;
       } else if (call->op.same_as(tenstorrent::dfb_pipe_wait())) {
         int64_t id = *as_const_int(call->args[1]);
         if (resources_[id].consumer == slot)
@@ -1556,6 +1649,7 @@ private:
                                  "DFB block count");
     int64_t id = resources_.size();
     resources_.push_back({metadata, producer, "", backing});
+    resources_.back().generation = generations_[buffer->data]++;
     if (publish_current)
       current_[buffer->data] = id;
     return id;
@@ -1628,6 +1722,7 @@ private:
         "interleaved", std::nullopt, Integer(1), std::nullopt, std::nullopt,
         "inferred", "inferred", "inferred", "inferred", span);
     resources_.push_back({metadata, "trisc", "", backing});
+    resources_.back().generation = generations_[buffer->data]++;
     return id;
   }
 
@@ -1873,11 +1968,21 @@ private:
     ffi::Array<ffi::Array<PrimExpr>> dfb_shapes, value_shapes;
     std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
         dfb_inputs, local_inputs;
+    std::unordered_map<int64_t, int64_t> dfb_accesses, value_accesses;
     auto original_maps = call->annotations.Get("tt.access_maps");
     ffi::Array<ffi::Array<Integer>> maps =
         original_maps.has_value()
             ? Downcast<ffi::Array<ffi::Array<Integer>>>(original_maps.value())
             : ffi::Array<ffi::Array<Integer>>();
+    auto original_access_ids = call->annotations.Get("tt.access_ids");
+    ffi::Array<Integer> access_ids =
+        original_access_ids.has_value()
+            ? Downcast<ffi::Array<Integer>>(original_access_ids.value())
+            : ffi::Array<Integer>();
+    if (original_access_ids.has_value() && access_ids.empty())
+      ThrowMalformed("compute access_ids annotation is present but empty");
+    if (!access_ids.empty() && access_ids.size() + 1 != call->args.size())
+      ThrowMalformed("compute access_ids must match input operands");
     bool dfb_only = kind == "gemm" || kind == "transpose" || kind == "reduce";
     std::unordered_set<int64_t> roots;
     for (size_t index = 1; index < call->args.size(); ++index) {
@@ -1893,6 +1998,8 @@ private:
         value_inputs.push_back(Integer(value));
         value_maps.push_back(map);
         value_shapes.push_back(input->buffer->shape);
+        if (!access_ids.empty())
+          value_accesses.emplace(access_ids[index - 1]->value, value);
         roots.insert(value_roots_[value].begin(), value_roots_[value].end());
       } else {
         int64_t id = ReadDFBOperand(input->buffer, call->span);
@@ -1900,6 +2007,8 @@ private:
         dfb_args.push_back(Integer(id));
         dfb_maps.push_back(map);
         dfb_shapes.push_back(input->buffer->shape);
+        if (!access_ids.empty())
+          dfb_accesses.emplace(access_ids[index - 1]->value, id);
         const auto &input_roots = dfb_roots_[id];
         roots.insert(input_roots.begin(), input_roots.end());
         Wait(&compute_, id, call->span);
@@ -1923,7 +2032,23 @@ private:
     attrs.Set("tt.value_input_shapes", value_shapes);
     auto expression = attrs.Get("tt.expression");
     if (expression.has_value()) {
-      DeviceExpressionRewriter rewriter(dfb_inputs, local_inputs);
+      bool has_access_leaf = false;
+      PostOrderVisit(Downcast<PrimExpr>(expression.value()),
+                     [&](const ffi::ObjectRef &node) {
+                       const auto *access = node.as<CallNode>();
+                       has_access_leaf |=
+                           access && access->op.same_as(tenstorrent::compute_access());
+                     });
+      if (has_access_leaf && access_ids.empty()) {
+        std::string keys;
+        for (const auto &[key, value] : call->annotations)
+          keys += (keys.empty() ? "" : ",") + std::string(key);
+        ThrowMalformed("compute_access expression lost tt.access_ids (annotations: " +
+                       keys + ")");
+      }
+      DeviceExpressionRewriter rewriter(dfb_inputs, local_inputs,
+                                        std::move(dfb_accesses),
+                                        std::move(value_accesses));
       attrs.Set("tt.expression",
                 rewriter(Downcast<PrimExpr>(expression.value())));
     }
@@ -2092,12 +2217,22 @@ private:
     ffi::Array<PrimExpr> args;
     std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
         inputs;
+    std::unordered_map<int64_t, int64_t> access_resources;
+    auto access_attr = call->annotations.Get("tt.access_ids");
+    ffi::Array<Integer> access_ids =
+        access_attr.has_value()
+            ? Downcast<ffi::Array<Integer>>(access_attr.value())
+            : ffi::Array<Integer>();
+    if (!access_ids.empty() && access_ids.size() + 1 != call->args.size())
+      ThrowMalformed("compute access_ids must match input operands");
     for (size_t i = 1; i < call->args.size(); ++i) {
       BufferRegion input =
           NormalizeToAccessRegion(call->args[i], kAccessRead).region;
       FullRegion(input);
       int64_t id = Read(input->buffer, "trisc");
       inputs.emplace(input->buffer, id);
+      if (!access_ids.empty())
+        access_resources.emplace(access_ids[i - 1]->value, id);
       args.push_back(Integer(id));
       Wait(&compute_, id, call->span);
     }
@@ -2109,7 +2244,11 @@ private:
     auto annotations = call->annotations;
     auto expression = annotations.Get("tt.expression");
     if (expression.has_value()) {
-      DeviceExpressionRewriter rewriter(inputs);
+      std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
+                         ffi::ObjectPtrEqual>
+          no_values;
+      DeviceExpressionRewriter rewriter(inputs, no_values,
+                                        std::move(access_resources), {});
       annotations.Set("tt.expression",
                       rewriter(Downcast<PrimExpr>(expression.value())));
     }
@@ -2203,6 +2342,7 @@ private:
       output_id = resources_.size();
       resources_.push_back({output_metadata, "trisc", "ncrisc",
                             TensorBacking(tensor, Integer(0))});
+      resources_.back().generation = generations_[storage->data]++;
       tensor_writes_[tensor] = true;
       Wait(&transfer_, output_id, call->span);
       ffi::Array<PrimExpr> args{Integer(output_id), Integer(tensor)};
@@ -2342,6 +2482,244 @@ private:
                      "compute legalization");
   }
 
+  void PlanHighLevelTransfer(const Call &call) {
+    if (call->args.size() != 10)
+      ThrowMalformed("high-level transfer arity mismatch");
+    int64_t sx = RequireStaticInteger(call->args[2], "transfer source x");
+    int64_t sy = RequireStaticInteger(call->args[3], "transfer source y");
+    int64_t bx = RequireStaticInteger(call->args[4], "transfer begin x");
+    int64_t by = RequireStaticInteger(call->args[5], "transfer begin y");
+    int64_t ex = RequireStaticInteger(call->args[6], "transfer end x");
+    int64_t ey = RequireStaticInteger(call->args[7], "transfer end y");
+    int64_t site = RequireStaticInteger(call->args[9], "transfer site_id");
+    const auto *contract = call->args[8].as<StringImmNode>();
+    if (!contract)
+      ThrowMalformed("high-level transfer contract is not a string");
+    bool source = core_x_ == sx && core_y_ == sy;
+    bool destination = bx <= core_x_ && core_x_ < ex && by <= core_y_ &&
+                       core_y_ < ey;
+    if (!source && !destination)
+      return;
+    if (source && destination)
+      ThrowMalformed("source-exclusive transfer includes the source Core");
+    ffi::Array<Integer> record{
+        Integer(site), Integer(sy * grid_x_ + sx),
+        Integer(contract->value == "collective" ? 1 : 0), Integer(sx),
+        Integer(sy),   Integer(bx), Integer(by), Integer(ex), Integer(ey)};
+    ffi::Map<ffi::String, ffi::ObjectRef> annotations{{"tt.pipe_record", record}};
+    Call endpoint(
+        DataType::Void(),
+        source ? tenstorrent::pipe_send() : tenstorrent::pipe_recv(),
+        source ? ffi::Array<PrimExpr>{call->args[0], Integer(0)}
+               : ffi::Array<PrimExpr>{Integer(0), call->args[1]},
+        annotations, call->span);
+    PlanPipe(endpoint);
+  }
+
+  int64_t GroupRank(int64_t x, int64_t y, int64_t bx, int64_t by,
+                    int64_t ex) const {
+    return (y - by) * (ex - bx) + (x - bx);
+  }
+
+  ffi::Array<Integer> DirectRecord(int64_t site, int64_t record_index,
+                                   int64_t sx, int64_t sy, int64_t dx,
+                                   int64_t dy) const {
+    return {Integer(site), Integer(record_index), Integer(0), Integer(sx),
+            Integer(sy),   Integer(dx),           Integer(dy), Integer(dx + 1),
+            Integer(dy + 1)};
+  }
+
+  void PlanDirectEndpoint(bool send, const BufferRegion &region,
+                          const ffi::Array<Integer> &record,
+                          const Span &span) {
+    ffi::Map<ffi::String, ffi::ObjectRef> annotations{{"tt.pipe_record", record}};
+    Call endpoint(
+        DataType::Void(),
+        send ? tenstorrent::pipe_send() : tenstorrent::pipe_recv(),
+        send ? ffi::Array<PrimExpr>{region->ToPrimExpr(), Integer(0)}
+             : ffi::Array<PrimExpr>{Integer(0), region->ToPrimExpr()},
+        annotations, span);
+    PlanPipe(endpoint);
+  }
+
+  Stmt MakeCollectiveStepCall(const Op &op, ffi::Array<PrimExpr> args,
+                              int64_t site, int64_t occurrence,
+                              const ffi::String &kind,
+                              const Span &span) const {
+    ffi::Map<ffi::String, ffi::ObjectRef> annotations{
+        {"tt.communication_site", Integer(site)},
+        {"tt.communication_occurrence", Integer(occurrence)},
+        {"tt.communication_step_kind", StringImm(kind)},
+        {"tt.core_x", Integer(core_x_)},
+        {"tt.core_y", Integer(core_y_)}};
+    return Evaluate(Call(DataType::Void(), op, std::move(args), annotations,
+                         span),
+                    span);
+  }
+
+  Buffer MakeCollectiveTemporary(const BufferRegion &payload, int64_t site,
+                                 int64_t occurrence, int64_t source_rank,
+                                 const Span &span) {
+    const Buffer &source = payload->buffer;
+    Buffer storage = decl_buffer(
+        source->shape, source->dtype,
+        "tt_collective_" + std::to_string(site) + "_" +
+            std::to_string(occurrence) + "_" + std::to_string(source_rank) +
+            "_" + std::to_string(generated_collective_buffers_++),
+        "shared", std::nullopt, span);
+    ffi::Array<PrimExpr> tile_shape{Integer(32), Integer(32)};
+    ffi::Array<PrimExpr> tile_grid;
+    for (const PrimExpr &extent : source->shape)
+      tile_grid.push_back(Integer(
+          RequirePositiveStaticInteger(extent, "collective payload extent") /
+          32));
+    TTBufferMetadata metadata(
+        "collective.temp." + std::to_string(generated_collective_buffers_),
+        storage, "logical_dfb_candidate", std::nullopt, tile_shape, tile_grid,
+        "interleaved", std::nullopt, Integer(1), std::nullopt, std::nullopt,
+        "inferred", "inferred", "unset", "inferred", span);
+    metadata_.emplace(storage, metadata);
+    return storage;
+  }
+
+  void PlanAllGather(const Call &call) {
+    if (call->args.size() != 8)
+      ThrowMalformed("all_gather arity mismatch");
+    BufferRegion source =
+        NormalizeToAccessRegion(call->args[0], kAccessRead).region;
+    BufferRegion destination =
+        NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
+    FullRegion(source);
+    FullRegion(destination);
+    int64_t bx = RequireStaticInteger(call->args[2], "all_gather begin x");
+    int64_t by = RequireStaticInteger(call->args[3], "all_gather begin y");
+    int64_t ex = RequireStaticInteger(call->args[4], "all_gather end x");
+    int64_t ey = RequireStaticInteger(call->args[5], "all_gather end y");
+    int64_t axis = RequireStaticInteger(call->args[6], "all_gather axis");
+    int64_t site = RequireStaticInteger(call->args[7], "all_gather site_id");
+    if (!(bx <= core_x_ && core_x_ < ex && by <= core_y_ && core_y_ < ey))
+      return;
+    int64_t occurrence = collective_occurrences_[site]++;
+    int64_t group_size = (ex - bx) * (ey - by);
+    int64_t local_rank = GroupRank(core_x_, core_y_, bx, by, ex);
+
+    for (int64_t dy = by; dy < ey; ++dy)
+      for (int64_t dx = bx; dx < ex; ++dx) {
+        int64_t destination_rank = GroupRank(dx, dy, bx, by, ex);
+        if (destination_rank == local_rank)
+          continue;
+        int64_t record_index = local_rank * group_size + destination_rank;
+        PlanDirectEndpoint(true, source,
+                           DirectRecord(site, record_index, core_x_, core_y_, dx,
+                                        dy),
+                           call->span);
+      }
+
+    int64_t output = Write(destination->buffer, "trisc");
+    observable_resources_.insert(output);
+    Reserve(&compute_, output, call->span);
+    for (int64_t sy = by; sy < ey; ++sy)
+      for (int64_t sx = bx; sx < ex; ++sx) {
+        int64_t source_rank = GroupRank(sx, sy, bx, by, ex);
+        int64_t input;
+        if (source_rank == local_rank) {
+          input = Read(source->buffer, "trisc");
+        } else {
+          Buffer temporary = MakeCollectiveTemporary(
+              source, site, occurrence, source_rank, call->span);
+          BufferRegion temporary_region = BufferRegion::FullRegion(temporary);
+          int64_t record_index = source_rank * group_size + local_rank;
+          PlanDirectEndpoint(false, temporary_region,
+                             DirectRecord(site, record_index, sx, sy, core_x_,
+                                          core_y_),
+                             call->span);
+          input = Read(temporary, "trisc");
+        }
+        Wait(&compute_, input, call->span);
+        compute_.push_back(MakeCollectiveStepCall(
+            tenstorrent::dfb_gather_copy(),
+            {Integer(input), Integer(output), Integer(axis),
+             Integer(source_rank), Integer(group_size)},
+            site, occurrence, "local_copy", call->span));
+      }
+  }
+
+  void PlanAllReduce(const Call &call) {
+    if (call->args.size() != 8)
+      ThrowMalformed("all_reduce arity mismatch");
+    BufferRegion source =
+        NormalizeToAccessRegion(call->args[0], kAccessRead).region;
+    BufferRegion destination =
+        NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
+    FullRegion(source);
+    FullRegion(destination);
+    int64_t bx = RequireStaticInteger(call->args[2], "all_reduce begin x");
+    int64_t by = RequireStaticInteger(call->args[3], "all_reduce begin y");
+    int64_t ex = RequireStaticInteger(call->args[4], "all_reduce end x");
+    int64_t ey = RequireStaticInteger(call->args[5], "all_reduce end y");
+    const auto *reduction = call->args[6].as<StringImmNode>();
+    if (!reduction)
+      ThrowMalformed("all_reduce reduction operation is not a string");
+    int64_t site = RequireStaticInteger(call->args[7], "all_reduce site_id");
+    if (!(bx <= core_x_ && core_x_ < ex && by <= core_y_ && core_y_ < ey))
+      return;
+    int64_t occurrence = collective_occurrences_[site]++;
+    int64_t group_size = (ex - bx) * (ey - by);
+    int64_t local_rank = GroupRank(core_x_, core_y_, bx, by, ex);
+    const int64_t root_x = bx, root_y = by;
+
+    if (local_rank != 0) {
+      PlanDirectEndpoint(
+          true, source,
+          DirectRecord(site, local_rank, core_x_, core_y_, root_x, root_y),
+          call->span);
+      PlanDirectEndpoint(
+          false, destination,
+          DirectRecord(site, group_size + local_rank, root_x, root_y, core_x_,
+                       core_y_),
+          call->span);
+      return;
+    }
+
+    int64_t output = Write(destination->buffer, "trisc");
+    observable_resources_.insert(output);
+    Reserve(&compute_, output, call->span);
+    int64_t local = Read(source->buffer, "trisc");
+    Wait(&compute_, local, call->span);
+    compute_.push_back(MakeCollectiveStepCall(
+        tenstorrent::dfb_local_copy(), {Integer(local), Integer(output)},
+        site, occurrence, "local_copy", call->span));
+    for (int64_t sy = by; sy < ey; ++sy)
+      for (int64_t sx = bx; sx < ex; ++sx) {
+        int64_t source_rank = GroupRank(sx, sy, bx, by, ex);
+        if (source_rank == 0)
+          continue;
+        Buffer temporary = MakeCollectiveTemporary(
+            source, site, occurrence, source_rank, call->span);
+        BufferRegion temporary_region = BufferRegion::FullRegion(temporary);
+        PlanDirectEndpoint(
+            false, temporary_region,
+            DirectRecord(site, source_rank, sx, sy, root_x, root_y), call->span);
+        int64_t input = Read(temporary, "trisc");
+        Wait(&compute_, input, call->span);
+        compute_.push_back(MakeCollectiveStepCall(
+            tenstorrent::dfb_collective_reduce(),
+            {Integer(output), Integer(input), Integer(output), call->args[6]},
+            site, occurrence, "local_reduce", call->span));
+      }
+    for (int64_t dy = by; dy < ey; ++dy)
+      for (int64_t dx = bx; dx < ex; ++dx) {
+        int64_t destination_rank = GroupRank(dx, dy, bx, by, ex);
+        if (destination_rank == 0)
+          continue;
+        PlanDirectEndpoint(
+            true, destination,
+            DirectRecord(site, group_size + destination_rank, root_x, root_y,
+                         dx, dy),
+            call->span);
+      }
+  }
+
   void PlanPipe(const Call &call) {
     auto descriptor = call->annotations.Get("tt.pipe_record");
     if (!descriptor.has_value())
@@ -2414,18 +2792,39 @@ private:
         auto key = std::make_tuple(record[0]->value, record[1]->value,
                                    occurrence, x, y);
         auto found = transfers_->find(key);
-        int64_t transfer =
-            found == transfers_->end() ? transfers_->size() : found->second;
+        int64_t site = record[0]->value, record_index = record[1]->value;
+        if (site < 0 || site >= 128 || record_index < 0 ||
+            record_index >= 1024 || occurrence < 0 || occurrence >= 1024)
+          ThrowUnsupported("communication family index exceeds the supported "
+                           "site/record/occurrence domain: site=" +
+                           std::to_string(site) + ", record=" +
+                           std::to_string(record_index) + ", occurrence=" +
+                           std::to_string(occurrence));
+        int64_t destination_rank = x * grid_y_ + y;
+        int64_t grid_size = grid_x_ * grid_y_;
+        __int128 identity =
+            ((static_cast<__int128>(site) * 1024 + record_index) * 1024 +
+             occurrence) *
+                grid_size +
+            destination_rank;
+        if (identity < 0 || identity > std::numeric_limits<int64_t>::max())
+          ThrowUnsupported("communication transfer identity exceeds int64");
+        int64_t transfer = static_cast<int64_t>(identity);
+        if (found != transfers_->end() && found->second != transfer)
+          ThrowMalformed("communication transfer identity is not stable");
         (*transfers_)[key] = transfer;
         endpoints_.push_back(
-            {transfer, occurrence, record, x, y, id, send, call->span});
+            {transfer, occurrence, record, x, y, id, send,
+             send && forward, call->span});
         auto *body = send && !forward ? &pipe_ : &transfer_;
         body->push_back(MakeDeviceCall(
             send ? tenstorrent::dfb_pipe_send() : tenstorrent::dfb_pipe_recv(),
-            {Integer(transfer), Integer(id), Integer(1)}, call->span));
+            {IntImm(DataType::Int(64), transfer), Integer(id), Integer(1)},
+            call->span));
         body->push_back(MakeDeviceCall(
             tenstorrent::dfb_pipe_wait(),
-            {Integer(transfer), Integer(id), Integer(1)}, call->span));
+            {IntImm(DataType::Int(64), transfer), Integer(id), Integer(1)},
+            call->span));
       }
     }
   }
@@ -2449,15 +2848,20 @@ private:
   std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       accumulator_ids_;
   std::map<std::tuple<int64_t, int64_t, bool>, int64_t> occurrences_;
+  std::unordered_map<int64_t, int64_t> collective_occurrences_;
+  int64_t generated_collective_buffers_{0};
+  std::unordered_set<int64_t> observable_resources_;
   bool has_producer_forwarding_{false};
   TransferKeys *transfers_;
-  int64_t core_x_, core_y_;
+  int64_t core_x_, core_y_, grid_x_{1}, grid_y_{1};
   std::vector<PipeEndpoint> endpoints_;
   ffi::Array<Stmt> pipe_;
   PrimFunc frontend_;
   BufferMetadataMap metadata_;
   std::unordered_map<Var, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       current_;
+  std::unordered_map<Var, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      generations_;
   std::vector<ResourceVersion> resources_;
   std::vector<bool> tensor_reads_, tensor_writes_;
   ffi::Array<Stmt> compute_, transfer_;
@@ -2498,44 +2902,64 @@ ffi::Optional<For> FindPipelineLoop(const Stmt &body) {
 
 // A complete iteration can retain its structured loop without constructing
 // loop-carried DFB state. Tensor inout remains ordered by the NCRISC stream.
-ffi::Optional<For> FindIndependentLoop(const Stmt &body) {
+std::vector<For> FindIndependentLoops(const Stmt &body) {
   Stmt candidate = body;
   while (const auto *realize = candidate.as<SBlockRealizeNode>()) {
     if (!realize->iter_values.empty() || !is_one(realize->predicate) ||
         !realize->block->iter_vars.empty() ||
         realize->block->init.has_value() ||
         !realize->block->match_buffers.empty()) {
-      return std::nullopt;
+      return {};
     }
     candidate = realize->block->body;
   }
-  auto loop = candidate.as<For>();
-  if (!loop.has_value() || loop.value()->kind != ForKind::kSerial ||
-      !loop.value()->annotations.empty() ||
-      (loop.value()->step.has_value() && !is_one(loop.value()->step.value()))) {
-    return std::nullopt;
+  std::vector<For> loops;
+  while (auto loop = candidate.as<For>()) {
+    For value = loop.value();
+    if (value->kind != ForKind::kSerial || !value->annotations.empty() ||
+        (value->step.has_value() && !is_one(value->step.value())) ||
+        !as_const_int(value->min) || !as_const_int(value->extent) ||
+        *as_const_int(value->extent) <= 0 ||
+        *as_const_int(value->extent) > 1024)
+      break;
+    loops.push_back(value);
+    candidate = value->body;
+    while (const auto *realize = candidate.as<SBlockRealizeNode>()) {
+      if (!realize->iter_values.empty() || !is_one(realize->predicate) ||
+          !realize->block->iter_vars.empty() ||
+          realize->block->init.has_value() ||
+          !realize->block->match_buffers.empty())
+        return loops;
+      candidate = realize->block->body;
+    }
   }
-  For value = loop.value();
-  if (!as_const_int(value->min) || !as_const_int(value->extent) ||
-      *as_const_int(value->extent) <= 0 ||
-      *as_const_int(value->extent) > 1024 ||
-      UsesVar(value->body, [&](const VarNode *var) {
-        return ffi::GetRef<Var>(var).same_as(value->loop_var);
-      })) {
-    return std::nullopt;
-  }
-  return value;
+  return loops;
 }
 
-Stmt WrapIndependentLoop(Stmt body, const For &loop) {
+Stmt WrapIndependentLoops(Stmt body, const std::vector<For> &loops) {
   if (const auto *evaluate = body.as<EvaluateNode>()) {
     if (is_zero(evaluate->value))
       return body;
   }
-  // Each function owns its binder, even though the body does not use it.
-  return For(Var("tt_iteration", loop->loop_var.dtype()), loop->min,
-             loop->extent, ForKind::kSerial, std::move(body), std::nullopt, {},
-             std::nullopt, loop->span);
+  for (auto it = loops.rbegin(); it != loops.rend(); ++it) {
+    const For &loop = *it;
+    Var variable = loop->loop_var.copy_with_suffix("");
+    body = Substitute(body, {{loop->loop_var, variable}});
+    body = For(variable, loop->min, loop->extent, ForKind::kSerial,
+               std::move(body), std::nullopt, {}, loop->step, loop->span);
+  }
+  return body;
+}
+
+PrimExpr IndependentIterationCount(const std::vector<For> &loops) {
+  PrimExpr count = Integer(1);
+  for (const For &loop : loops)
+    count = count * loop->extent;
+  return count;
+}
+
+Stmt IndependentLoopBody(const std::vector<For> &loops, const Stmt &fallback) {
+  return loops.empty() ? fallback : loops.back()->body;
 }
 
 PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
@@ -2589,14 +3013,24 @@ PrimFunc MakeSlotFunction(const PrimFunc &frontend, const Target &target,
 class DeviceIDRemapper : public StmtExprMutator {
 public:
   DeviceIDRemapper(int64_t offset, int64_t accumulator_offset,
-                   int64_t value_offset)
+                   int64_t value_offset,
+                   const std::vector<int64_t> *resource_ids = nullptr)
       : offset_(offset), accumulator_offset_(accumulator_offset),
-        value_offset_(value_offset) {}
+        value_offset_(value_offset), resource_ids_(resource_ids) {}
   PrimExpr VisitExpr_(const CallNode *op) final {
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     auto args = call->args;
     auto shift = [&](size_t index) {
-      args.Set(index, Integer(*as_const_int(args[index]) + offset_));
+      int64_t id = *as_const_int(args[index]);
+      if (resource_ids_) {
+        if (id < 0 || id >= static_cast<int64_t>(resource_ids_->size()) ||
+            resource_ids_->at(id) < 0)
+          ThrowMalformed("Device operation references an uninterned DFB ID");
+        id = resource_ids_->at(id);
+      } else {
+        id += offset_;
+      }
+      args.Set(index, Integer(id));
     };
     auto shift_value = [&](size_t index) {
       int64_t value = *as_const_int(args[index]);
@@ -2657,23 +3091,490 @@ private:
   int64_t offset_;
   int64_t accumulator_offset_;
   int64_t value_offset_;
+  const std::vector<int64_t> *resource_ids_{nullptr};
 };
+
+using TransferStepKey =
+    std::tuple<int64_t, std::string, int64_t, int64_t, std::string>;
+using LocalStepKey = std::tuple<int64_t, int64_t, std::string, int64_t,
+                                int64_t, int64_t, int64_t>;
+
+class CommunicationStepRefAttacher : public StmtExprMutator {
+public:
+  CommunicationStepRefAttacher(
+      const ffi::Array<CommunicationStepDescriptor> &steps,
+      ffi::String owner_slot, int64_t core_x, int64_t core_y)
+      : owner_slot_(std::move(owner_slot)), core_x_(core_x), core_y_(core_y) {
+    for (const CommunicationStepDescriptor &step : steps) {
+      const int64_t *parameter = as_const_int(step->parameter);
+      std::string kind = step->kind;
+      if (kind == "send" || kind == "receive" || kind == "completion" ||
+          kind == "publish") {
+        if (!parameter)
+          ThrowMalformed(
+              "transport step parameter must be a static transfer ID");
+        CoreCoord coord;
+        if (kind == "send") {
+          coord = step->source_core.value();
+        } else if (kind == "receive" || kind == "publish") {
+          coord = step->destination_core.value();
+        } else {
+          if (step->dependencies.size() != 1)
+            ThrowMalformed("transport completion requires one dependency");
+          const CommunicationStepDescriptor &dependency =
+              steps[step->dependencies[0]->value];
+          coord = dependency->kind == "send" ? step->source_core.value()
+                                              : step->destination_core.value();
+        }
+        TransferStepKey key{*parameter, std::string(step->owner_slot),
+                            coord->x, coord->y, kind};
+        if (!transfer_steps_.emplace(key, step->step_id).second)
+          ThrowMalformed("duplicate transport step identity");
+        continue;
+      }
+      if (!step->source_core.has_value() ||
+          !step->destination_core.has_value())
+        ThrowMalformed("local communication step requires Core coordinates");
+      LocalStepKey key{
+          step->communication_id,
+          step->occurrence,
+          kind,
+          step->source_core.value()->x,
+          step->source_core.value()->y,
+          step->source_dfb_id,
+          step->destination_dfb_id,
+      };
+      if (!local_steps_.emplace(key, step->step_id).second)
+        ThrowMalformed("duplicate local communication step identity");
+    }
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    ffi::Array<PrimExpr> refs;
+    auto static_arg = [&](size_t index, const char *label) {
+      if (index >= call->args.size() || !as_const_int(call->args[index]))
+        ThrowMalformed(std::string(label) + " must be a static integer before "
+                       "shared-body parameterization");
+      return *as_const_int(call->args[index]);
+    };
+    auto transfer_ref = [&](int64_t transfer, const char *kind) {
+      TransferStepKey key{transfer, std::string(owner_slot_), core_x_, core_y_,
+                          kind};
+      auto found = transfer_steps_.find(key);
+      if (found == transfer_steps_.end())
+        ThrowMalformed("Device transport operation has no matching step");
+      refs.push_back(Integer(found->second));
+    };
+    if (call->op.same_as(dfb_pipe_send())) {
+      transfer_ref(static_arg(0, "Pipe transfer ID"), "send");
+    } else if (call->op.same_as(dfb_pipe_recv())) {
+      transfer_ref(static_arg(0, "Pipe transfer ID"), "receive");
+    } else if (call->op.same_as(dfb_pipe_wait())) {
+      int64_t transfer = static_arg(0, "Pipe transfer ID");
+      transfer_ref(transfer, "completion");
+      TransferStepKey publish{transfer, std::string(owner_slot_), core_x_,
+                              core_y_, "publish"};
+      auto found = transfer_steps_.find(publish);
+      if (found != transfer_steps_.end())
+        refs.push_back(Integer(found->second));
+    } else if (call->op.same_as(dfb_local_copy()) ||
+               call->op.same_as(dfb_gather_copy()) ||
+               call->op.same_as(dfb_collective_reduce())) {
+      auto site = call->annotations.Get("tt.communication_site");
+      auto occurrence = call->annotations.Get("tt.communication_occurrence");
+      auto kind = call->annotations.Get("tt.communication_step_kind");
+      if (!site.has_value() || !occurrence.has_value() || !kind.has_value())
+        ThrowMalformed("local communication operation has no step identity");
+      int64_t source = call->op.same_as(dfb_collective_reduce())
+                           ? static_arg(1, "local reduction source")
+                           : static_arg(0, "local copy source");
+      int64_t destination = call->op.same_as(dfb_collective_reduce())
+                                ? static_arg(2, "local reduction destination")
+                                : static_arg(1, "local copy destination");
+      LocalStepKey key{
+          Downcast<Integer>(site.value())->value,
+          Downcast<Integer>(occurrence.value())->value,
+          std::string(Downcast<StringImm>(kind.value())->value),
+          core_x_,
+          core_y_,
+          source,
+          destination,
+      };
+      auto found = local_steps_.find(key);
+      if (found == local_steps_.end())
+        ThrowMalformed("local communication operation has no matching step");
+      refs.push_back(Integer(found->second));
+    }
+    if (refs.empty())
+      return call;
+    auto annotations = call->annotations;
+    if (annotations.count("tt_communication_step_refs"))
+      ThrowMalformed("communication step refs were attached more than once");
+    annotations.Set("tt_communication_step_refs", refs);
+    return Call(call->dtype, call->op, call->args, annotations, call->span);
+  }
+
+private:
+  ffi::String owner_slot_;
+  int64_t core_x_, core_y_;
+  std::map<TransferStepKey, int64_t> transfer_steps_;
+  std::map<LocalStepKey, int64_t> local_steps_;
+};
+
+using StorageLocalKey = std::tuple<int64_t, int64_t, int64_t>;
+using StorageCoreKey = std::pair<int64_t, int64_t>;
+
+struct ScheduledDeviceCall {
+  Call call;
+  bool repeated;
+};
+
+std::vector<size_t> StorageDFBOperandPositions(const Call &call) {
+  if (call->op.same_as(tenstorrent::dfb_compute())) {
+    std::vector<size_t> result(call->args.size());
+    std::iota(result.begin(), result.end(), 0);
+    return result;
+  }
+  if (call->op.same_as(tenstorrent::compute_value())) {
+    std::vector<size_t> result(call->args.size() > 0 ? call->args.size() - 1
+                                                     : 0);
+    std::iota(result.begin(), result.end(), 1);
+    return result;
+  }
+  if (call->op.same_as(tenstorrent::dfb_reserve()) ||
+      call->op.same_as(tenstorrent::dfb_wait()) ||
+      call->op.same_as(tenstorrent::dfb_copy_wait()) ||
+      call->op.same_as(tenstorrent::dfb_release()) ||
+      call->op.same_as(tenstorrent::dfb_load()) ||
+      call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
+    return {0};
+  if (call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_send()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_wait()) ||
+      call->op.same_as(tenstorrent::accumulator_materialize()) ||
+      call->op.same_as(tenstorrent::compute_value_store()))
+    return {1};
+  if (call->op.same_as(tenstorrent::compute_value_gemm()))
+    return {1, 2};
+  if (call->op.same_as(tenstorrent::gemm_update()) ||
+      call->op.same_as(tenstorrent::dfb_local_copy()) ||
+      call->op.same_as(tenstorrent::dfb_gather_copy()))
+    return {0, 1};
+  if (call->op.same_as(tenstorrent::dfb_collective_reduce()))
+    return {0, 1, 2};
+  return {};
+}
+
+void CollectStorageScheduleCalls(const Stmt &stmt, bool repeated,
+                                 std::vector<ScheduledDeviceCall> *calls) {
+  if (const auto *sequence = stmt.as<SeqStmtNode>()) {
+    for (const Stmt &child : sequence->seq)
+      CollectStorageScheduleCalls(child, repeated, calls);
+    return;
+  }
+  if (const auto *loop = stmt.as<ForNode>()) {
+    CollectStorageScheduleCalls(loop->body, true, calls);
+    return;
+  }
+  if (const auto *branch = stmt.as<IfThenElseNode>()) {
+    CollectStorageScheduleCalls(branch->then_case, repeated, calls);
+    if (branch->else_case.has_value())
+      CollectStorageScheduleCalls(branch->else_case.value(), repeated, calls);
+    return;
+  }
+  if (const auto *realize = stmt.as<SBlockRealizeNode>()) {
+    CollectStorageScheduleCalls(realize->block->body, repeated, calls);
+    return;
+  }
+  if (const auto *evaluate = stmt.as<EvaluateNode>())
+    if (const auto *call = evaluate->value.as<CallNode>())
+      calls->push_back({ffi::GetRef<Call>(call), repeated});
+}
+
+bool IsAcyclic(const std::vector<std::vector<int64_t>> &successors) {
+  std::vector<int64_t> indegree(successors.size(), 0);
+  for (const auto &edges : successors)
+    for (int64_t successor : edges)
+      ++indegree[successor];
+  std::vector<int64_t> ready;
+  for (size_t event = 0; event < indegree.size(); ++event)
+    if (!indegree[event])
+      ready.push_back(event);
+  size_t visited = 0;
+  while (!ready.empty()) {
+    int64_t event = ready.back();
+    ready.pop_back();
+    ++visited;
+    for (int64_t successor : successors[event])
+      if (!--indegree[successor])
+        ready.push_back(successor);
+  }
+  return visited == successors.size();
+}
+
+struct StorageSchedule {
+  std::vector<std::vector<int64_t>> successors;
+  std::map<StorageLocalKey, int64_t> reserves;
+  std::map<StorageLocalKey, int64_t> producers;
+  std::map<StorageLocalKey, int64_t> first_waits;
+  std::map<StorageLocalKey, int64_t> releases;
+  std::set<int64_t> repeated_resources;
+};
+
+StorageSchedule BuildStorageSchedule(
+    const std::array<std::vector<DeviceCoreBody>, 3> &bodies,
+    const ffi::Array<DFBDescriptor> &dfbs) {
+  StorageSchedule result;
+  std::map<int64_t, DFBDescriptor> descriptors;
+  for (const DFBDescriptor &dfb : dfbs)
+    descriptors.emplace(dfb->dfb_id, dfb);
+  std::map<StorageLocalKey, std::pair<int64_t, bool>> copy_issues;
+  std::map<StorageLocalKey, int64_t> copy_completions;
+  std::map<StorageLocalKey, std::vector<int64_t>> waits;
+  std::map<StorageLocalKey, std::vector<int64_t>> forwarding_completions;
+  using TransferKey = std::tuple<int64_t, int64_t, int64_t, int64_t>;
+  std::map<TransferKey, bool> sends;
+  std::set<TransferKey> receives;
+
+  auto add_edge = [&](int64_t source, int64_t destination) {
+    if (source != destination)
+      result.successors[source].push_back(destination);
+  };
+  auto static_arg = [&](const Call &call, size_t index) {
+    if (index >= call->args.size() || !as_const_int(call->args[index]))
+      ThrowMalformed("storage planning requires static concrete DFB operands");
+    return *as_const_int(call->args[index]);
+  };
+
+  for (size_t slot_index = 0; slot_index < bodies.size(); ++slot_index) {
+    const ffi::String slot = slot_index == 0   ? ffi::String("trisc")
+                             : slot_index == 1 ? ffi::String("ncrisc")
+                                               : ffi::String("brisc");
+    for (const DeviceCoreBody &core_body : bodies[slot_index]) {
+      std::vector<ScheduledDeviceCall> calls;
+      CollectStorageScheduleCalls(core_body.body, false, &calls);
+      int64_t previous = -1;
+      for (const ScheduledDeviceCall &scheduled : calls) {
+        const Call &call = scheduled.call;
+        int64_t event = result.successors.size();
+        result.successors.emplace_back();
+        if (previous >= 0)
+          add_edge(previous, event);
+        previous = event;
+        for (size_t position : StorageDFBOperandPositions(call))
+          if (position < call->args.size() && as_const_int(call->args[position]) &&
+              scheduled.repeated)
+            result.repeated_resources.insert(*as_const_int(call->args[position]));
+
+        auto key = [&](int64_t resource) {
+          return StorageLocalKey{core_body.x, core_body.y, resource};
+        };
+        if (call->op.same_as(tenstorrent::dfb_reserve())) {
+          result.reserves.emplace(key(static_arg(call, 0)), event);
+        } else if (call->op.same_as(tenstorrent::dfb_wait())) {
+          waits[key(static_arg(call, 0))].push_back(event);
+        } else if (call->op.same_as(tenstorrent::dfb_release())) {
+          result.releases[key(static_arg(call, 0))] = event;
+        } else if (call->op.same_as(tenstorrent::tensor_to_dfb_nd())) {
+          copy_issues.emplace(key(static_arg(call, 1)),
+                              std::make_pair(event, true));
+        } else if (call->op.same_as(tenstorrent::dfb_to_tensor_nd())) {
+          copy_issues.emplace(key(static_arg(call, 0)),
+                              std::make_pair(event, false));
+        } else if (call->op.same_as(tenstorrent::dfb_copy_wait())) {
+          int64_t resource = static_arg(call, 0);
+          copy_completions[key(resource)] = event;
+          auto issue = copy_issues.find(key(resource));
+          if (issue != copy_issues.end() && issue->second.second)
+            result.producers[key(resource)] = event;
+        } else if (call->op.same_as(tenstorrent::dfb_compute())) {
+          result.producers[key(static_arg(call, 0))] = event;
+        } else if (call->op.same_as(tenstorrent::accumulator_materialize()) ||
+                   call->op.same_as(tenstorrent::compute_value_store())) {
+          result.producers[key(static_arg(call, 1))] = event;
+        } else if (call->op.same_as(tenstorrent::dfb_local_copy()) ||
+                   call->op.same_as(tenstorrent::dfb_gather_copy())) {
+          result.producers[key(static_arg(call, 1))] = event;
+        } else if (call->op.same_as(tenstorrent::dfb_collective_reduce())) {
+          result.producers[key(static_arg(call, 2))] = event;
+        } else if (call->op.same_as(tenstorrent::dfb_pipe_send()) ||
+                   call->op.same_as(tenstorrent::dfb_pipe_recv())) {
+          int64_t transfer = static_arg(call, 0);
+          int64_t resource = static_arg(call, 1);
+          TransferKey transfer_key{core_body.x, core_body.y, transfer, resource};
+          if (call->op.same_as(tenstorrent::dfb_pipe_send())) {
+            const DFBDescriptor &descriptor = descriptors.at(resource);
+            bool forwarding = slot == descriptor->producer_slot &&
+                              descriptor->tensor_backing.has_value();
+            sends[transfer_key] = forwarding;
+          } else {
+            receives.insert(transfer_key);
+          }
+        } else if (call->op.same_as(tenstorrent::dfb_pipe_wait())) {
+          int64_t transfer = static_arg(call, 0);
+          int64_t resource = static_arg(call, 1);
+          TransferKey transfer_key{core_body.x, core_body.y, transfer, resource};
+          auto sent = sends.find(transfer_key);
+          if (sent != sends.end() && sent->second)
+            forwarding_completions[key(resource)].push_back(event);
+          else if (receives.count(transfer_key))
+            result.producers[key(resource)] = event;
+        }
+      }
+    }
+  }
+
+  for (const auto &[key, events] : waits) {
+    auto producer = result.producers.find(key);
+    if (producer == result.producers.end())
+      ThrowMalformed("storage planning found a wait without publication");
+    result.first_waits.emplace(key, events.front());
+    for (int64_t event : events)
+      add_edge(producer->second, event);
+  }
+  for (const auto &[key, issue] : copy_issues) {
+    auto completion = copy_completions.find(key);
+    if (completion == copy_completions.end())
+      ThrowMalformed("storage planning found a copy without completion");
+    add_edge(issue.first, completion->second);
+    if (!issue.second) {
+      auto release = result.releases.find(key);
+      if (release == result.releases.end())
+        ThrowMalformed("storage planning found an export without release");
+      add_edge(completion->second, release->second);
+    }
+  }
+  for (const auto &[key, completions] : forwarding_completions) {
+    auto release = result.releases.find(key);
+    if (release == result.releases.end())
+      ThrowMalformed("storage planning found forwarding without release");
+    for (int64_t completion : completions)
+      add_edge(completion, release->second);
+  }
+  if (!IsAcyclic(result.successors))
+    ThrowMalformed("base transaction schedule contains a dependency cycle");
+  return result;
+}
+
+std::map<int64_t, std::map<StorageCoreKey, int64_t>> IndexStorageEvents(
+    const std::map<StorageLocalKey, int64_t> &events) {
+  std::map<int64_t, std::map<StorageCoreKey, int64_t>> result;
+  for (const auto &[key, event] : events)
+    result[std::get<2>(key)][{std::get<0>(key), std::get<1>(key)}] = event;
+  return result;
+}
+
+ffi::Map<ffi::String, Integer> PlanNonPipelineStorageGroups(
+    const ffi::Array<DFBDescriptor> &dfbs,
+    const std::array<std::vector<DeviceCoreBody>, 3> &bodies,
+    const std::map<int64_t, std::string> &storage_keys) {
+  StorageSchedule schedule = BuildStorageSchedule(bodies, dfbs);
+  auto reserves = IndexStorageEvents(schedule.reserves);
+  auto producers = IndexStorageEvents(schedule.producers);
+  auto waits = IndexStorageEvents(schedule.first_waits);
+  auto releases = IndexStorageEvents(schedule.releases);
+  std::map<int64_t, DFBDescriptor> descriptors;
+  std::map<std::string, std::vector<int64_t>> compatible;
+  for (const DFBDescriptor &dfb : dfbs) {
+    descriptors.emplace(dfb->dfb_id, dfb);
+    compatible[storage_keys.at(dfb->dfb_id)].push_back(dfb->dfb_id);
+  }
+
+  auto ordered = [&](const auto &events, int64_t before, int64_t after) {
+    auto lhs = events.find(before), rhs = events.find(after);
+    if (lhs == events.end() || rhs == events.end())
+      return true;
+    for (const auto &[core, event] : lhs->second) {
+      auto other = rhs->second.find(core);
+      if (other != rhs->second.end() && event >= other->second)
+        return false;
+    }
+    return true;
+  };
+  auto fifo_ordered = [&](int64_t before, int64_t after) {
+    return ordered(reserves, before, after) &&
+           ordered(producers, before, after) &&
+           ordered(waits, before, after) &&
+           ordered(releases, before, after);
+  };
+
+  struct Group {
+    int64_t id;
+    int64_t capacity;
+    std::vector<int64_t> resources;
+  };
+  std::vector<Group> groups;
+  ffi::Map<ffi::String, Integer> assignments;
+  for (auto &[storage_key, resources] : compatible) {
+    std::sort(resources.begin(), resources.end());
+    std::vector<size_t> local_groups;
+    for (int64_t resource : resources) {
+      int64_t capacity = RequirePositiveStaticInteger(
+          descriptors.at(resource)->block_count, "DFB storage capacity");
+      bool assigned = false;
+      if (!schedule.repeated_resources.count(resource)) {
+        for (size_t group_index : local_groups) {
+          Group &group = groups[group_index];
+          if (group.capacity != capacity)
+            continue;
+          bool valid_order = std::all_of(
+              group.resources.begin(), group.resources.end(),
+              [&](int64_t previous) { return fifo_ordered(previous, resource); });
+          if (!valid_order)
+            continue;
+          std::vector<std::pair<int64_t, int64_t>> added_edges;
+          if (group.resources.size() >= static_cast<size_t>(capacity)) {
+            int64_t previous =
+                group.resources[group.resources.size() - capacity];
+            auto old_releases = releases.find(previous);
+            auto next_reserves = reserves.find(resource);
+            if (old_releases == releases.end() || next_reserves == reserves.end())
+              continue;
+            for (const auto &[core, release] : old_releases->second) {
+              auto reserve = next_reserves->second.find(core);
+              if (reserve != next_reserves->second.end()) {
+                schedule.successors[release].push_back(reserve->second);
+                added_edges.emplace_back(release, reserve->second);
+              }
+            }
+            if (!IsAcyclic(schedule.successors)) {
+              for (auto it = added_edges.rbegin(); it != added_edges.rend(); ++it)
+                schedule.successors[it->first].pop_back();
+              continue;
+            }
+          }
+          group.resources.push_back(resource);
+          assignments.Set(std::to_string(resource), Integer(group.id));
+          assigned = true;
+          break;
+        }
+      }
+      if (!assigned) {
+        int64_t group_id = groups.size();
+        groups.push_back({group_id, capacity, {resource}});
+        local_groups.push_back(groups.size() - 1);
+        assignments.Set(std::to_string(resource), Integer(group_id));
+      }
+    }
+  }
+  if (assignments.size() != dfbs.size())
+    ThrowMalformed("storage-group planning did not cover every DFB generation");
+  return assignments;
+}
 
 IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                               const Target &target,
                               const ffi::String &operation,
                               const ffi::String &arch, int64_t gx, int64_t gy,
-                              const Stmt &body,
+                              const Stmt &kernel_body, const Var &core_x_var,
+                              const Var &core_y_var,
                               const ffi::Array<TTBufferMetadata> &metadata) {
-  ffi::Array<Stmt> cores;
-  if (const auto *seq = body.as<SeqStmtNode>())
-    cores = seq->seq;
-  else
-    cores.push_back(body);
-  if (cores.size() != static_cast<size_t>(gx * gy))
-    ThrowMalformed("normalized topology does not cover the Core grid");
   ffi::Map<GlobalVar, BaseFunc> functions;
   ffi::Array<ffi::String> order;
+  std::array<std::vector<DeviceCoreBody>, 3> shared_bodies;
+  std::array<std::set<int64_t>, 3> shared_tensor_indices;
   ffi::Array<DFBDescriptor> dfbs;
   ffi::Array<PipeDescriptor> pipes;
   ffi::Array<PipeTransferDescriptor> transfers;
@@ -2682,24 +3583,29 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   std::vector<int> effects(frontend->params.size(), 0);
   TransferKeys transfer_keys;
   std::vector<PipeEndpoint> endpoints;
-  int64_t offset = 0, accumulator_offset = 0, value_offset = 0;
-  int64_t pipeline_stages = 0, pipeline_extent = 0, group_offset = 0;
+  int64_t accumulator_offset = 0, value_offset = 0;
+  int64_t pipeline_stages = 0, pipeline_extent = 0;
   ffi::String pipeline_wait_policy;
   ffi::Map<ffi::String, Integer> storage_groups;
   ffi::Map<ffi::String, ffi::Array<Integer>> pipeline_relations;
   bool producer_forwarding = false;
   bool precision_regions = false;
-  for (size_t index = 0; index < cores.size(); ++index) {
+  CoreDomain shared_domain(CoreCoord(0, 0), CoreCoord(gx, gy));
+  std::map<std::string, int64_t> logical_resource_ids;
+  std::map<int64_t, std::string> resource_storage_keys;
+  // Specialize and consume one proof instance at a time. Do not materialize a
+  // gx*gy clone of the structured input before shared-body parameterization.
+  for (int64_t index = 0; index < gx * gy; ++index) {
     int64_t x = index / gy, y = index % gy;
-    const auto *realize = cores[index].as<SBlockRealizeNode>();
-    if (!realize || !realize->block->annotations.count("tt.core_x") ||
-        Downcast<Integer>(realize->block->annotations.at("tt.core_x"))->value !=
-            x ||
-        Downcast<Integer>(realize->block->annotations.at("tt.core_y"))->value !=
-            y)
-      ThrowMalformed("normalized topology Core order is not lexicographic x/y");
+    StaticIterationSubstituter specialize_x(core_x_var, Integer(x));
+    Stmt specialized = specialize_x(kernel_body);
+    StaticIterationSubstituter specialize_y(core_y_var, Integer(y));
+    specialized = specialize_y(specialized);
     GeneralDataflowPlanner planner(frontend, metadata, &transfer_keys, x, y);
-    planner.Plan(realize->block->body);
+    std::vector<For> independent_loops =
+        FindIndependentLoops(specialized);
+    planner.Plan(
+        IndependentLoopBody(independent_loops, specialized));
     planner.EliminateDeadWrites();
     planner.FinalizeMulticore();
     if (planner.IsPipeline()) {
@@ -2712,53 +3618,80 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       pipeline_extent = planner.PipelineExtent();
       pipeline_stages = planner.PipelineStages();
       pipeline_wait_policy = planner.PipelineWaitPolicy();
-      for (const auto &[key, group] : planner.StorageGroups())
-        storage_groups.Set(
-            std::to_string(std::stoll(std::string(key)) + offset),
-            Integer(group->value + group_offset));
-      for (const auto &[key, relation] : planner.PipelineRelations())
-        pipeline_relations.Set(
-            std::to_string(std::stoll(std::string(key)) + offset), relation);
-    } else if (pipeline_extent || !storage_groups.empty()) {
+    } else if (pipeline_extent) {
       ThrowUnsupported("all active Core bodies must retain their pipeline");
     }
     producer_forwarding |= planner.HasProducerForwarding();
     precision_regions |= planner.HasPrecisionRegions();
     CoreDomain domain(CoreCoord(x, y), CoreCoord(x + 1, y + 1));
+    PrimExpr transaction_relation =
+        IndependentIterationCount(independent_loops);
+    std::vector<int64_t> resource_ids(planner.ResourceCount(), -1);
     for (const DFBDescriptor &dfb : planner.Descriptors(domain)) {
-      dfbs.push_back(DFBDescriptor(
-          dfb->dfb_id + offset,
-          dfb->source_buffer_identity + ".core" + std::to_string(x) + "_" +
-              std::to_string(y),
-          dfb->element_dtype, dfb->tile_shape, dfb->block_shape_in_tiles,
-          dfb->block_count, dfb->tensor_backing, dfb->producer_slot, domain,
-          dfb->consumer_slot, domain, dfb->transaction_count_or_loop_relation,
-          dfb->source_span));
+      int64_t local_id = dfb->dfb_id;
+      std::string key = planner.ResourceIdentity(local_id);
+      auto [found, inserted] =
+          logical_resource_ids.emplace(key, logical_resource_ids.size());
+      int64_t global_id = found->second;
+      resource_ids[local_id] = global_id;
+      std::string storage_key = planner.ResourceStorageIdentity(local_id);
+      if (inserted) {
+        resource_storage_keys.emplace(global_id, std::move(storage_key));
+        dfbs.push_back(DFBDescriptor(
+            global_id, key, dfb->element_dtype, dfb->tile_shape,
+            dfb->block_shape_in_tiles, dfb->block_count, dfb->tensor_backing,
+            dfb->producer_slot, shared_domain, dfb->consumer_slot,
+            shared_domain,
+            independent_loops.empty()
+                ? dfb->transaction_count_or_loop_relation
+                : transaction_relation,
+            dfb->source_span));
+      } else if (resource_storage_keys.at(global_id) != storage_key) {
+        ThrowMalformed("one logical DFB has inconsistent storage identity");
+      }
     }
-    std::unordered_map<Var, Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
-        core_buffers;
-    auto isolate_buffer = [&](const Buffer &buffer) -> Buffer {
-      auto found = core_buffers.find(buffer->data);
-      if (found != core_buffers.end())
-        return found->second;
-      Buffer isolated = buffer;
-      isolated.CopyOnWrite()->data = buffer->data.copy_with_suffix(
-          "_core" + std::to_string(x) + "_" + std::to_string(y));
-      core_buffers.emplace(buffer->data, isolated);
-      return isolated;
-    };
+    if (planner.IsPipeline()) {
+      for (const auto &[key, group] : planner.StorageGroups()) {
+        int64_t local = std::stoll(std::string(key));
+        if (local < 0 || local >= static_cast<int64_t>(resource_ids.size()) ||
+            resource_ids[local] < 0)
+          ThrowMalformed("pipeline storage group references dead DFB");
+        ffi::String global_key = std::to_string(resource_ids[local]);
+        if (storage_groups.count(global_key)) {
+          if (storage_groups.at(global_key)->value != group->value)
+            ThrowUnsupported(
+                "Core-local storage groups disagree for one logical DFB");
+        } else {
+          storage_groups.Set(global_key, group);
+        }
+      }
+      for (const auto &[key, relation] : planner.PipelineRelations()) {
+        int64_t local = std::stoll(std::string(key));
+        if (local < 0 || local >= static_cast<int64_t>(resource_ids.size()) ||
+            resource_ids[local] < 0)
+          ThrowMalformed("pipeline relation references dead DFB");
+        ffi::String global_key = std::to_string(resource_ids[local]);
+        if (pipeline_relations.count(global_key)) {
+          if (!ffi::StructuralEqual()(pipeline_relations.at(global_key),
+                                      relation))
+            ThrowUnsupported(
+                "Core-local pipeline relations disagree for one logical DFB");
+        } else {
+          pipeline_relations.Set(global_key, relation);
+        }
+      }
+    }
     for (const AccumulatorDescriptor &accumulator : planner.Accumulators()) {
       accumulators.push_back(AccumulatorDescriptor(
           accumulator->accumulator_id + accumulator_offset,
-          BufferRegion(isolate_buffer(accumulator->accumulator_region->buffer),
-                       accumulator->accumulator_region->region),
+          accumulator->accumulator_region,
           accumulator->input_dtype, accumulator->accumulation_dtype,
           accumulator->output_dtype, accumulator->full_k_tiles,
-          accumulator->source_span));
+          domain, accumulator->source_span));
     }
     for (const ComputeValueDescriptor &value : planner.ComputeValues()) {
       compute_values.push_back(ComputeValueDescriptor(
-          value->value_id + value_offset, isolate_buffer(value->buffer),
+          value->value_id + value_offset, value->buffer,
           value->version,
           value->previous_value_id < 0
               ? -1
@@ -2766,10 +3699,16 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
           value->accumulator_id < 0
               ? -1
               : value->accumulator_id + accumulator_offset,
-          value->source_span));
+          value->value_kind, value->logical_shape, value->compute_tile_shape,
+          value->dtype, value->owner_slot, domain,
+          value->materialization_refs, value->source_span));
     }
     for (PipeEndpoint endpoint : planner.Endpoints()) {
-      endpoint.dfb_id += offset;
+      if (endpoint.dfb_id < 0 ||
+          endpoint.dfb_id >= static_cast<int64_t>(resource_ids.size()) ||
+          resource_ids[endpoint.dfb_id] < 0)
+        ThrowMalformed("communication endpoint references dead DFB");
+      endpoint.dfb_id = resource_ids[endpoint.dfb_id];
       endpoints.push_back(std::move(endpoint));
     }
     auto core_effects = planner.Effects();
@@ -2779,55 +3718,34 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
                                 : effect == "output" ? 2
                                                      : 1;
     }
-    DeviceIDRemapper remap(offset, accumulator_offset, value_offset);
-    ffi::String core_operation =
-        operation + "_x" + std::to_string(x) + "_y" + std::to_string(y);
+    DeviceIDRemapper remap(0, accumulator_offset, value_offset, &resource_ids);
+    size_t slot_index = 0;
     for (const ffi::String &slot :
          ffi::Array<ffi::String>{"trisc", "ncrisc", "brisc"}) {
       bool compute = slot == "trisc";
       Stmt slot_body = compute            ? planner.ComputeBody()
                        : slot == "ncrisc" ? planner.TransferBody()
                                           : planner.PipeBody();
-      PrimFunc func = MakeSlotFunction(
-          frontend, target, domain, core_operation, slot,
-          compute ? "compute" : "datamovement",
-          compute ? ffi::Optional<Integer>(std::nullopt)
-                  : ffi::Optional<Integer>(Integer(slot == "ncrisc" ? 0 : 1)),
-          slot == "ncrisc" ? planner.UsedTensorIndices()
-                           : ffi::Array<Integer>(),
-          compute ? "compute" : "datamovement",
-          compute            ? "general"
-          : slot == "ncrisc" ? "tensor_io"
-                             : "pipe_source",
-          remap(slot_body));
-      ffi::Array<Var> isolated_params;
-      ffi::Map<Var, Buffer> isolated_buffers;
-      for (const Var &parameter : func->params) {
-        Var isolated_parameter = parameter.copy_with_suffix("");
-        Buffer buffer = func->buffer_map.at(parameter);
-        buffer.CopyOnWrite()->data = buffer->data.copy_with_suffix("");
-        isolated_params.push_back(isolated_parameter);
-        isolated_buffers.Set(isolated_parameter, buffer);
+      slot_body =
+          WrapIndependentLoops(std::move(slot_body), independent_loops);
+      Stmt local = remap(slot_body);
+      if (!(local.as<EvaluateNode>() &&
+            is_zero(local.as<EvaluateNode>()->value))) {
+        shared_bodies[slot_index].push_back({x, y, local});
       }
-      func.CopyOnWrite()->params = isolated_params;
-      func.CopyOnWrite()->buffer_map = isolated_buffers;
-      ffi::String symbol = core_operation + "_" + slot;
-      func = WithAttr(func, kLogicalKernelAttr,
-                      LogicalKernel("kernel." + symbol,
-                                    compute ? "compute" : "datamovement",
-                                    compute            ? "general"
-                                    : slot == "ncrisc" ? "tensor_io"
-                                                       : "pipe_source",
-                                    frontend->span));
-      functions.Set(GlobalVar(symbol), func);
-      order.push_back(symbol);
+      if (slot == "ncrisc")
+        for (const Integer &tensor : planner.UsedTensorIndices())
+          shared_tensor_indices[slot_index].insert(tensor->value);
+      ++slot_index;
     }
-    offset += planner.ResourceCount();
     accumulator_offset += planner.AccumulatorCount();
     value_offset += planner.ComputeValues().size();
-    group_offset += 2 * planner.ResourceCount();
   }
+  if (!pipeline_extent)
+    storage_groups = PlanNonPipelineStorageGroups(
+        dfbs, shared_bodies, resource_storage_keys);
   std::map<int64_t, PipeEndpoint> senders, receivers;
+  std::unordered_map<int64_t, bool> forwarding_transfers;
   std::map<std::pair<int64_t, int64_t>, int64_t> record_payloads;
   std::map<std::pair<int64_t, int64_t>, PipeDescriptor> ordered_pipes;
   for (const PipeEndpoint &endpoint : endpoints) {
@@ -2855,19 +3773,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       }
     }
   }
-  auto original_records =
-      frontend->GetAttr<ffi::Array<ffi::Array<Integer>>>("tt.topology_records");
-  if (!original_records.has_value())
-    ThrowMalformed("normalized topology original record registry is missing");
-  std::unordered_set<int64_t> active_nets;
-  for (const auto &[key, payload] : record_payloads)
-    active_nets.insert(key.first);
-  for (const auto &record : original_records.value()) {
-    if (active_nets.count(record[0]->value) &&
-        !record_payloads.count({record[0]->value, record[1]->value}))
-      ThrowMalformed("active PipeNet must retain one transaction for every "
-                     "original record");
-  }
   for (const auto &[key, pipe] : ordered_pipes)
     pipes.push_back(pipe);
   if (senders.size() != receivers.size())
@@ -2888,6 +3793,254 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
         id, r[0]->value, r[1]->value, sender.occurrence,
         CoreCoord(r[3]->value, r[4]->value), CoreCoord(sender.x, sender.y),
         sender.dfb_id, receiver->second.dfb_id, 1, sender.span));
+    forwarding_transfers.emplace(id, sender.producer_forwarding);
+  }
+  ffi::Array<CommunicationDescriptor> communications;
+  auto normalized_topology = frontend->GetAttr<
+      ffi::Array<NormalizedTopologyDescriptor>>("tt.normalized_topology");
+  if (normalized_topology.has_value()) {
+    For logical_x = Downcast<For>(frontend->body);
+    For logical_y = Downcast<For>(logical_x->body);
+    StaticIterationSubstituter bind_x(
+        logical_x->loop_var,
+        Call(logical_x->loop_var.dtype(), tenstorrent::core_x(), {}));
+    StaticIterationSubstituter bind_y(
+        logical_y->loop_var,
+        Call(logical_y->loop_var.dtype(), tenstorrent::core_y(), {}));
+    auto parameterize = [&](const PrimExpr &expr) {
+      return bind_y(bind_x(expr));
+    };
+    auto parameterize_array = [&](const ffi::Array<PrimExpr> &values) {
+      ffi::Array<PrimExpr> result;
+      for (const PrimExpr &value : values)
+        result.push_back(parameterize(value));
+      return result;
+    };
+    for (const NormalizedTopologyDescriptor &entry :
+         normalized_topology.value()) {
+      ffi::String algorithm =
+          entry->kind == "all_gather"
+              ? ffi::String("direct_all_to_all")
+          : entry->kind == "all_reduce"
+              ? ffi::String("root0_left_fold_broadcast")
+          : entry->contract == "collective" ? ffi::String("direct_broadcast")
+                                              : ffi::String("direct_p2p");
+      communications.push_back(CommunicationDescriptor(
+          entry->site_id, entry->kind, algorithm, entry->source_region,
+          entry->destination_region, parameterize_array(entry->source_coord),
+          parameterize_array(entry->group_begin),
+          parameterize_array(entry->group_end), parameterize(entry->parameter),
+          entry->contract,
+          entry->occurrence_extents, entry->source_span));
+    }
+  }
+  ffi::Array<CommunicationStepDescriptor> communication_steps;
+  std::unordered_map<int64_t, int64_t> incoming_completion;
+  auto add_step = [&](int64_t communication_id, int64_t occurrence,
+                      ffi::String kind, ffi::Optional<CoreCoord> source_core,
+                      ffi::Optional<CoreCoord> destination_core,
+                      int64_t source_dfb, int64_t destination_dfb,
+                      ffi::String owner_slot, ffi::Array<Integer> dependencies,
+                      PrimExpr parameter, Span span) {
+    int64_t id = communication_steps.size();
+    communication_steps.push_back(CommunicationStepDescriptor(
+        id, communication_id, occurrence, std::move(kind),
+        std::move(source_core), std::move(destination_core), source_dfb,
+        destination_dfb, std::move(owner_slot), std::move(dependencies),
+        std::move(parameter), std::move(span)));
+    return id;
+  };
+  for (const PipeTransferDescriptor &transfer : transfers) {
+    ffi::String source_owner =
+        forwarding_transfers.at(transfer->transfer_id) ? "ncrisc" : "brisc";
+    int64_t send = add_step(
+        transfer->pipe_net_id, transfer->occurrence, "send",
+        transfer->src_coord, transfer->dst_coord, transfer->source_dfb_id,
+        transfer->destination_dfb_id, source_owner, {},
+        Integer(transfer->transfer_id), transfer->source_span);
+    int64_t receive = add_step(
+        transfer->pipe_net_id, transfer->occurrence, "receive",
+        transfer->src_coord, transfer->dst_coord, transfer->source_dfb_id,
+        transfer->destination_dfb_id, "ncrisc", {},
+        Integer(transfer->transfer_id), transfer->source_span);
+    add_step(transfer->pipe_net_id, transfer->occurrence, "completion",
+             transfer->src_coord, transfer->dst_coord,
+             transfer->source_dfb_id, transfer->destination_dfb_id,
+             source_owner,
+             {Integer(send)}, Integer(transfer->transfer_id),
+             transfer->source_span);
+    int64_t completed = add_step(
+        transfer->pipe_net_id, transfer->occurrence, "completion",
+        transfer->src_coord, transfer->dst_coord, transfer->source_dfb_id,
+        transfer->destination_dfb_id, "ncrisc", {Integer(receive)},
+        Integer(transfer->transfer_id), transfer->source_span);
+    int64_t publish = add_step(
+        transfer->pipe_net_id, transfer->occurrence, "publish",
+        transfer->src_coord, transfer->dst_coord, transfer->source_dfb_id,
+        transfer->destination_dfb_id, "ncrisc", {Integer(completed)},
+        Integer(transfer->transfer_id), transfer->source_span);
+    incoming_completion[transfer->destination_dfb_id] = publish;
+  }
+  std::unordered_map<int64_t, int64_t> last_output_step;
+  for (const DeviceCoreBody &core_body : shared_bodies[0]) {
+    PostOrderVisit(core_body.body, [&](const ffi::ObjectRef &object) {
+      const auto *node = object.as<CallNode>();
+      if (!node)
+        return;
+      Call call = ffi::GetRef<Call>(node);
+      auto site_attr = call->annotations.Get("tt.communication_site");
+      if (!site_attr.has_value())
+        return;
+      int64_t site = Downcast<Integer>(site_attr.value())->value;
+      int64_t occurrence =
+          Downcast<Integer>(
+              call->annotations.at("tt.communication_occurrence"))
+              ->value;
+      ffi::String kind =
+          Downcast<StringImm>(
+              call->annotations.at("tt.communication_step_kind"))
+              ->value;
+      CoreCoord core(
+          Downcast<Integer>(call->annotations.at("tt.core_x"))->value,
+          Downcast<Integer>(call->annotations.at("tt.core_y"))->value);
+      int64_t source = -1, destination = -1;
+      PrimExpr parameter = Integer(0);
+      if (call->op.same_as(dfb_local_copy())) {
+        source = *as_const_int(call->args[0]);
+        destination = *as_const_int(call->args[1]);
+      } else if (call->op.same_as(dfb_gather_copy())) {
+        source = *as_const_int(call->args[0]);
+        destination = *as_const_int(call->args[1]);
+        parameter = call->args[2];
+      } else if (call->op.same_as(dfb_collective_reduce())) {
+        source = *as_const_int(call->args[1]);
+        destination = *as_const_int(call->args[2]);
+        parameter = call->args[3];
+      } else {
+        return;
+      }
+      ffi::Array<Integer> dependencies;
+      auto incoming = incoming_completion.find(source);
+      if (incoming != incoming_completion.end())
+        dependencies.push_back(Integer(incoming->second));
+      auto previous = last_output_step.find(destination);
+      if (previous != last_output_step.end())
+        dependencies.push_back(Integer(previous->second));
+      int64_t step = add_step(site, occurrence, kind, core, core, source,
+                              destination, "trisc", dependencies, parameter,
+                              call->span);
+      last_output_step[destination] = step;
+    });
+  }
+  auto step_phase = [](const CommunicationStepDescriptor &step) {
+    if (step->kind == "send" || step->kind == "receive")
+      return 0;
+    if (step->kind == "completion")
+      return 1;
+    if (step->kind == "publish")
+      return 2;
+    return 3;
+  };
+  auto step_less = [&](size_t lhs, size_t rhs) {
+    const auto &a = communication_steps[lhs];
+    const auto &b = communication_steps[rhs];
+    auto dependency_kind = [&](const CommunicationStepDescriptor &step) {
+      return step->dependencies.empty()
+                 ? ffi::String("")
+                 : communication_steps[step->dependencies[0]->value]->kind;
+    };
+    auto coordinate = [](const ffi::Optional<CoreCoord> &coord, bool x) {
+      return coord.has_value() ? (x ? coord.value()->x : coord.value()->y) : -1;
+    };
+    return std::make_tuple(
+               a->communication_id, step_phase(a), a->kind, a->owner_slot,
+               dependency_kind(a), a->dependencies.size(), a->occurrence,
+               coordinate(a->source_core, true),
+               coordinate(a->source_core, false),
+               coordinate(a->destination_core, true),
+               coordinate(a->destination_core, false), a->step_id) <
+           std::make_tuple(
+               b->communication_id, step_phase(b), b->kind, b->owner_slot,
+               dependency_kind(b), b->dependencies.size(), b->occurrence,
+               coordinate(b->source_core, true),
+               coordinate(b->source_core, false),
+               coordinate(b->destination_core, true),
+               coordinate(b->destination_core, false), b->step_id);
+  };
+  std::vector<int64_t> indegree(communication_steps.size(), 0);
+  std::vector<std::vector<size_t>> successors(communication_steps.size());
+  for (size_t step = 0; step < communication_steps.size(); ++step) {
+    for (const Integer &dependency : communication_steps[step]->dependencies) {
+      if (dependency->value < 0 ||
+          dependency->value >= static_cast<int64_t>(communication_steps.size()))
+        ThrowMalformed("communication step dependency is out of range");
+      ++indegree[step];
+      successors[dependency->value].push_back(step);
+    }
+  }
+  std::set<size_t, decltype(step_less)> ready(step_less);
+  for (size_t step = 0; step < communication_steps.size(); ++step)
+    if (!indegree[step])
+      ready.insert(step);
+  std::vector<size_t> step_order;
+  step_order.reserve(communication_steps.size());
+  while (!ready.empty()) {
+    size_t step = *ready.begin();
+    ready.erase(ready.begin());
+    step_order.push_back(step);
+    for (size_t successor : successors[step])
+      if (!--indegree[successor])
+        ready.insert(successor);
+  }
+  if (step_order.size() != communication_steps.size())
+    ThrowMalformed("communication step dependency graph contains a cycle");
+  std::vector<int64_t> remapped_steps(communication_steps.size(), -1);
+  for (size_t next = 0; next < step_order.size(); ++next)
+    remapped_steps[step_order[next]] = next;
+  ffi::Array<CommunicationStepDescriptor> ordered_steps;
+  for (size_t next = 0; next < step_order.size(); ++next) {
+    const auto &step = communication_steps[step_order[next]];
+    ffi::Array<Integer> dependencies;
+    for (const Integer &dependency : step->dependencies) {
+      int64_t remapped = remapped_steps[dependency->value];
+      if (remapped < 0 || remapped >= static_cast<int64_t>(next))
+        ThrowMalformed("communication family ordering violates dependency");
+      dependencies.push_back(Integer(remapped));
+    }
+    ordered_steps.push_back(CommunicationStepDescriptor(
+        next, step->communication_id, step->occurrence, step->kind,
+        step->source_core, step->destination_core, step->source_dfb_id,
+        step->destination_dfb_id, step->owner_slot, dependencies,
+        step->parameter, step->source_span));
+  }
+  communication_steps = std::move(ordered_steps);
+  const std::array<ffi::String, 3> slots = {"trisc", "ncrisc", "brisc"};
+  for (size_t index = 0; index < slots.size(); ++index) {
+    const ffi::String &slot = slots[index];
+    for (DeviceCoreBody &core_body : shared_bodies[index]) {
+      CommunicationStepRefAttacher attach(communication_steps, slot,
+                                           core_body.x, core_body.y);
+      core_body.body = attach(core_body.body);
+    }
+    bool compute = slot == "trisc";
+    ffi::Array<Integer> tensor_indices;
+    for (int64_t tensor : shared_tensor_indices[index])
+      tensor_indices.push_back(Integer(tensor));
+    Stmt slot_body = ParameterizeDeviceCoreStatements(
+        shared_bodies[index], gx, gy, slot, frontend->span);
+    PrimFunc func = MakeSlotFunction(
+        frontend, target, shared_domain, operation, slot,
+        compute ? "compute" : "datamovement",
+        compute ? ffi::Optional<Integer>(std::nullopt)
+                : ffi::Optional<Integer>(Integer(slot == "ncrisc" ? 0 : 1)),
+        tensor_indices, compute ? "compute" : "datamovement",
+        compute            ? "general"
+        : slot == "ncrisc" ? "tensor_io"
+                           : "transport",
+        slot_body);
+    ffi::String symbol = operation + "_" + slot;
+    functions.Set(GlobalVar(symbol), func);
+    order.push_back(symbol);
   }
   ffi::Array<ffi::String> tensor_effects;
   for (int effect : effects)
@@ -2899,28 +4052,24 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       endpoints.begin(), endpoints.end(),
       [](const PipeEndpoint &endpoint) { return endpoint.occurrence != 0; });
   ffi::Map<ffi::String, ffi::Any> attrs{
-      {kDeviceIRVersionAttr,
-       Integer(precision_regions         ? 8
-               : !compute_values.empty() ? 7
-               : !accumulators.empty() || repeated_transfers ||
-                       producer_forwarding
-                   ? 6
-                   : 4)},
+      {"tt.ir_stage", ffi::String("device")},
       {kTargetArchAttr, arch},
       {kLaunchGridAttr, CoreCoord(gx, gy)},
       {kOperationIdentityAttr, OperationIdentity(operation, frontend->span)},
       {kTensorTableAttr, tensors},
       {kDFBTableAttr, dfbs},
-      {kPipeTableAttr, pipes},
-      {kPipeTransferTableAttr, transfers},
+      {"tt.communication_table", communications},
+      {"tt.communication_step_table", communication_steps},
+      {"tt.transport_table", pipes},
       {kKernelOrderAttr, order}};
   if (!accumulators.empty())
     attrs.Set(kAccumulatorTableAttr, accumulators);
   if (!compute_values.empty())
     attrs.Set(kComputeValueTableAttr, compute_values);
+  if (!storage_groups.empty())
+    attrs.Set(kInternalDFBStorageGroupsAttr, storage_groups);
   if (pipeline_extent) {
-    attrs.Set("tt.dfb_storage_groups", storage_groups);
-    attrs.Set("tt.pipeline_relations", pipeline_relations);
+    attrs.Set(kInternalDFBTransactionRelationsAttr, pipeline_relations);
     attrs.Set("tt.pipeline_stages", Integer(pipeline_stages));
     attrs.Set("tt.pipeline_extent", Integer(pipeline_extent));
     attrs.Set("tt.pipeline_wait_policy", pipeline_wait_policy);
@@ -2928,11 +4077,19 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
   auto capacity = input->GetAttr<Integer>("tt.l1_capacity_bytes");
   if (capacity.has_value())
     attrs.Set("tt.l1_capacity_bytes", capacity.value());
-  return IRModule(functions, input->source_map, DictAttrs(attrs),
-                  input->global_infos);
+  return ParameterizeCurrentDeviceTables(DeviceMetadataInterner::Rewrite(
+      IRModule(functions, input->source_map, DictAttrs(attrs),
+               input->global_infos)));
 }
 
 IRModule FormProgram(const IRModule &input) {
+  auto stage = input->GetAttr<ffi::String>("tt.ir_stage");
+  if (stage.has_value()) {
+    if (stage.value() == "device")
+      return VerifyTenstorrentDeviceIR()(input);
+    ThrowMalformed("formation requires original/structured input, not stage '" +
+                   std::string(stage.value()) + "'");
+  }
   if (input->GetAttr<Integer>(kDeviceIRVersionAttr).has_value()) {
     return VerifyTenstorrentDeviceIR()(input);
   }
@@ -2990,10 +4147,15 @@ IRModule FormProgram(const IRModule &input) {
   }
 
   Stmt kernel_body = StripLogicalCoreLoops(frontend, launch_grid.value());
-  if (frontend->GetAttr<Integer>("tt.topology_normalized").has_value())
+  if (frontend->GetAttr<Integer>("tt.topology_normalized").has_value()) {
+    For xloop = Downcast<For>(frontend->body);
+    For yloop = Downcast<For>(xloop->body);
     return FormMulticoreProgram(
         input, frontend, target.value(), frontend_global.value()->name_hint,
-        target_arch.value(), grid_x, grid_y, kernel_body, buffer_table.value());
+        target_arch.value(), grid_x, grid_y, kernel_body, xloop->loop_var,
+        yloop->loop_var,
+        buffer_table.value());
+  }
   if (grid_x != 1 || grid_y != 1)
     ThrowMalformed("multi-Core input requires NormalizeTenstorrentTopology");
   const size_t tile_add_count = TileAddCounter::Count(kernel_body);
@@ -3030,23 +4192,20 @@ IRModule FormProgram(const IRModule &input) {
   PrimFunc trisc;
   PrimFunc ncrisc;
   PrimFunc brisc;
-  ffi::Map<ffi::String, Integer> storage_groups;
-  ffi::Map<ffi::String, ffi::Array<Integer>> pipeline_relations;
   int64_t pipeline_stages = 0, pipeline_extent = 0;
   bool precision_regions = false;
   ffi::String pipeline_wait_policy;
+  ffi::Map<ffi::String, Integer> storage_groups;
+  ffi::Map<ffi::String, ffi::Array<Integer>> pipeline_relations;
   Stmt idle = Evaluate(IntImm(DataType::Int(32), 0), frontend->span);
   if (general_compute) {
     GeneralDataflowPlanner planner(frontend, buffer_table.value());
-    ffi::Optional<For> independent_loop =
-        planner.HasComputeValues() ? ffi::Optional<For>(std::nullopt)
-                                   : FindIndependentLoop(kernel_body);
+    std::vector<For> independent_loops = FindIndependentLoops(kernel_body);
     ffi::Optional<For> pipeline_loop = FindPipelineLoop(kernel_body);
     if (pipeline_loop.has_value()) {
       planner.PlanPipeline(pipeline_loop.value());
     } else {
-      planner.Plan(independent_loop.has_value() ? independent_loop.value()->body
-                                                : kernel_body);
+      planner.Plan(IndependentLoopBody(independent_loops, kernel_body));
     }
     planner.EliminateDeadWrites();
     planner.FinalizePipeline();
@@ -3066,20 +4225,22 @@ IRModule FormProgram(const IRModule &input) {
     precision_regions = planner.HasPrecisionRegions();
     Stmt compute_body = planner.ComputeBody();
     Stmt transfer_body = planner.TransferBody();
-    if (independent_loop.has_value()) {
-      const For &loop = independent_loop.value();
+    if (!independent_loops.empty()) {
+      PrimExpr iterations = IndependentIterationCount(independent_loops);
       ffi::Array<DFBDescriptor> repeated;
       for (const DFBDescriptor &dfb : dfbs) {
         repeated.push_back(DFBDescriptor(
             dfb->dfb_id, dfb->source_buffer_identity, dfb->element_dtype,
             dfb->tile_shape, dfb->block_shape_in_tiles, dfb->block_count,
             dfb->tensor_backing, dfb->producer_slot, dfb->producer_domain,
-            dfb->consumer_slot, dfb->consumer_domain, loop->extent,
+            dfb->consumer_slot, dfb->consumer_domain, iterations,
             dfb->source_span));
       }
       dfbs = std::move(repeated);
-      compute_body = WrapIndependentLoop(std::move(compute_body), loop);
-      transfer_body = WrapIndependentLoop(std::move(transfer_body), loop);
+      compute_body =
+          WrapIndependentLoops(std::move(compute_body), independent_loops);
+      transfer_body =
+          WrapIndependentLoops(std::move(transfer_body), independent_loops);
     }
     ffi::Array<Integer> tensor_indices = planner.UsedTensorIndices();
     trisc = MakeSlotFunction(frontend, target.value(), domain, operation,
@@ -3129,12 +4290,7 @@ IRModule FormProgram(const IRModule &input) {
   functions.Set(GlobalVar(operation + "_brisc"), std::move(brisc));
 
   ffi::Map<ffi::String, ffi::Any> attrs = {
-      {kDeviceIRVersionAttr, Integer(precision_regions         ? 8
-                                     : !compute_values.empty() ? 7
-                                     : !accumulators.empty()   ? 5
-                                     : pipeline_extent         ? 3
-                                     : general_compute ? 2
-                                                       : kDeviceIRVersion)},
+      {"tt.ir_stage", ffi::String("device")},
       {kTargetArchAttr, target_arch.value()},
       {kLaunchGridAttr, launch},
       {kOperationIdentityAttr,
@@ -3142,15 +4298,17 @@ IRModule FormProgram(const IRModule &input) {
       {kTensorTableAttr, tensors},
       {kDFBTableAttr, dfbs},
       {kPipeTableAttr, ffi::Array<PipeDescriptor>()},
-      {kKernelOrderAttr, ffi::Array<ffi::String>({"trisc", "ncrisc", "brisc"})},
+      {kKernelOrderAttr,
+       ffi::Array<ffi::String>({operation + "_trisc", operation + "_ncrisc",
+                                operation + "_brisc"})},
   };
   if (!accumulators.empty())
     attrs.Set(kAccumulatorTableAttr, accumulators);
   if (!compute_values.empty())
     attrs.Set(kComputeValueTableAttr, compute_values);
   if (pipeline_extent) {
-    attrs.Set("tt.dfb_storage_groups", storage_groups);
-    attrs.Set("tt.pipeline_relations", pipeline_relations);
+    attrs.Set(kInternalDFBStorageGroupsAttr, storage_groups);
+    attrs.Set(kInternalDFBTransactionRelationsAttr, pipeline_relations);
     attrs.Set("tt.pipeline_stages", Integer(pipeline_stages));
     attrs.Set("tt.pipeline_extent", Integer(pipeline_extent));
     attrs.Set("tt.pipeline_wait_policy", pipeline_wait_policy);

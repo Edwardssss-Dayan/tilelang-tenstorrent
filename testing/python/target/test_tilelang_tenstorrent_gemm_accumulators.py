@@ -3,9 +3,11 @@
 import pytest
 
 from tilelang import tvm
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import transform
 from tvm import ir, tirx
+from testing.python.target.test_tilelang_tenstorrent_compute_values import _calls
 
 TARGET = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
 
@@ -187,8 +189,13 @@ def test_ordinary_fp32_fragment_does_not_imply_gemm_precision():
 def test_full_pipeline_preserves_complete_accumulator_lifetime(dtypes, mode, updates):
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
-    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": program(*dtypes, mode=mode)}), TARGET)
-    assert int(mod.attrs["tt.device_ir_version"]) == 5
+    mod = D.expand_current_device_tables(
+        TenstorrentPassPipelineBody(
+            tvm.IRModule({"main": program(*dtypes, mode=mode)}), TARGET
+        )
+    )
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     (accumulator,) = mod.attrs["tt.accumulator_table"]
     assert str(accumulator.input_dtype) == dtypes[0]
     assert str(accumulator.accumulation_dtype) == dtypes[1]
@@ -217,7 +224,7 @@ def device_calls(mod, slot):
     calls = []
     for func in mod.functions.values():
         if func.attrs["tt.kernel_slot"] == slot:
-            tirx.stmt_functor.post_order_visit(func.body, lambda node: calls.append(node) if isinstance(node, tirx.Call) else None)
+            calls.extend(_calls(func.body))
     return calls
 
 
@@ -237,7 +244,9 @@ def test_serial_k_slices_keep_all_input_generations_live():
                 T.gemm(a, b, c)
             T.copy(c, C)
 
-    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": sliced}), TARGET)
+    mod = D.expand_current_device_tables(
+        TenstorrentPassPipelineBody(tvm.IRModule({"main": sliced}), TARGET)
+    )
     (accumulator,) = mod.attrs["tt.accumulator_table"]
     assert accumulator.full_k_tiles == 3
     updates = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.gemm_update"]
@@ -303,7 +312,11 @@ def test_device_ir_rechecks_bfloat16_precision_contract(key, value, message):
 
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
-    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": gemm_program(output_dtype="bfloat16")}), TARGET)
+    mod = D.expand_current_device_tables(
+        TenstorrentPassPipelineBody(
+            tvm.IRModule({"main": gemm_program(output_dtype="bfloat16")}), TARGET
+        )
+    )
 
     def corrupt_requirement(node):
         if isinstance(node, tirx.Call) and node.op.name == "tl.tt.dfb_compute" and node.annotations["tt.compute_kind"].value == "gemm":
@@ -348,13 +361,8 @@ def test_compute_kernel_scopes_accumulator_precision_to_live_values(keep_fp32_li
 
     # Frontend proves individual lifetimes; the actual formed kernel owns the merge.
     assert len(verify(mixed)["main"].attrs["tt.gemm_accumulator_requirements"]) == 2
-    if keep_fp32_live:
-        with pytest.raises((ValueError, NotImplementedError, tvm.error.TVMError), match="precision.*conflicts|conflicting.*destination"):
-            TenstorrentPassPipelineBody(tvm.IRModule({"main": mixed}), TARGET)
-    else:
-        mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": mixed}), TARGET)
-        assert int(mod.attrs["tt.device_ir_version"]) == 8
-        transform.VerifyTenstorrentDeviceIR()(mod)
+    with pytest.raises((ValueError, NotImplementedError, tvm.error.TVMError), match="precision.*conflicts|conflicting.*destination"):
+        TenstorrentPassPipelineBody(tvm.IRModule({"main": mixed}), TARGET)
 
 
 @pytest.mark.parametrize("transpose_a,transpose_b", [(False, False), (True, False), (False, True), (True, True)])
@@ -375,7 +383,9 @@ def test_accumulator_update_preserves_transpose_and_logical_k(transpose_a, trans
             T.gemm(a, b, c, transpose_A=transpose_a, transpose_B=transpose_b, clear_accum=True)
             T.copy(c, C)
 
-    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": transposed}), TARGET)
+    mod = D.expand_current_device_tables(
+        TenstorrentPassPipelineBody(tvm.IRModule({"main": transposed}), TARGET)
+    )
     (accumulator,) = mod.attrs["tt.accumulator_table"]
     assert accumulator.full_k_tiles == 2
     (update,) = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.gemm_update"]
@@ -400,7 +410,9 @@ def test_accumulator_materializes_to_shared_output_with_storage_dtype():
             T.copy(c, output)
             T.copy(output, C)
 
-    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": shared_output}), TARGET)
+    mod = D.expand_current_device_tables(
+        TenstorrentPassPipelineBody(tvm.IRModule({"main": shared_output}), TARGET)
+    )
     (materialize,) = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.accumulator_materialize"]
     descriptor = next(dfb for dfb in mod.attrs["tt.dfb_table"] if dfb.dfb_id == int(materialize.args[1]))
     assert str(descriptor.element_dtype) == "bfloat16"

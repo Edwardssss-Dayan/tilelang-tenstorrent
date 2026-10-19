@@ -235,13 +235,13 @@ def test_structured_compute_precedes_device_lowering_in_pass_order():
     assert TENSTORRENT_LOWER_PASS_ORDER == (
         "BindTarget",
         "CanonicalizeTTElementwise",
-        "VerifyTTComputeBlocks",
         "ValidateTenstorrentFrontendIR",
         "NormalizeTenstorrentLaunch",
         "NormalizeTenstorrentBufferMetadata",
         "VerifyTTGemmAccumulators",
         "NormalizeTenstorrentTopology",
         "NormalizeTenstorrentRegions",
+        "VerifyTTStructuredDataflow",
         "LegalizeTenstorrentTileOps",
         "InferTenstorrentTensorLayout",
         "FormTenstorrentDeviceProgram",
@@ -251,7 +251,7 @@ def test_structured_compute_precedes_device_lowering_in_pass_order():
 
 
 def test_frozen_ttl_reference_and_initial_module_contract():
-    assert contracts.TTLANG_REFERENCE_COMMIT == "6e3051bb9b2f7bfbd5fd045aa38deb68b7a6e6bd"
+    assert contracts.TTLANG_REFERENCE_COMMIT == "e49ce12c2bcd2350565632d9b51239e9eafb2546"
     assert contracts.TTLANG_REFERENCE_VERSION == "1.1.9.dev51"
     assert contracts.TTLANG_PUBLIC_BINDING_MODULES == (
         "ttl.ir",

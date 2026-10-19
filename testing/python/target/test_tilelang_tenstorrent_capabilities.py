@@ -143,18 +143,13 @@ def multicore_shared_pipeline():
         ("reduce", reduction_fragment_output, {"rank": 3, "output_value_kind": "fragment"}),
         ("transpose", transpose_fragment, {"output_value_kind": "fragment"}),
         ("transpose", lambda: transpose_fragment(source_fragment=True), {"input_value_kind": "fragment", "output_value_kind": "fragment"}),
-        ("pipe", make_point_to_point, {"multicore": True}),
         ("elementwise", make_pipeline, {"pipelined": True}),
-        ("elementwise", lambda: index_condition, {"control_flow": "static_branch"}),
         ("elementwise", value_chain, {"input_value_kind": "mixed", "output_value_kind": "fragment", "control_flow": "static_loop"}),
         ("elementwise", branch_program, {"output_value_kind": "fragment", "control_flow": "pure_value_branch"}),
         ("elementwise", lambda: branch_program(fragment=False), {"control_flow": "pure_value_branch"}),
         ("elementwise", multicore_values, {"multicore": True, "output_value_kind": "fragment"}),
-        ("elementwise", pipe_values, {"multicore": True, "output_value_kind": "fragment"}),
         ("elementwise", pipeline_values, {"pipelined": True, "output_value_kind": "fragment"}),
-        ("pipe", shared_pipe_pipeline, {"pipelined": True, "multicore": True}),
         ("elementwise", multicore_shared_pipeline, {"pipelined": True, "multicore": True}),
-        ("elementwise", pipeline_pipe_values, {"pipelined": True, "multicore": True, "output_value_kind": "fragment"}),
         (
             "gemm",
             multicore_gemm_epilogue,
@@ -182,20 +177,6 @@ def multicore_shared_pipeline():
         ),
         (
             "gemm",
-            pipeline_summa,
-            {
-                "pipelined": True,
-                "multicore": True,
-                "loop_carried": True,
-                "output_value_kind": "accumulator",
-                "input_dtype": "bfloat16",
-                "output_dtype": "bfloat16",
-                "accumulation_dtype": "float32",
-                "update_count": 5,
-            },
-        ),
-        (
-            "gemm",
             gemm_fragment_operand,
             {
                 "input_value_kind": "mixed",
@@ -212,24 +193,23 @@ def test_supported_queries_match_real_lower(operation, factory, query, arch):
     assert capability.device_lower, capability.reason
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
     mod = lower_tenstorrent_ir(tvm.IRModule({"main": factory()}), target)
-    assert "tt.ir_stage" not in mod.attrs
-    assert int(mod.attrs["tt.device_ir_version"]) == capability.device_ir_version
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     expected = CapabilityStatus.LEGALIZABLE if query.get("control_flow") else CapabilityStatus.SUPPORTED
     assert capability.status == expected
 
 
 @pytest.mark.parametrize("arch", ["wormhole_b0", "blackhole"])
 @pytest.mark.parametrize("accumulation_dtype", ["bfloat16", "float32"])
-def test_multicore_accumulator_is_lower_supported_without_claiming_codegen(arch, accumulation_dtype):
+def test_legacy_pipenet_summa_is_not_an_active_lower_input(arch, accumulation_dtype):
     capability = gemm_capability("bfloat16", accumulation_dtype, "bfloat16", arch=arch, ir_version=6, multicore=True, update_count=2)
     assert capability.device_lower
     assert not capability.ttl_mapping
     assert not capability.compile_only_validated
     assert not capability.hardware_validated
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": make_summa(accum_dtype=accumulation_dtype)}), target)
-    assert int(mod.attrs["tt.device_ir_version"]) == 6
-    assert len(mod.attrs["tt.accumulator_table"]) == 4
+    with pytest.raises(NotImplementedError, match="legacy Pipe"):
+        lower_tenstorrent_ir(tvm.IRModule({"main": make_summa(accum_dtype=accumulation_dtype)}), target)
 
 
 @pytest.mark.parametrize(
@@ -238,7 +218,7 @@ def test_multicore_accumulator_is_lower_supported_without_claiming_codegen(arch,
         ("elementwise", {"control_flow": "dynamic_branch"}, "Dynamic control flow"),
         ("elementwise", {"control_flow": "dynamic_loop"}, "Dynamic control flow"),
         ("elementwise", {"pipelined": True, "input_value_kind": "fragment", "loop_carried": True}, "loop-carried"),
-        ("elementwise", {"pipelined": True, "control_flow": "static_branch"}, "independent iterations"),
+        ("elementwise", {"pipelined": True, "control_flow": "static_branch"}, "balanced Device transactions"),
         ("gemm", {"pipelined": True, "output_value_kind": "accumulator", "ir_version": 7}, "v5/v6 route"),
         ("gemm", {"pipelined": True, "output_value_kind": "accumulator", "input_value_kind": "mixed"}, "v5/v6 route"),
         ("gemm", {"control_flow": "pure_value_branch"}, "elementwise assignments"),
@@ -278,8 +258,8 @@ def test_deferred_combinations_are_not_reported_as_device_lower(operation, query
         ("reduce", {"keepdims": True, "rank": 3}, "rank-2 input"),
         ("reduce", {"reduction_kind": "prod"}, "sum/max/min"),
         ("reduce", {"accumulation_dtype": "bfloat16"}, "float32 accumulation"),
-        ("pipe", {"input_value_kind": "fragment", "multicore": True}, "shared DFBs"),
-        ("pipe", {"input_dtype": "bfloat16", "output_dtype": "float32", "multicore": True}, "preserves"),
+        ("pipe", {"input_value_kind": "fragment", "multicore": True}, "legacy compatibility"),
+        ("pipe", {"input_dtype": "bfloat16", "output_dtype": "float32", "multicore": True}, "legacy compatibility"),
         ("gemm", {"output_value_kind": "accumulator", "ir_version": 4}, "requires Device IR v5"),
     ],
 )
@@ -328,4 +308,5 @@ def test_keepdims_capability_matches_fragment_reduction_lower(arch, dtype, reduc
     assert capability.status == CapabilityStatus.SUPPORTED
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
     mod = lower_tenstorrent_ir(tvm.IRModule({"main": keepdims_reduction(dtype, reduction_kind)}), target)
-    assert int(mod.attrs["tt.device_ir_version"]) == capability.device_ir_version == 7
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs

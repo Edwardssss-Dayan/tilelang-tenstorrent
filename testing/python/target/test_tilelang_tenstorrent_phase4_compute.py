@@ -149,7 +149,11 @@ def test_tiles_parallel_same_consumed_expression_and_maps():
     outputs = [legalize(elementwise_program(tiles=tiles, broadcast=True)) for tiles in (False, True)]
     left, right = (calls(mod)[0] for mod in outputs)
     assert str(left.annotations["tt.compute_kind"].value) == "elementwise"
-    assert [[int(axis) for axis in axes] for axes in left.annotations["tt.access_maps"]] == [[0, 1], [-1, 1]]
+    assert [[int(axis) for axis in axes] for axes in left.annotations["tt.access_maps"]] == [
+        [0, 1],
+        [0, 1],
+        [-1, 1],
+    ]
     # Structural comparison uses free-var mapping because separately parsed
     # programs own distinct Buffer/data identities.
     assert ir.structural_equal(left, right, map_free_vars=True)
@@ -239,7 +243,10 @@ def batch_nested_parallel(A: T.Tensor((2, 64, 64), "float32"), B: T.Tensor((1, 3
 def test_batch_flat_and_nested_parallel_same_device_selection():
     left, right = (calls(legalize(func))[0] for func in (batch_elementwise, batch_nested_parallel))
     assert ir.structural_equal(left, right, map_free_vars=True)
-    assert [[int(axis) for axis in axes] for axes in left.annotations["tt.access_maps"]] == [[0, 1, 2], [-1, -1, 2]]
+    assert [[int(axis) for axis in axes] for axes in left.annotations["tt.access_maps"]] == [
+        [0, 1, 2],
+        [-1, -1, 2],
+    ]
 
 
 @pytest.mark.parametrize("kind,accum_dtype", [("sum", "float32"), ("min", "bfloat16"), ("max", "bfloat16")])
@@ -248,7 +255,8 @@ def test_bfloat16_reduction_has_validated_device_accumulation(kind, accum_dtype)
 
     func = reduction_program(kind=kind, dtype="bfloat16", output_dtype="bfloat16")
     mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), TARGET)
-    assert int(mod.attrs["tt.device_ir_version"]) == 2
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     selected = [call for call in calls(mod, "tl.tt.dfb_compute") if call.annotations["tt.compute_kind"].value == "reduce"][0]
     assert selected.annotations["tt.accum_dtype"].value == accum_dtype
     transform.VerifyTenstorrentDeviceIR()(mod)
@@ -280,6 +288,6 @@ def test_alternative_frontend_compute_consumes_to_verified_device_ir(func, kind)
     mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), TARGET)
     selected = [call for call in calls(mod, "tl.tt.dfb_compute") if call.annotations["tt.compute_kind"].value == kind]
     assert len(selected) == 1
-    assert int(mod.attrs["tt.device_ir_version"]) == 2
-    assert "tt.ir_stage" not in mod.attrs
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     transform.VerifyTenstorrentDeviceIR()(mod)

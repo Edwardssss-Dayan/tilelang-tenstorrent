@@ -5,6 +5,7 @@ import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from tvm import ir, tirx
 
@@ -62,8 +63,9 @@ def blocks(mod):
 def test_fragment_lifetime_lowers_to_immutable_device_values(mode):
     frontend = tvm.IRModule({"main": fragment_program(mode)})
     before = ir.save_json(frontend)
-    result = lower_tenstorrent_ir(frontend, TARGET)
-    assert int(result.attrs["tt.device_ir_version"]) == 7
+    result = D.expand_current_device_tables(lower_tenstorrent_ir(frontend, TARGET))
+    assert str(result.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in result.attrs
     assert len(result.attrs["tt.compute_value_table"]) >= 4
     calls = []
     for func in result.functions.values():
@@ -165,8 +167,11 @@ def test_gemm_tiles_epilogue_preserves_precision_and_update_relation(mode):
     if mode == "store":
         assert isinstance(blocks(result)[-1].body.value, tirx.Cast)
         assert str(blocks(result)[-1].body.value.dtype) == "bfloat16"
-    device = lower_tenstorrent_ir(tvm.IRModule({"main": gemm_epilogue(mode)}), TARGET)
-    assert int(device.attrs["tt.device_ir_version"]) == 7
+    device = D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": gemm_epilogue(mode)}), TARGET)
+    )
+    assert str(device.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in device.attrs
     assert any(int(value.accumulator_id) >= 0 for value in device.attrs["tt.compute_value_table"])
 
 
@@ -185,7 +190,7 @@ def test_fragment_program_still_validates_shared_tileops():
             T.transpose(a, b)
 
     mod = tvm.IRModule({"fragment": fragment_program(), "invalid": malformed_transpose})
-    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="Transpose output shape"):
+    with pytest.raises((NotImplementedError, tvm.error.TVMError), match="exactly one frontend PrimFunc"):
         lower_tenstorrent_ir(mod, TARGET)
 
 
@@ -194,5 +199,8 @@ def test_fragment_program_rejects_non_primfunc_sibling():
 
     tensor = relax.Var("tensor", relax.TensorStructInfo((32, 32), "float32"))
     mod = tvm.IRModule({"fragment": fragment_program(), "relax": relax.Function([tensor], tensor)})
-    with pytest.raises(ValueError, match="only PrimFunc globals"):
+    with pytest.raises(
+        (NotImplementedError, tvm.error.TVMError),
+        match="exactly one frontend PrimFunc",
+    ):
         lower_tenstorrent_ir(mod, TARGET)

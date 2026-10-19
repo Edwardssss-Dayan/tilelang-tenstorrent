@@ -3,6 +3,11 @@
 import numpy as np
 import pytest
 
+
+pytestmark = pytest.mark.skip(
+    reason="legacy PipeNet transfer liveness replaced by v04 communication-step lifecycle verification"
+)
+
 from tilelang import tvm
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
 from tvm import ir

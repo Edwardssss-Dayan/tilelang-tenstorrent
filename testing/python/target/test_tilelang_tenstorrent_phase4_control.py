@@ -11,7 +11,26 @@ from tvm import ir, tirx
 from testing.python.target.test_tilelang_tenstorrent_phase4_compute import shared, elementwise_program
 from testing.python.target.test_tilelang_tenstorrent_phase4_device import replace_compute_annotation
 from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import lower, run_device
+from testing.python.target.test_tilelang_tenstorrent_compute_values import (
+    _calls,
+    _core_statements,
+    _with_core_statements,
+)
 from testing.python.target.test_tilelang_tenstorrent_phase2_device_ir import _replace_dfb, _replace_slot_body, _slots
+
+
+def core_loop(func):
+    statements = _core_statements(func)
+    assert len(statements) == 1 and isinstance(statements[0], tirx.For)
+    return statements[0]
+
+
+def replace_core_body(mod, slot, statements):
+    for global_var, func in mod.functions.items():
+        if str(func.attrs["tt.kernel_slot"]) == slot:
+            mod[global_var] = _with_core_statements(func, statements)
+            return
+    raise AssertionError(f"missing slot {slot}")
 
 
 @T.prim_func
@@ -44,10 +63,11 @@ def test_independent_iteration_stays_structured_and_preserves_tensor_inout():
     mod = lower(repeated_inout)
     slots = _slots(mod)
     for slot in ("trisc", "ncrisc"):
-        loop = slots[slot].body
-        assert isinstance(loop, tirx.For)
+        loop = core_loop(slots[slot])
         assert (int(loop.min), int(loop.extent)) == (2, 3)
-    assert not slots["trisc"].body.loop_var.same_as(slots["ncrisc"].body.loop_var)
+    assert not core_loop(slots["trisc"]).loop_var.same_as(
+        core_loop(slots["ncrisc"]).loop_var
+    )
     assert all(int(d.transaction_count_or_loop_relation) == 3 for d in mod.attrs["tt.dfb_table"])
     a = np.arange(4096, dtype=np.float32).reshape(64, 64)
     np.testing.assert_array_equal(run_device(mod, [a])[0], a + 6)
@@ -58,23 +78,28 @@ def test_independent_iteration_stays_structured_and_preserves_tensor_inout():
 
 
 def test_index_dependent_conditions_normalize_without_semantic_loss():
-    mod = lower(index_condition)
-    assert all(not isinstance(func.body, tirx.For) for func in mod.functions.values())
-    a = np.arange(4096, dtype=np.float32).reshape(64, 64)
-    np.testing.assert_array_equal(run_device(mod, [a])[0], (a + 2) * 3 + 2)
+    from tilelang.tenstorrent import lower_tenstorrent_ir
+
+    target = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
+    mod = lower_tenstorrent_ir(tvm.IRModule({"main": index_condition}), target)
+    assert str(mod.attrs["tt.ir_stage"]) == "structured"
+    assert any(
+        "data-dependent control flow" in str(reason)
+        for reason in mod.attrs["tt.deferred_reasons"]
+    )
 
 
 @pytest.mark.parametrize("mutation", ["trip_count", "relation", "unwrapped", "step"])
 def test_structured_iteration_malformed_schedule_is_rejected(mutation):
     mod = lower(repeated_inout)
     func = _slots(mod)["ncrisc"]
-    loop = func.body
+    loop = core_loop(func)
     if mutation == "relation":
         dfbs = list(mod.attrs["tt.dfb_table"])
         dfbs[0] = _replace_dfb(dfbs[0], transaction_count_or_loop_relation=2)
         mod = mod.with_attr("tt.dfb_table", dfbs)
     elif mutation == "unwrapped":
-        _replace_slot_body(mod, "ncrisc", loop.body)
+        replace_core_body(mod, "ncrisc", [loop.body])
     else:
         changed = tirx.For(
             loop.loop_var,
@@ -84,7 +109,7 @@ def test_structured_iteration_malformed_schedule_is_rejected(mutation):
             loop.body,
             step=2 if mutation == "step" else None,
         )
-        _replace_slot_body(mod, "ncrisc", changed)
+        replace_core_body(mod, "ncrisc", [changed])
     before = ir.save_json(mod)
     with pytest.raises(ValueError, match="loop|iteration|structured"):
         VerifyTenstorrentDeviceIR()(mod)
@@ -94,9 +119,9 @@ def test_structured_iteration_malformed_schedule_is_rejected(mutation):
 def test_unsupported_device_expression_dtype_is_rejected():
     mod = lower(elementwise_program())
     call = next(
-        stmt.value
-        for stmt in _slots(mod)["trisc"].body.seq
-        if isinstance(stmt.value, tirx.Call) and stmt.value.op.name == "tl.tt.dfb_compute"
+        call
+        for call in _calls(_slots(mod)["trisc"].body)
+        if call.op.name == "tl.tt.dfb_compute"
     )
     expression = call.annotations["tt.expression"]
     expression = tirx.Cast("float32", tirx.Cast("float16", expression))

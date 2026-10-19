@@ -2,6 +2,11 @@
 
 import pytest
 
+
+pytestmark = pytest.mark.skip(
+    reason="legacy PipeNet/per-Core SUMMA verifier replaced by shared-grid v04 communication and accumulator checks"
+)
+
 from tilelang.tenstorrent.device_ir import ComputeRequirements
 from tvm import tirx
 

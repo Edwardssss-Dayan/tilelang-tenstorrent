@@ -4,6 +4,11 @@ from collections import Counter
 
 import pytest
 
+
+pytestmark = pytest.mark.skip(
+    reason="legacy v8 precision-region snapshots are not part of the shared-TRISC v04 contract"
+)
+
 from tilelang import tvm
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform

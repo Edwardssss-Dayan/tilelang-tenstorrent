@@ -3,6 +3,7 @@
 import pytest
 
 from tilelang import tvm
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform
 from tilelang.tenstorrent.device_ir import AccumulatorDescriptor, ComputeValueDescriptor
@@ -35,7 +36,9 @@ def test_bf16_value_with_fp32_intermediate_requires_fp32_destination():
                 result[i, j] = T.cast(T.cast(value[i, j], "float32") * T.float32(0.5), "bfloat16")
             T.copy(result, C)
 
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
+    mod = D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
+    )
     assert all(str(entry.buffer.dtype) == "bfloat16" for entry in mod.attrs["tt.compute_value_table"])
     requirement = slot_function(mod, "trisc")[1].attrs["tt.compute_requirements"]
     assert requirement.destination_width == "bits32_required"
@@ -113,7 +116,11 @@ def forge_fp32_output(mod):
 def test_raw_final_tensor_dtype_cannot_bypass_accumulator_capability():
     from testing.python.target.test_tilelang_tenstorrent_frontend02 import gemm_epilogue
 
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": gemm_epilogue("inplace")}), TARGET)
+    mod = D.expand_current_device_tables(
+        lower_tenstorrent_ir(
+            tvm.IRModule({"main": gemm_epilogue("inplace")}), TARGET
+        )
+    )
     corrupt = forge_fp32_output(mod)
     with pytest.raises(ValueError, match="GEMM final output dtype"):
         corrupt = transform.InferTenstorrentComputeRequirements()(clear_requirements(corrupt))
@@ -159,7 +166,9 @@ def test_raw_dfb_to_fragment_reentry_retains_accumulator_output_contract(explici
             T.copy(storage, reloaded)
             T.copy(reloaded, C)
 
-    mod = lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
+    mod = D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
+    )
     values = list(mod.attrs["tt.compute_value_table"])
     (accumulator,) = mod.attrs["tt.accumulator_table"]
     reloaded = [value for value in values if str(value.buffer.name) == "reloaded"]

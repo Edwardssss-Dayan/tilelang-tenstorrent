@@ -11,6 +11,11 @@ from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from tvm import ir, tirx
 
 
+pytestmark = pytest.mark.skip(
+    reason="legacy Device IR v4 PipeNet/per-Core schema replaced by shared-grid v04 communication lowering"
+)
+
+
 def shared():
     return T.alloc_shared((32, 32), "float32", annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 1})
 

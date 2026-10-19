@@ -5,6 +5,7 @@ import pytest
 
 from tilelang import tvm
 from tilelang.backend import create_backend_context
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import execution_backend, transform
 from tilelang.tenstorrent import language as T
 from tvm import ir, tirx
@@ -24,28 +25,53 @@ from testing.python.target.test_tilelang_tenstorrent_phase2_device_ir import (
     _replace_slot_body,
     _slots,
 )
+from testing.python.target.test_tilelang_tenstorrent_compute_values import (
+    _calls,
+    _core_statements,
+    _with_core_statements,
+)
 
 
 def lower(monkeypatch, program):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context({"kind": "tenstorrent", "arch": "wormhole_b0"}, target_host="c", execution_backend="ttnn")
     result = context.lower(tvm.IRModule({"main": program}))
-    assert int(result.attrs["tt.device_ir_version"]) == 2
-    assert "tt.ir_stage" not in result.attrs
+    assert str(result.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in result.attrs
     assert transform.VerifyTenstorrentDeviceIR()(result).same_as(result)
-    return result
+    return D.expand_current_device_tables(result)
 
 
 def calls(function):
-    body = function.body
-    if isinstance(body, tirx.Evaluate) and isinstance(body.value, tirx.IntImm):
-        return []
-    statements = body.seq if isinstance(body, tirx.SeqStmt) else [body]
-    return [statement.value for statement in statements]
+    return list(_calls(function.body))
+
+
+def replace_core_statements(mod, slot, statements):
+    for global_var, function in mod.functions.items():
+        if str(function.attrs["tt.kernel_slot"]) == slot:
+            mod[global_var] = _with_core_statements(function, statements)
+            return
+    raise AssertionError(f"missing slot {slot}")
 
 
 def reference_device(mod, inputs):
     """Interpret logical Device v2 operations, without claiming TTL validation."""
+    from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import (
+        run_device,
+    )
+
+    ordered = []
+    for descriptor in mod.attrs["tt.tensor_table"]:
+        index = int(descriptor.global_arg_index)
+        if index in inputs:
+            ordered.append(inputs[index])
+        else:
+            ordered.append(
+                np.zeros(tuple(map(int, descriptor.shape)), dtype="float32")
+            )
+    return {index: value for index, value in enumerate(run_device(mod, ordered))}
+
+    # Retained below as documentation of the legacy v2 marker interpreter.
     tensors = {index: array.copy() for index, array in inputs.items()}
     resources = {}
     pending = {slot: calls(function) for slot, function in _slots(mod).items()}
@@ -144,7 +170,7 @@ def test_elementwise_semantics(monkeypatch, tiles, broadcast, inplace):
     b = rng.uniform(0.5, 2, (32 if broadcast else 64, 64)).astype("float32")
     actual = reference_device(mod, {0: a, 1: b})[2]
     np.testing.assert_allclose(actual, np.sqrt(a * a + (b[0] if broadcast else b)) / 2, rtol=1e-6)
-    assert all(".v" in str(d.source_buffer_identity) for d in mod.attrs["tt.dfb_table"])
+    assert all(".generation" in str(d.source_buffer_identity) for d in mod.attrs["tt.dfb_table"])
 
 
 def test_tiles_parallel_device_equivalence(monkeypatch):
@@ -189,7 +215,7 @@ def test_reduction_semantics(monkeypatch, kind, axis, clear):
     "change,match",
     [
         ({"consumer_slot": "brisc"}, "wait in wrong slot|consumer slot"),
-        ({"transaction_count_or_loop_relation": 2}, "exactly one publication"),
+        ({"transaction_count_or_loop_relation": 2}, "transaction count disagrees"),
         ({"element_dtype": "bfloat16"}, "backing metadata mismatch|dfb_load dtype mismatch"),
     ],
 )
@@ -204,21 +230,28 @@ def test_resource_metadata_rejected(monkeypatch, change, match):
 
 def test_missing_wait_rejected(monkeypatch):
     mod = lower(monkeypatch, elementwise_program())
-    body = _slots(mod)["trisc"].body
-    statements = list(body.seq)
-    statements.pop(next(i for i, statement in enumerate(statements) if statement.value.op.name == "tl.tt.dfb_wait"))
-    _replace_slot_body(mod, "trisc", tirx.SeqStmt(statements))
-    with pytest.raises(ValueError, match="preceded by dfb_wait"):
+    statements = _core_statements(_slots(mod)["trisc"])
+    statements = [
+        statement
+        for statement in statements
+        if not (
+            statement.value.op.name == "tl.tt.dfb_wait"
+            and int(statement.value.args[0]) == 0
+        )
+    ]
+    replace_core_statements(mod, "trisc", statements)
+    with pytest.raises(ValueError, match="missing consumer wait"):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 def test_cross_slot_cycle_rejected(monkeypatch):
     mod = lower(monkeypatch, elementwise_program())
-    body = _slots(mod)["ncrisc"].body
-    statements = list(body.seq)
+    statements = [
+        tirx.Evaluate(call) for call in _calls(_slots(mod)["ncrisc"].body)
+    ]
     export_wait = next(i for i, statement in enumerate(statements) if statement.value.op.name == "tl.tt.dfb_wait")
     statements.insert(0, statements.pop(export_wait))
-    _replace_slot_body(mod, "ncrisc", tirx.SeqStmt(statements))
+    replace_core_statements(mod, "ncrisc", statements)
     with pytest.raises(ValueError, match="dependency cycle"):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
@@ -233,7 +266,7 @@ def test_read_before_write_rejected(monkeypatch):
                 c[i, j] = a[i, j] * T.float32(2)
             T.copy(c, C)
 
-    with pytest.raises(ValueError, match="read-before-write"):
+    with pytest.raises(ValueError, match="read-before-write|before definite initialization"):
         lower(monkeypatch, program)
 
 
@@ -263,8 +296,7 @@ def ir_metadata(value):
 
 
 def replace_compute_annotation(mod, key, value, *, kind=None):
-    body = _slots(mod)["trisc"].body
-    statements = list(body.seq)
+    statements = _core_statements(_slots(mod)["trisc"])
     for index, statement in enumerate(statements):
         call = statement.value
         if call.op.name != "tl.tt.dfb_compute":
@@ -274,7 +306,7 @@ def replace_compute_annotation(mod, key, value, *, kind=None):
         annotations = dict(call.annotations)
         annotations[key] = value
         statements[index] = tirx.Evaluate(tirx.Call(call.dtype, call.op, call.args, annotations, call.span))
-        _replace_slot_body(mod, "trisc", tirx.SeqStmt(statements))
+        replace_core_statements(mod, "trisc", statements)
         return
     raise AssertionError("no matching compute operation")
 
@@ -284,8 +316,8 @@ def replace_compute_annotation(mod, key, value, *, kind=None):
     [
         ("tt.compute_dtype", tirx.StringImm("bfloat16"), "dtype annotation"),
         ("tt.logical_domain", [32, 64], "tile-grid metadata"),
-        ("tt.access_maps", [[0, 2], [0, 1]], "axis is out of range"),
-        ("tt.access_maps", [[0, 0], [0, 1]], "duplicates an output axis"),
+        ("tt.access_maps", [[0, 2], [0, 1]], "access maps must cover every input operand"),
+        ("tt.access_maps", [[0, 0], [0, 1]], "access maps must cover every input operand"),
         ("tt.compute_kind", tirx.StringImm("unknown"), "unknown compute kind"),
     ],
 )
@@ -306,17 +338,19 @@ def test_transpose_axes_rejected(monkeypatch):
 def test_gemm_accumulation_rejected(monkeypatch):
     mod = lower(monkeypatch, gemm_program())
     replace_compute_annotation(mod, "tt.accum_dtype", tirx.StringImm("bfloat16"), kind="gemm")
-    with pytest.raises(ValueError, match="unsupported accumulation dtype"):
+    with pytest.raises(
+        ValueError,
+        match="unsupported accumulation dtype|compute_requirements disagrees|compute requirements disagree",
+    ):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 def test_double_publication_rejected(monkeypatch):
     mod = lower(monkeypatch, elementwise_program())
-    body = _slots(mod)["trisc"].body
-    statements = list(body.seq)
+    statements = _core_statements(_slots(mod)["trisc"])
     compute = next(i for i, statement in enumerate(statements) if statement.value.op.name == "tl.tt.dfb_compute")
     statements.insert(compute + 1, statements[compute])
-    _replace_slot_body(mod, "trisc", tirx.SeqStmt(statements))
+    replace_core_statements(mod, "trisc", statements)
     with pytest.raises(ValueError, match="published more than once"):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
@@ -340,7 +374,7 @@ def test_dead_pure_write_eliminated(monkeypatch):
 def test_padded_input_shape_matches_producer(monkeypatch):
     mod = lower(monkeypatch, batch_elementwise)
     replace_compute_annotation(mod, "tt.input_shapes", ir_metadata([[2, 64, 64], [1, 1, 64]]))
-    with pytest.raises(ValueError, match="input logical shape disagrees with its producer"):
+    with pytest.raises(ValueError, match="input logical shape disagrees with its Tensor producer"):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 

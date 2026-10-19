@@ -5,6 +5,8 @@ from collections import defaultdict
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.skip(reason="legacy v8/v9 per-Core export sizing was replaced by shared-grid structured loops")
+
 from tilelang import tvm
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform
 from tvm import tirx

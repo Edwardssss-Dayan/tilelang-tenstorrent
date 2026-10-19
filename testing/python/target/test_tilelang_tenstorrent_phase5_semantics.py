@@ -5,11 +5,13 @@ from collections import defaultdict
 import numpy as np
 import pytest
 
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
 from tvm import ir, tirx
 
 from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import cast, expression
+from testing.python.target.test_tilelang_tenstorrent_compute_values import _calls
 
 
 def run_pipeline_device(mod, inputs, *, seed=0):
@@ -20,7 +22,9 @@ def run_pipeline_device(mod, inputs, *, seed=0):
     Randomized slot order and copy latency exercise legal interleavings.
     """
     VerifyTenstorrentDeviceIR()(mod)
-    assert int(mod.attrs["tt.device_ir_version"]) == 3
+    mod = D.expand_current_device_tables(mod)
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     rng = np.random.default_rng(seed)
     tensors = [cast(value, desc.dtype).copy() for value, desc in zip(inputs, mod.attrs["tt.tensor_table"])]
     dfbs = {int(d.dfb_id): d for d in mod.attrs["tt.dfb_table"]}
@@ -30,8 +34,7 @@ def run_pipeline_device(mod, inputs, *, seed=0):
     streams = []
     for slot in ("ncrisc", "trisc", "brisc"):
         func = next(f for f in mod.functions.values() if str(f.attrs["tt.kernel_slot"]) == slot)
-        stmts = list(func.body.seq) if isinstance(func.body, tirx.SeqStmt) else [func.body]
-        streams.append([s.value for s in stmts if isinstance(s.value, tirx.Call)])
+        streams.append(list(_calls(func.body)))
     positions = [0] * len(streams)
     owners, storage, pending = {}, {}, {}
     published, released = set(), set()

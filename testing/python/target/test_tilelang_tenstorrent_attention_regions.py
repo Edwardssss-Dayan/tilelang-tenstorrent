@@ -48,7 +48,8 @@ def test_singleton_tensor_axes_preserve_original_abi_and_slice_coordinates(mode)
     for parameter, buffer in frontend["main"].buffer_map.items():
         assert normalized["main"].buffer_map[parameter].same_as(buffer)
     result = lower_tenstorrent_ir(tvm.IRModule({"main": tensor_slice_program(mode)}), TARGET)
-    assert "tt.device_ir_version" in result.attrs
+    assert str(result.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in result.attrs
     specs = result.attrs["tt.tensor_table"]
     assert all([int(axis) for axis in spec.shape] == [2, 3, 64, 64] for spec in specs)
     transform.VerifyTenstorrentDeviceIR()(result)

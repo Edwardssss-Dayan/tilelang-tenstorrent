@@ -6,6 +6,8 @@
 #include "../../op/copy.h"
 #include "../../op/region.h"
 #include "../../op/utils.h"
+#include "../ir/device_ir.h"
+#include "../op/builtin.h"
 #include "attr.h"
 
 #include <tvm/arith/analyzer.h>
@@ -73,6 +75,8 @@ bool HasStructuredComputeAnnotations(const Entries &annotations) {
          annotations.count(kTTPhysicalTileShape) ||
          annotations.count(kTTBlockShape) ||
          annotations.count(kTTIteratorTypes) ||
+         annotations.count(kTTAccessTable) ||
+         annotations.count(kTTOutputAccessID) ||
          annotations.count(kTTAccessMaps) ||
          annotations.count(kTTBroadcastRecipes) ||
          annotations.count(kTTValueKinds);
@@ -123,10 +127,12 @@ private:
 };
 
 struct Access {
+  int64_t access_id;
   Buffer buffer;
   Array<Integer> axes;
   bool read{false};
   bool write{false};
+  Span span;
 };
 struct ScopePlan {
   Array<Var> variables;
@@ -237,8 +243,8 @@ public:
     Require(!store->predicate.has_value(), "store predicate is unsupported");
     Require(store->value.dtype() == store->buffer->dtype,
             "store expression dtype mismatch");
-    RecordAccess(plan, store->buffer, store->indices, false);
     AnalyzeExpression(plan, store->value);
+    RecordAccess(plan, store->buffer, store->indices, false, store->span);
     // Storage metadata belongs to the actual effects, never to the Buffer
     // that merely supplied the frontend domain shape.
     for (const Access &access : plan.accesses)
@@ -316,11 +322,17 @@ private:
       int64_t expected =
           axes[axis]->value < 0 ? padding : Static(domain[axis], "domain");
       int64_t actual = Static(buffer->shape[axis], "buffer shape");
-      Require(actual == expected || (value_kind == "compute_fragment" &&
-                                     axes[axis]->value < 0 && actual == 1),
+      bool full_shape_broadcast = axes[axis]->value < 0 &&
+                                  actual == Static(domain[axis], "domain");
+      Require(actual == expected || full_shape_broadcast ||
+                  (value_kind == "compute_fragment" &&
+                   axes[axis]->value < 0 && actual == 1),
               "buffer '" + std::string(buffer->name) +
                   "' shape does not match identity or compact padded broadcast "
-                  "shape");
+                  "shape on axis " + std::to_string(axis) + " (actual=" +
+                  std::to_string(actual) + ", expected=" +
+                  std::to_string(expected) + ", domain=" +
+                  std::to_string(Static(domain[axis], "domain")) + ")");
     }
     auto record = allocation_.metadata.find(buffer->data);
     if (value_kind == "compute_fragment") {
@@ -376,7 +388,8 @@ private:
   }
 
   void RecordAccess(ScopePlan &plan, const Buffer &buffer,
-                    const Array<PrimExpr> &indices, bool read) {
+                    const Array<PrimExpr> &indices, bool read,
+                    const Span &span) {
     Require(indices.size() == plan.domain.size(),
             "buffer access rank must match logical domain");
     Array<Integer> axes;
@@ -390,24 +403,14 @@ private:
         Reject("access indices in buffer '" + std::string(buffer->name) +
                "' must be identity or zero-axis broadcast in Phase 1");
     }
-    for (Access &access : plan.accesses) {
-      if (access.buffer->data.same_as(buffer->data)) {
-        Require(access.buffer.same_as(buffer),
-                "alias Buffer objects share one data identity");
-        Require(ffi::StructuralEqual()(access.axes, axes),
-                "one buffer has conflicting access maps");
-        access.read |= read;
-        access.write |= !read;
-        return;
-      }
-    }
-    plan.accesses.push_back({buffer, axes, read, !read});
+    plan.accesses.push_back({static_cast<int64_t>(plan.accesses.size()), buffer,
+                             axes, read, !read, span});
   }
 
   void AnalyzeExpression(ScopePlan &plan, const PrimExpr &expr) {
     if (const auto *load = expr.as<BufferLoadNode>()) {
       Require(!load->predicate.has_value(), "load predicate is unsupported");
-      RecordAccess(plan, load->buffer, load->indices, true);
+      RecordAccess(plan, load->buffer, load->indices, true, load->span);
       return;
     }
     if (expr.as<IntImmNode>() || expr.as<FloatImmNode>())
@@ -495,6 +498,13 @@ private:
 // index expressions, including equivalent spellings such as (i + 0), with
 // canonical zeros without simplifying the scalar expression DAG itself.
 class TemplateBuilder : public StmtExprMutator {
+public:
+  explicit TemplateBuilder(const ScopePlan &plan) {
+    for (const Access &access : plan.accesses)
+      if (access.read)
+        read_access_ids_.push_back(access.access_id);
+  }
+
 private:
   static Array<PrimExpr> ZeroIndices(const Array<PrimExpr> &indices) {
     Array<PrimExpr> zeros;
@@ -504,21 +514,34 @@ private:
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
-    return BufferLoad(op->buffer, ZeroIndices(op->indices), std::nullopt,
-                      op->span);
+    Require(next_read_ < read_access_ids_.size(),
+            "structured expression has more loads than access descriptors");
+    return Call(op->dtype, tenstorrent::compute_access(),
+                {Integer(read_access_ids_[next_read_++])}, {}, op->span);
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     return BufferStore(op->buffer, VisitExpr(op->value),
                        ZeroIndices(op->indices), std::nullopt, op->span);
   }
+
+  std::vector<int64_t> read_access_ids_;
+  size_t next_read_{0};
 };
 
 SBlockRealize ApplyPlan(const ScopePlan &plan) {
   Array<BufferRegion> reads, writes;
+  Array<TTAccessDescriptor> access_table;
   AxisMaps maps;
   ValueKinds value_kinds;
   Map<Var, Map<String, ffi::Any>> recipes;
+  int64_t output_access_id = -1;
+  auto add_effect = [](Array<BufferRegion> *effects, const Buffer &buffer) {
+    for (const BufferRegion &region : *effects)
+      if (region->buffer->data.same_as(buffer->data))
+        return;
+    effects->push_back(BufferRegion::FullRegion(buffer));
+  };
   for (const Access &access : plan.accesses) {
     Array<Range> ranges;
     Array<PrimExpr> logical, physical_tiles;
@@ -539,18 +562,26 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
     }
     BufferRegion region(access.buffer, ranges);
     if (access.read)
-      reads.push_back(region);
-    if (access.write)
-      writes.push_back(region);
+      add_effect(&reads, access.buffer);
+    if (access.write) {
+      add_effect(&writes, access.buffer);
+      output_access_id = access.access_id;
+    }
     maps.Set(access.buffer->data, access.axes);
     value_kinds.Set(access.buffer->data, GetValueKind(access.buffer));
+    String kind =
+        broadcast_axes.empty()
+            ? String("identity")
+            : plan.domain.size() == 2
+                  ? (broadcast_axes.size() == 2
+                         ? String("scalar")
+                         : (broadcast_axes[0]->value == 0 ? String("row")
+                                                         : String("column")))
+                  : String("batch");
+    access_table.push_back(TTAccessDescriptor(
+        access.access_id, access.buffer, access.read ? "read" : "write", region,
+        access.axes, kind, broadcast_axes, access.span));
     if (!broadcast_axes.empty()) {
-      String kind =
-          plan.domain.size() == 2
-              ? (broadcast_axes.size() == 2
-                     ? "scalar"
-                     : (broadcast_axes[0]->value == 0 ? "row" : "column"))
-              : "batch";
       recipes.Set(access.buffer->data,
                   {{"broadcast_kind", kind},
                    {"broadcast_axes", broadcast_axes},
@@ -575,10 +606,14 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
       {kTTPhysicalTileShape, Array<PrimExpr>{Integer(32), Integer(32)}},
       {kTTBlockShape, block_shape},
       {kTTIteratorTypes, iterator_types},
+      {kTTAccessTable, access_table},
+      {kTTOutputAccessID, Integer(output_access_id)},
       {kTTAccessMaps, maps},
       {kTTValueKinds, value_kinds},
       {kTTBroadcastRecipes, recipes}};
-  TemplateBuilder builder;
+  Require(output_access_id >= 0,
+          "structured computation has no output access descriptor");
+  TemplateBuilder builder(plan);
   SBlock block({}, reads, writes, "tl.tt.elementwise", builder(plan.store),
                std::nullopt, {}, {}, annotations, plan.span);
   return SBlockRealize({}, const_true(), block, plan.span);
@@ -758,43 +793,65 @@ private:
 // The original template itself is required to contain zero indices exclusively.
 class TemplateRestorer : public StmtExprMutator {
 public:
-  TemplateRestorer(AxisMaps maps, Array<Var> variables)
-      : maps_(std::move(maps)), variables_(std::move(variables)) {}
+  TemplateRestorer(Array<TTAccessDescriptor> accesses, int64_t output_access_id,
+                   Array<Var> variables)
+      : output_access_id_(output_access_id), variables_(std::move(variables)) {
+    for (const TTAccessDescriptor &access : accesses) {
+      Require(access.defined() && access->access_id >= 0 &&
+                  by_id_.emplace(access->access_id, access).second,
+              "structured access table contains invalid or duplicate IDs");
+    }
+  }
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
-    Require(!op->predicate.has_value(),
-            "structured load predicate is unsupported");
-    return BufferLoad(op->buffer, RestoreIndices(op->buffer, op->indices),
-                      std::nullopt, op->span);
+    Reject("structured expression must reference loads by access_id");
+  }
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = ffi::GetRef<Call>(op);
+    if (!call->op.same_as(tenstorrent::compute_access()))
+      return StmtExprMutator::VisitExpr_(op);
+    Require(call->args.size() == 1 && as_const_int(call->args[0]),
+            "structured access expression requires one static access_id");
+    int64_t id = *as_const_int(call->args[0]);
+    auto found = by_id_.find(id);
+    Require(found != by_id_.end() && found->second->access_kind == "read",
+            "structured expression references a missing or non-read access");
+    const TTAccessDescriptor &access = found->second;
+    return BufferLoad(access->buffer, RestoreIndices(access), std::nullopt,
+                      op->span);
   }
   Stmt VisitStmt_(const BufferStoreNode *op) final {
+    auto found = by_id_.find(output_access_id_);
+    Require(found != by_id_.end() && found->second->access_kind == "write",
+            "structured output_access_id references a missing write access");
+    const TTAccessDescriptor &output = found->second;
+    Require(output->buffer.same_as(op->buffer),
+            "structured output descriptor disagrees with store Buffer");
     Require(!op->predicate.has_value(),
             "structured store predicate is unsupported");
     return BufferStore(op->buffer, VisitExpr(op->value),
-                       RestoreIndices(op->buffer, op->indices), std::nullopt,
-                       op->span);
+                       RestoreIndices(output), std::nullopt, op->span);
   }
 
 private:
-  Array<PrimExpr> RestoreIndices(const Buffer &buffer,
-                                 const Array<PrimExpr> &indices) {
-    Require(indices.size() == variables_.size(),
-            "structured template access rank must match domain");
-    auto axes = maps_.Get(buffer->data);
-    Require(axes.has_value() && axes.value().size() == variables_.size(),
-            "structured template buffer is missing tl.tt.access_maps");
+  [[noreturn]] static void Reject(const std::string &message) {
+    ThrowElementwiseError(message);
+  }
+
+  Array<PrimExpr> RestoreIndices(const TTAccessDescriptor &access) {
+    Require(access->access_map.size() == variables_.size(),
+            "structured access rank must match domain");
     Array<PrimExpr> restored;
     for (size_t axis = 0; axis < variables_.size(); ++axis) {
-      Require(Static(indices[axis], "structured template index") == 0,
-              "structured template indices must be zero");
-      int64_t mapped = axes.value()[axis]->value;
+      int64_t mapped = access->access_map[axis]->value;
       Require(mapped == -1 || mapped == static_cast<int64_t>(axis),
               "structured access map must be identity or zero-axis broadcast");
-      restored.push_back(mapped < 0 ? make_zero(indices[axis].dtype())
+      restored.push_back(mapped < 0 ? make_zero(variables_[axis].dtype())
                                     : PrimExpr(variables_[axis]));
     }
     return restored;
   }
-  AxisMaps maps_;
+  std::unordered_map<int64_t, TTAccessDescriptor> by_id_;
+  int64_t output_access_id_;
   Array<Var> variables_;
 };
 
@@ -863,14 +920,22 @@ Stmt MergeComputeBranch(const IfThenElse &branch,
     indices.push_back(variable);
   }
   TemplateRestorer then_restorer(
-      Downcast<AxisMaps>(then_block.value()->annotations.at(kTTAccessMaps)),
+      Downcast<Array<TTAccessDescriptor>>(
+          then_block.value()->annotations.at(kTTAccessTable)),
+      Downcast<Integer>(
+          then_block.value()->annotations.at(kTTOutputAccessID))
+          ->value,
       variables);
   then_store = Downcast<BufferStore>(then_restorer(then_store));
   PrimExpr otherwise =
       BufferLoad(then_store->buffer, indices, std::nullopt, branch->span);
   if (else_block.has_value()) {
     TemplateRestorer else_restorer(
-        Downcast<AxisMaps>(else_block.value()->annotations.at(kTTAccessMaps)),
+        Downcast<Array<TTAccessDescriptor>>(
+            else_block.value()->annotations.at(kTTAccessTable)),
+        Downcast<Integer>(
+            else_block.value()->annotations.at(kTTOutputAccessID))
+            ->value,
         variables);
     otherwise =
         Downcast<BufferStore>(else_restorer(else_block.value()->body))->value;
@@ -927,26 +992,30 @@ public:
             "allocations");
     for (const char *key :
          {kTTComputeKind, kTTTilesStage, kTTLogicalDomain, kTTPhysicalTileShape,
-          kTTBlockShape, kTTIteratorTypes, kTTAccessMaps, kTTBroadcastRecipes,
-          kTTValueKinds}) {
+          kTTBlockShape, kTTIteratorTypes, kTTAccessTable, kTTOutputAccessID,
+          kTTAccessMaps, kTTBroadcastRecipes, kTTValueKinds}) {
       Require(op->annotations.count(key),
               std::string("structured block missing metadata ") + key);
     }
     auto domain = op->annotations.at(kTTLogicalDomain).as<Array<PrimExpr>>();
-    auto maps = op->annotations.at(kTTAccessMaps).as<AxisMaps>();
+    auto access_table =
+        op->annotations.at(kTTAccessTable).as<Array<TTAccessDescriptor>>();
+    auto output_access = op->annotations.at(kTTOutputAccessID).as<Integer>();
     auto value_kinds = op->annotations.at(kTTValueKinds).as<ValueKinds>();
     Require(value_kinds.has_value(),
             "invalid structured tl.tt.value_kinds schema: expected "
             "Map<Var, String> keyed by Buffer data identity");
     Require(
-        domain.has_value() && domain.value().size() >= 2 && maps.has_value(),
-        "invalid structured tl.tt.logical_domain or tl.tt.access_maps schema");
+        domain.has_value() && domain.value().size() >= 2 &&
+            access_table.has_value() && output_access.has_value(),
+        "invalid structured logical domain or access table schema");
     Array<Var> variables;
     for (const PrimExpr &extent : domain.value()) {
       Static(extent, "structured logical domain");
       variables.push_back(Var("tt_verify_axis", extent.dtype()));
     }
-    TemplateRestorer restorer(maps.value(), variables);
+    TemplateRestorer restorer(access_table.value(), output_access.value()->value,
+                              variables);
     Stmt body = restorer(op->body);
     for (int axis = static_cast<int>(variables.size()) - 1; axis >= 0; --axis) {
       body = For(variables[axis], make_zero(variables[axis].dtype()),
@@ -990,6 +1059,8 @@ tvm::transform::Pass CanonicalizeTTElementwise() {
     Stmt body = rewriter(func->body);
     if (!body.same_as(func->body))
       func.CopyOnWrite()->body = std::move(body);
+    ComputeVerifier verifier(func);
+    verifier.Verify(func->body);
     return func;
   };
   return tirx::transform::CreatePrimFuncPass(

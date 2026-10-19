@@ -1,4 +1,8 @@
-"""Typed construction helpers shared by Tenstorrent Device IR v1 through v9.
+"""Typed Tenstorrent Device IR construction and diagnostic helpers.
+
+The active contract is selected only by ``tt.ir_stage="device"`` and carries
+typed descriptor families without a numeric schema version. Versioned helpers
+below remain solely for explicit legacy artifact verification and migration.
 
 ``TTBufferMetadata`` is a normalization-stage object.  It is attached as an
 array under :data:`BUFFER_METADATA_TABLE_ATTR` before program formation and
@@ -42,6 +46,9 @@ the compact input. Older consumers must explicitly expand or reject version 9.
 
 from __future__ import annotations
 
+import ast
+import io
+import tokenize
 from typing import Any
 
 import tvm_ffi
@@ -62,8 +69,18 @@ COMPUTE_VALUE_TABLE_ATTR = "tt.compute_value_table"
 COMPUTE_REQUIREMENTS_ATTR = "tt.compute_requirements"
 COMPUTE_REGION_REQUIREMENTS_ATTR = "tt.compute_region_requirements"
 DFB_TABLE_ATTR = "tt.dfb_table"
+DFB_FAMILIES_ATTR = "tt.dfb_families"
+DFB_STORAGE_GROUPS_ATTR = "tt.dfb_storage_groups"
+DFB_STORAGE_GROUP_RELATIONS_ATTR = "tt.dfb_storage_group_relations"
+ACCUMULATOR_FAMILIES_ATTR = "tt.accumulator_families"
+COMPUTE_VALUE_FAMILIES_ATTR = "tt.compute_value_families"
+COMMUNICATION_STEP_FAMILIES_ATTR = "tt.communication_step_families"
+TRANSPORT_FAMILIES_ATTR = "tt.transport_families"
 PIPE_TABLE_ATTR = "tt.pipe_table"
 PIPE_TRANSFER_TABLE_ATTR = "tt.pipe_transfer_table"
+COMMUNICATION_TABLE_ATTR = "tt.communication_table"
+COMMUNICATION_STEP_TABLE_ATTR = "tt.communication_step_table"
+TRANSPORT_TABLE_ATTR = "tt.transport_table"
 KERNEL_ORDER_ATTR = "tt.kernel_order"
 KERNEL_SLOT_ATTR = "tt.kernel_slot"
 KERNEL_THREAD_ATTR = "tt.kernel_thread"
@@ -72,7 +89,6 @@ LOGICAL_KERNEL_ATTR = "tt.logical_kernel"
 TENSOR_ARG_INDICES_ATTR = "tt.tensor_arg_indices"
 CORE_DOMAIN_ATTR = "tt.core_domain"
 BUFFER_METADATA_TABLE_ATTR = "tt.buffer_metadata_table"
-DFB_STORAGE_GROUPS_ATTR = "tt.dfb_storage_groups"
 PIPELINE_RELATIONS_ATTR = "tt.pipeline_relations"
 PIPELINE_STAGES_ATTR = "tt.pipeline_stages"
 PIPELINE_EXTENT_ATTR = "tt.pipeline_extent"
@@ -98,6 +114,30 @@ class DeviceIRDescriptorFamily(Node):
         self.__init_handle_by_constructor__(_ffi_api.DeviceIRDescriptorFamily, prototype, positions, fields, list(source_parts))
 
 
+@tvm_ffi.register_object("tl.tenstorrent.DFBStorageGroupRelation")
+class DFBStorageGroupRelation(Node):
+    """Family-aligned storage-group ID and transaction-ordinal columns."""
+
+    def __init__(
+        self,
+        dfb_family_id: int,
+        storage_group_ids: DeviceIRIntColumn,
+        transaction_ordinals: DeviceIRIntColumn,
+        pipeline_iterations: DeviceIRIntColumn | None = None,
+    ):
+        if pipeline_iterations is None:
+            pipeline_iterations = DeviceIRIntColumn(
+                -1, 0, int(storage_group_ids.count)
+            )
+        self.__init_handle_by_constructor__(
+            _ffi_api.DFBStorageGroupRelation,
+            int(dfb_family_id),
+            storage_group_ids,
+            transaction_ordinals,
+            pipeline_iterations,
+        )
+
+
 def compact_device_ir(mod: IRModule, *, force: bool = False) -> IRModule:
     """Use the existing Lower representation helper without creating a pass.
 
@@ -116,6 +156,63 @@ def expand_device_ir(mod: IRModule) -> IRModule:
     schema is rejected.
     """
     return _ffi_api.ExpandDeviceIR(mod)
+
+
+def expand_current_device_tables(mod: IRModule) -> IRModule:
+    """Materialize current-stage family instances for bounded inspection.
+
+    Lower, Codegen and serialization keep the parameterized representation.
+    This helper exists for tests, diagnostics and verifier-equivalent audits.
+    """
+    return _ffi_api.ExpandCurrentDeviceTables(mod)
+
+
+def device_ir_to_tirx(mod: IRModule) -> str:
+    """Return parseable TVMScript for current Device IR.
+
+    TVM's generic printer emits ``tirx.Call.annotations`` as keyword arguments.
+    Tenstorrent annotation names use dotted ``tt.*`` keys, which are valid IR
+    keys but invalid Python keyword identifiers. Encode only those keyword
+    tokens at the text boundary; ``T.tt`` constructors decode them while parsing.
+    """
+
+    if mod.attrs is None or str(mod.attrs.get("tt.ir_stage", "")) != "device":
+        raise ValueError("device_ir_to_tirx requires tt.ir_stage='device'")
+
+    source = mod.script(show_meta=True)
+    tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+    encoded = []
+    index = 0
+    while index < len(tokens):
+        if (
+            index + 3 < len(tokens)
+            and tokens[index].type == tokenize.NAME
+            and tokens[index].string == "tt"
+            and tokens[index + 1].type == tokenize.OP
+            and tokens[index + 1].string == "."
+            and tokens[index + 2].type == tokenize.NAME
+            and tokens[index + 3].type == tokenize.OP
+            and tokens[index + 3].string == "="
+        ):
+            first = tokens[index]
+            name = tokens[index + 2]
+            encoded.append(
+                tokenize.TokenInfo(
+                    tokenize.NAME,
+                    f"tt__{name.string}",
+                    first.start,
+                    name.end,
+                    first.line,
+                )
+            )
+            index += 3
+            continue
+        encoded.append(tokens[index])
+        index += 1
+
+    result = tokenize.untokenize(encoded)
+    ast.parse(result)
+    return result
 
 
 def is_supported_accumulator_dtype_triple(input_dtype, accumulation_dtype, output_dtype) -> bool:
@@ -155,6 +252,19 @@ class ShardSpec(Node):
 class TensorBacking(Node):
     def __init__(self, global_arg_index: int, byte_offset=0):
         self.__init_handle_by_constructor__(_ffi_api.TensorBacking, int(global_arg_index), _expr(byte_offset))
+
+
+@tvm_ffi.register_object("tl.tenstorrent.TensorStorageBacking")
+class TensorStorageBacking(Node):
+    """Proven Tensor byte range used as storage for a complete DFB capacity."""
+
+    def __init__(self, global_arg_index: int, byte_offset, byte_size):
+        self.__init_handle_by_constructor__(
+            _ffi_api.TensorStorageBacking,
+            int(global_arg_index),
+            _expr(byte_offset),
+            _expr(byte_size),
+        )
 
 
 @tvm_ffi.register_object("tl.tenstorrent.OperationIdentity")
@@ -197,6 +307,138 @@ class TensorDescriptor(Node):
         )
 
 
+@tvm_ffi.register_object("tl.tenstorrent.TTAccessDescriptor")
+class TTAccessDescriptor(Node):
+    """One stable load/store occurrence in a structured compute expression."""
+
+    def __init__(
+        self,
+        access_id,
+        buffer,
+        access_kind,
+        logical_region,
+        access_map,
+        broadcast_kind,
+        broadcast_axes=(),
+        source_span=None,
+    ):
+        self.__init_handle_by_constructor__(
+            _ffi_api.TTAccessDescriptor,
+            int(access_id),
+            buffer,
+            access_kind,
+            logical_region,
+            list(access_map),
+            broadcast_kind,
+            list(broadcast_axes),
+            source_span,
+        )
+
+
+@tvm_ffi.register_object("tl.tenstorrent.NormalizedTopologyDescriptor")
+class NormalizedTopologyDescriptor(Node):
+    """Structured-stage facts for one high-level communication site."""
+
+    def __init__(
+        self,
+        site_id,
+        kind,
+        source_region,
+        destination_region,
+        source_coord,
+        group_begin,
+        group_end,
+        parameter,
+        contract,
+        guard,
+        occurrence_extents=(),
+        source_span=None,
+    ):
+        self.__init_handle_by_constructor__(
+            _ffi_api.NormalizedTopologyDescriptor,
+            int(site_id),
+            kind,
+            source_region,
+            destination_region,
+            list(source_coord),
+            list(group_begin),
+            list(group_end),
+            parameter,
+            contract,
+            guard,
+            list(occurrence_extents),
+            source_span,
+        )
+
+
+@tvm_ffi.register_object("tl.tenstorrent.CommunicationDescriptor")
+class CommunicationDescriptor(Node):
+    def __init__(
+        self,
+        communication_id,
+        kind,
+        algorithm,
+        source_region,
+        destination_region,
+        source_coord,
+        group_begin,
+        group_end,
+        parameter,
+        contract,
+        occurrence_extents=(),
+        source_span=None,
+    ):
+        self.__init_handle_by_constructor__(
+            _ffi_api.CommunicationDescriptor,
+            int(communication_id),
+            kind,
+            algorithm,
+            source_region,
+            destination_region,
+            list(source_coord),
+            list(group_begin),
+            list(group_end),
+            parameter,
+            contract,
+            list(occurrence_extents),
+            source_span,
+        )
+
+
+@tvm_ffi.register_object("tl.tenstorrent.CommunicationStepDescriptor")
+class CommunicationStepDescriptor(Node):
+    def __init__(
+        self,
+        step_id,
+        communication_id,
+        occurrence,
+        kind,
+        source_core,
+        destination_core,
+        source_dfb_id,
+        destination_dfb_id,
+        owner_slot,
+        dependencies=(),
+        parameter=0,
+        source_span=None,
+    ):
+        self.__init_handle_by_constructor__(
+            _ffi_api.CommunicationStepDescriptor,
+            int(step_id),
+            int(communication_id),
+            int(occurrence),
+            kind,
+            source_core,
+            destination_core,
+            int(source_dfb_id),
+            int(destination_dfb_id),
+            owner_slot,
+            list(dependencies),
+            _expr(parameter),
+            source_span,
+        )
+
+
 @tvm_ffi.register_object("tl.tenstorrent.DFBDescriptor")
 class DFBDescriptor(Node):
     def __init__(
@@ -229,6 +471,40 @@ class DFBDescriptor(Node):
             consumer_slot,
             consumer_domain,
             _expr(transaction_count_or_loop_relation),
+            source_span,
+        )
+
+
+@tvm_ffi.register_object("tl.tenstorrent.DFBStorageGroupDescriptor")
+class DFBStorageGroupDescriptor(Node):
+    """One finite logical CB stream shared by compatible DFB generations."""
+
+    def __init__(
+        self,
+        storage_group_id: int,
+        element_dtype: str | DataType,
+        tile_shape,
+        block_shape_in_tiles,
+        block_count,
+        producer_slot: str,
+        producer_domain: CoreDomain,
+        consumer_slot: str,
+        consumer_domain: CoreDomain,
+        storage_backing: TensorStorageBacking | None,
+        source_span: Span,
+    ):
+        self.__init_handle_by_constructor__(
+            _ffi_api.DFBStorageGroupDescriptor,
+            int(storage_group_id),
+            DataType(element_dtype),
+            _shape(tile_shape),
+            _shape(block_shape_in_tiles),
+            _expr(block_count),
+            producer_slot,
+            producer_domain,
+            consumer_slot,
+            consumer_domain,
+            storage_backing,
             source_span,
         )
 
@@ -487,6 +763,10 @@ __all__ = (
     "ComputeValueDescriptor",
     "COMPUTE_VALUE_TABLE_ATTR",
     "ComputeRequirements",
+    "CommunicationDescriptor",
+    "CommunicationStepDescriptor",
+    "COMMUNICATION_TABLE_ATTR",
+    "COMMUNICATION_STEP_TABLE_ATTR",
     "ACCUMULATOR_TABLE_ATTR",
     "COMPUTE_REQUIREMENTS_ATTR",
     "COMPUTE_REGION_REQUIREMENTS_ATTR",
@@ -494,18 +774,29 @@ __all__ = (
     "CoreCoord",
     "CoreDomain",
     "DFBDescriptor",
+    "DFBStorageGroupDescriptor",
+    "DFBStorageGroupRelation",
+    "DFB_STORAGE_GROUPS_ATTR",
+    "DFB_STORAGE_GROUP_RELATIONS_ATTR",
+    "DeviceIRDescriptorFamily",
+    "DeviceIRIntColumn",
     "DeviceFunctionMetadata",
     "DeviceModuleMetadata",
     "LogicalKernel",
+    "NormalizedTopologyDescriptor",
     "OperationIdentity",
     "PipeDescriptor",
     "PipeTransferDescriptor",
     "PIPE_TRANSFER_TABLE_ATTR",
     "ShardSpec",
     "TTBufferMetadata",
+    "TTAccessDescriptor",
+    "TRANSPORT_TABLE_ATTR",
     "TensorBacking",
+    "TensorStorageBacking",
     "TensorDescriptor",
     "VerifyTenstorrentDeviceIR",
     "attach_device_function_metadata",
     "attach_device_module_metadata",
+    "device_ir_to_tirx",
 )

@@ -57,7 +57,8 @@ def lower(func, arch="wormhole_b0"):
 @pytest.mark.parametrize("predicate", [-1, 0, 1, np.nan])
 def test_dynamic_branch_selects_a_complete_value(arch, fragment, predicate):
     mod = lower(branch_program(fragment=fragment), arch)
-    assert "tt.ir_stage" not in mod.attrs
+    assert str(mod.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in mod.attrs
     selects, branches = [], []
     for func in mod.functions.values():
         tirx.stmt_functor.post_order_visit(
@@ -70,7 +71,8 @@ def test_dynamic_branch_selects_a_complete_value(arch, fragment, predicate):
                 else None
             ),
         )
-    assert selects and not branches
+    semantic_branches = [branch for branch in branches if "T.tt.core_" not in str(branch.condition)]
+    assert selects and not semantic_branches
     data = np.arange(64 * 64, dtype="float32").reshape(64, 64)
     flag = np.full((32, 32), predicate, dtype="float32")
     inputs = [data, flag, np.zeros_like(data)]
@@ -130,5 +132,6 @@ def test_branch_with_transfer_effect_is_not_speculated():
             if p[0, 0] > 0:
                 T.copy(a, C)
 
-    with pytest.raises(NotImplementedError, match="control flow|transaction"):
-        lower(main)
+    result = lower(main)
+    assert str(result.attrs["tt.ir_stage"]) == "structured"
+    assert any("control flow" in str(reason) or "transaction" in str(reason) for reason in result.attrs["tt.deferred_reasons"])

@@ -221,17 +221,14 @@ def test_legalize_consumes_fill_tileop():
 
 
 def test_topology_capabilities_are_checked_by_the_topology_pass():
-    normalized = _normalized(FRONTEND_PROGRAMS["p2p"])
-    ir.assert_structural_equal(transform.LegalizeTenstorrentTileOps()(normalized), normalized)
-    specialized = transform.NormalizeTenstorrentTopology()(normalized)
-    assert int(specialized["main"].attrs["tt.topology_normalized"]) == 1
-    assert "tl.tt.foreach_src" not in specialized.script()
+    with pytest.raises(NotImplementedError, match="legacy PipeNet"):
+        _normalized(FRONTEND_PROGRAMS["p2p"])
 
 
 def test_partial_copy_is_rejected_at_transaction_planning_boundary():
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
-    with pytest.raises(ValueError, match="FormTenstorrentDeviceProgram.*regions disagree"):
+    with pytest.raises(ValueError, match="read before definite initialization"):
         TenstorrentPassPipelineBody(tvm.IRModule({"main": partial_copy_add}), TARGET)
 
 
@@ -239,6 +236,6 @@ def test_one_block_dfb_capacity_is_not_an_add_frontend_restriction():
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
     result = TenstorrentPassPipelineBody(tvm.IRModule({"main": single_buffer_add}), TARGET)
-    assert int(result.attrs["tt.device_ir_version"]) == 2
-    assert "tt.ir_stage" not in result.attrs
+    assert str(result.attrs["tt.ir_stage"]) == "device"
+    assert "tt.device_ir_version" not in result.attrs
     transform.VerifyTenstorrentDeviceIR()(result)

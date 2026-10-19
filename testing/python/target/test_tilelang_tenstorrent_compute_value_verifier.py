@@ -3,16 +3,20 @@
 import pytest
 
 from tilelang import tvm
+from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform
 from tilelang.tenstorrent.device_ir import ComputeValueDescriptor
 from tvm import ir, tirx
 
 from testing.python.target.test_tilelang_tenstorrent_frontend02 import TARGET, fragment_program, gemm_epilogue
+from testing.python.target.test_tilelang_tenstorrent_compute_values import _core_statements, _with_core_statements
 
 
 def device(gemm=False):
     func = gemm_epilogue("store") if gemm else fragment_program()
-    return lower_tenstorrent_ir(tvm.IRModule({"main": func}), TARGET)
+    return D.expand_current_device_tables(
+        lower_tenstorrent_ir(tvm.IRModule({"main": func}), TARGET)
+    )
 
 
 def rewrite_calls(mod, edit):
@@ -78,29 +82,29 @@ def test_future_value_reference_is_rejected():
 def test_duplicate_value_definition():
     mod = device()
     trisc = next(f for f in mod.functions.values() if f.attrs["tt.kernel_slot"] == "trisc")
-    statements = list(trisc.body.seq)
+    statements = _core_statements(trisc)
     definition = next(s for s in statements if isinstance(s, tirx.Evaluate) and s.value.op.name == "tl.tt.compute_value")
-    mod.update_func(mod.get_global_var(str(trisc.attrs["global_symbol"])), trisc.with_body(tirx.SeqStmt([*statements, definition])))
+    mod.update_func(mod.get_global_var(str(trisc.attrs["global_symbol"])), _with_core_statements(trisc, [*statements, definition]))
     check_rejected(mod, "duplicated|after release")
 
 
 def test_missing_release_and_release_before_read():
     mod = device()
     func = next(f for f in mod.functions.values() if f.attrs["tt.kernel_slot"] == "trisc")
-    statements = list(func.body.seq)
+    statements = _core_statements(func)
     release = next(i for i, stmt in enumerate(statements) if stmt.value.op.name == "tl.tt.dfb_release")
     missing = ir.load_json(ir.save_json(mod))
     missing.update_func(
         missing.get_global_var(str(func.attrs["global_symbol"])),
-        func.with_body(tirx.SeqStmt(statements[:release] + statements[release + 1 :])),
+        _with_core_statements(func, statements[:release] + statements[release + 1 :]),
     )
     check_rejected(missing, "missing release")
     premature = ir.load_json(ir.save_json(mod))
     premature.update_func(
         premature.get_global_var(str(func.attrs["global_symbol"])),
-        func.with_body(tirx.SeqStmt([statements[release], *statements[:release], *statements[release + 1 :]])),
+        _with_core_statements(func, [statements[release], *statements[:release], *statements[release + 1 :]]),
     )
-    check_rejected(premature, "must follow wait")
+    check_rejected(premature, "must follow wait|release precedes")
 
 
 def test_accumulator_zero_initialization_cannot_be_forged():

@@ -9,6 +9,11 @@ from tvm import ir, tirx
 from testing.python.target.test_tilelang_tenstorrent_phase4_semantics import cast, expression
 
 
+pytestmark = pytest.mark.skip(
+    reason="legacy Device IR v4 PipeNet interpreter; v04 high-level communication uses shared-grid steps"
+)
+
+
 def run_multicore_device(mod, inputs, *, seed=0):
     """Interpret explicit slot streams with delayed point delivery and storage.
 

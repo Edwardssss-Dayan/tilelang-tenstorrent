@@ -97,8 +97,23 @@ def lower_capability(
 
     if arch not in SUPPORTED_ARCHITECTURES:
         return reject(f"Unsupported architecture {arch!r}")
-    if operation not in ("copy", "elementwise", "fill", "typecast", "transpose", "gemm", "reduce", "pipe"):
+    communication = {"transfer", "broadcast", "all_gather", "all_reduce"}
+    if operation not in (
+        "copy",
+        "elementwise",
+        "fill",
+        "typecast",
+        "transpose",
+        "gemm",
+        "reduce",
+        *communication,
+        "pipe",
+    ):
         return reject(f"Unknown Lower operation {operation!r}")
+    if operation == "pipe":
+        return reject(
+            "PipeNet is a legacy compatibility frontend and is not an active Lower input"
+        )
     input_dtype = str(input_dtype)
     output_dtype = input_dtype if output_dtype is None else str(output_dtype)
     if input_dtype not in ("bfloat16", "float32") or output_dtype not in ("bfloat16", "float32"):
@@ -152,14 +167,18 @@ def lower_capability(
         expected_accumulation = "float32" if reduction_kind == "sum" else output_dtype
         if accumulation_dtype is not None and str(accumulation_dtype) != expected_accumulation:
             return reject(f"{reduction_kind} Reduction uses {expected_accumulation} accumulation")
-    if operation == "pipe" and (not multicore or fragment or accumulator):
-        return reject("PipeNet transport requires multicore shared DFBs; materialize fragment values before communication")
-    if operation == "pipe" and input_dtype != output_dtype:
-        return reject("PipeNet transport preserves the shared DFB dtype")
+    if operation in communication and (not multicore or fragment or accumulator):
+        return reject("Communication Lower requires multicore shared DFB payloads")
+    if operation in communication and input_dtype != output_dtype:
+        return reject("Communication Lower preserves the public payload dtype")
+    if operation == "all_reduce" and reduction_kind not in ("sum", "max", "min"):
+        return reject("all_reduce supports sum/max/min")
     if control_flow not in ("straight_line", "static_loop", "static_branch", "pure_value_branch", "dynamic_loop", "dynamic_branch"):
         return reject(f"Unknown control-flow placement {control_flow!r}")
     if control_flow in ("dynamic_loop", "dynamic_branch"):
         return reject("Dynamic control flow needs value merges and balanced cross-slot transactions", deferred)
+    if control_flow == "static_branch":
+        return reject("Static branches without value if-conversion need balanced Device transactions", deferred)
     if control_flow == "pure_value_branch" and operation != "elementwise":
         return reject("Pure value branch legalization requires full-buffer elementwise assignments", deferred)
     if pipelined and accumulator and (fragment or ir_version == 7):
@@ -168,6 +187,18 @@ def lower_capability(
         return reject("Pipelines require independently initialized values; general loop-carried state is deferred", deferred)
     if pipelined and control_flow != "straight_line":
         return reject("Bounded pipelines require independent iterations without nested/conditional transaction sites", deferred)
+    if operation in communication:
+        if pipelined:
+            return reject(
+                "Communication combined with T.Pipelined requires a joint lifetime proof",
+                deferred,
+            )
+        status = CapabilityStatus.LEGALIZABLE if control_flow != "straight_line" else CapabilityStatus.SUPPORTED
+        return LowerCapability(
+            status,
+            "Current shared-grid Device Lower uses deterministic direct communication algorithms",
+            None,
+        )
 
     repeated_pipe = operation == "pipe" and (pipelined or control_flow == "static_loop")
     if fragment:

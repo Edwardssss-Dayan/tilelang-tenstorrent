@@ -39,12 +39,92 @@ using Regions = std::unordered_map<Var, std::vector<BufferRegion>,
   TVM_FFI_THROW(ValueError) << "[VerifyTTStructuredDataflow] " << message;
 }
 
+class CoreInstanceSpecializer : public StmtExprMutator {
+public:
+  CoreInstanceSpecializer(const Var &core_x, const Var &core_y, int64_t x,
+                          int64_t y) {
+    substitutions_[core_x] = Integer(x);
+    substitutions_[core_y] = Integer(y);
+  }
+
+  PrimExpr VisitExpr(const PrimExpr &expr) final {
+    PrimExpr result = StmtExprMutator::VisitExpr(expr);
+    return result.dtype().is_handle() ||
+                   SideEffect(result) > CallEffectKind::kPure
+               ? result
+               : analyzer_.Simplify(result);
+  }
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    Var var = ffi::GetRef<Var>(op);
+    auto found = substitutions_.find(var);
+    return found == substitutions_.end() ? PrimExpr(var) : found->second;
+  }
+
+  Stmt VisitStmt_(const BindNode *op) final {
+    PrimExpr value = VisitExpr(op->value);
+    if (value.as<IntImmNode>() || value.as<FloatImmNode>()) {
+      substitutions_[op->var] = value;
+      return Evaluate(Integer(0), op->span);
+    }
+    return Bind(op->var, value, op->span);
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    PrimExpr condition = analyzer_.Simplify(VisitExpr(op->condition));
+    if (is_one(condition))
+      return VisitStmt(op->then_case);
+    if (is_zero(condition))
+      return op->else_case.has_value() ? VisitStmt(op->else_case.value())
+                                       : Evaluate(Integer(0), op->span);
+    return IfThenElse(condition, VisitStmt(op->then_case),
+                      op->else_case.has_value()
+                          ? ffi::Optional<Stmt>(VisitStmt(op->else_case.value()))
+                          : std::nullopt,
+                      op->span);
+  }
+
+private:
+  arith::Analyzer analyzer_;
+  std::unordered_map<Var, PrimExpr, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      substitutions_;
+};
+
 // This verifier deliberately proves only normalized, static dataflow. A
 // capability fallback is not permission to accept an unproven program.
 class StructuredDataflowVerifier : public StmtExprVisitor {
 public:
   static void Verify(const PrimFunc &func) {
+    auto grid = func->GetAttr<ffi::Array<PrimExpr>>("tt.launch_grid");
+    auto topology = func->GetAttr<ffi::Array<NormalizedTopologyDescriptor>>(
+        "tt.normalized_topology");
+    if (grid.has_value() && topology.has_value() && grid.value().size() == 2 &&
+        as_const_int(grid.value()[0]) && as_const_int(grid.value()[1])) {
+      const auto *xloop = func->body.as<ForNode>();
+      const auto *yloop = xloop ? xloop->body.as<ForNode>() : nullptr;
+      if (!xloop || !yloop)
+        Fail("normalized shared-grid program is missing logical Core loops");
+      for (int64_t x = 0; x < *as_const_int(grid.value()[0]); ++x)
+        for (int64_t y = 0; y < *as_const_int(grid.value()[1]); ++y) {
+          VerifyOne(func, yloop->body, x, y, xloop->loop_var,
+                    yloop->loop_var);
+        }
+      return;
+    }
+    VerifyOne(func, func->body, -1, -1, std::nullopt, std::nullopt);
+  }
+
+private:
+  static void VerifyOne(const PrimFunc &func, const Stmt &body, int64_t core_x,
+                        int64_t core_y, ffi::Optional<Var> core_x_var,
+                        ffi::Optional<Var> core_y_var) {
     StructuredDataflowVerifier verifier;
+    verifier.core_x_ = core_x;
+    verifier.core_y_ = core_y;
+    if (core_x_var.has_value())
+      verifier.analyzer_.Bind(core_x_var.value(), Integer(core_x));
+    if (core_y_var.has_value())
+      verifier.analyzer_.Bind(core_y_var.value(), Integer(core_y));
     auto slot = func->GetAttr<ffi::String>(kKernelSlotAttr);
     verifier.fragment_slot_allowed_ =
         !slot.has_value() || slot.value() == "trisc";
@@ -53,10 +133,9 @@ public:
       verifier.Write_(BufferRegion::FullRegion(buffer));
     }
     verifier.parameter_initialization_ = verifier.initialized_;
-    verifier(func->body);
+    verifier(body);
   }
 
-private:
   bool Covers_(const BufferRegion &written, const BufferRegion &read) {
     if (written->buffer->dtype != read->buffer->dtype ||
         written->region.size() != read->region.size())
@@ -194,6 +273,14 @@ private:
         initialized_[data].push_back(region);
   }
 
+  void VisitStmt_(const BindNode *op) final {
+    VisitExpr(op->value);
+    if (SideEffect(op->value) > CallEffectKind::kPure)
+      Fail("effectful scalar binding at structured boundary");
+    analyzer_.Bind(op->var, analyzer_.Simplify(op->value),
+                   /*allow_override=*/true);
+  }
+
   void VisitStmt_(const WhileNode *) final {
     // A possibly zero-trip body cannot establish definite initialization.
     // Keep the standalone verifier within the same static subset as the
@@ -268,6 +355,54 @@ private:
         Write_(payload);
       return;
     }
+    if (call->op.same_as(tenstorrent::transfer()) ||
+        call->op.same_as(tenstorrent::all_gather()) ||
+        call->op.same_as(tenstorrent::all_reduce())) {
+      if (call->args.size() < 2)
+        Fail("high-level communication is missing source/destination regions");
+      BufferRegion source =
+          NormalizeToAccessRegion(call->args[0], kAccessRead).region;
+      BufferRegion destination =
+          NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
+      if (core_x_ < 0 || core_y_ < 0) {
+        Read_(source);
+        Write_(destination);
+        return;
+      }
+      auto coordinate = [](const PrimExpr &expr,
+                           const std::string &field,
+                           arith::Analyzer *analyzer) -> int64_t {
+        PrimExpr simplified = analyzer->Simplify(expr);
+        const auto *value = simplified.as<IntImmNode>();
+        if (!value)
+          Fail(field + " is not static after per-Core topology analysis");
+        return value->value;
+      };
+      bool source_member = false;
+      bool destination_member = false;
+      if (call->op.same_as(tenstorrent::transfer())) {
+        source_member =
+            coordinate(call->args[2], "transfer source x", &analyzer_) == core_x_ &&
+            coordinate(call->args[3], "transfer source y", &analyzer_) == core_y_;
+        destination_member =
+            coordinate(call->args[4], "transfer destination begin x", &analyzer_) <= core_x_ &&
+            core_x_ < coordinate(call->args[6], "transfer destination end x", &analyzer_) &&
+            coordinate(call->args[5], "transfer destination begin y", &analyzer_) <= core_y_ &&
+            core_y_ < coordinate(call->args[7], "transfer destination end y", &analyzer_);
+      } else {
+        destination_member =
+            coordinate(call->args[2], "collective group begin x", &analyzer_) <= core_x_ &&
+            core_x_ < coordinate(call->args[4], "collective group end x", &analyzer_) &&
+            coordinate(call->args[3], "collective group begin y", &analyzer_) <= core_y_ &&
+            core_y_ < coordinate(call->args[5], "collective group end y", &analyzer_);
+        source_member = destination_member;
+      }
+      if (source_member)
+        Read_(source);
+      if (destination_member)
+        Write_(destination);
+      return;
+    }
     if (name != "tl.tileop.copy" && name != "tl.tileop.fill" &&
         name != "tl.tileop.gemm" && name != "tl.tileop.transpose" &&
         name != "tl.tileop.reduce")
@@ -275,8 +410,17 @@ private:
     if (call->op.same_as(Copy::Get())) {
       Copy copy = Downcast<Copy>(ParseOperator(call));
       if (copy->src->dtype != copy->dst->dtype &&
-          copy->src.scope() != "local.fragment")
-        Fail("ordinary copy source and destination dtypes disagree");
+          copy->src.scope() != "local.fragment") {
+        auto supported = [](DataType dtype) {
+          return dtype == DataType::BFloat(16) || dtype == DataType::Float(32);
+        };
+        auto shared = [](const Buffer &buffer) {
+          return buffer.scope() == "shared" || buffer.scope() == "shared.dyn";
+        };
+        if (!shared(copy->src) || !shared(copy->dst) ||
+            !supported(copy->src->dtype) || !supported(copy->dst->dtype))
+          Fail("ordinary copy source and destination dtypes disagree");
+      }
     }
     if (call->op.same_as(Fill::Get())) {
       Fill fill = Downcast<Fill>(ParseOperator(call));
@@ -318,6 +462,8 @@ private:
   arith::Analyzer analyzer_;
   Regions parameter_initialization_;
   bool fragment_slot_allowed_{true};
+  int64_t core_x_{-1};
+  int64_t core_y_{-1};
   Regions initialized_;
   std::unordered_map<Var, Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
       known_;

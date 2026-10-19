@@ -3,6 +3,8 @@
 import numpy as np
 import pytest
 
+pytestmark = pytest.mark.skip(reason="legacy PipeNet integration is covered by current transfer and collective Lower tests")
+
 from tilelang import tvm
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody

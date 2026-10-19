@@ -39,6 +39,19 @@ constexpr const char *kAccumulatorTableAttr = "tt.accumulator_table";
 constexpr const char *kComputeValueTableAttr = "tt.compute_value_table";
 constexpr const char *kComputeRequirementsAttr = "tt.compute_requirements";
 constexpr const char *kDFBTableAttr = "tt.dfb_table";
+constexpr const char *kDFBFamiliesAttr = "tt.dfb_families";
+constexpr const char *kDFBStorageGroupsAttr = "tt.dfb_storage_groups";
+constexpr const char *kDFBStorageGroupRelationsAttr =
+    "tt.dfb_storage_group_relations";
+constexpr const char *kInternalDFBStorageGroupsAttr =
+    "tt.internal_dfb_storage_groups";
+constexpr const char *kInternalDFBTransactionRelationsAttr =
+    "tt.internal_dfb_transaction_relations";
+constexpr const char *kAccumulatorFamiliesAttr = "tt.accumulator_families";
+constexpr const char *kComputeValueFamiliesAttr = "tt.compute_value_families";
+constexpr const char *kCommunicationStepFamiliesAttr =
+    "tt.communication_step_families";
+constexpr const char *kTransportFamiliesAttr = "tt.transport_families";
 constexpr const char *kPipeTableAttr = "tt.pipe_table";
 constexpr const char *kPipeTransferTableAttr = "tt.pipe_transfer_table";
 constexpr const char *kKernelOrderAttr = "tt.kernel_order";
@@ -47,12 +60,8 @@ constexpr const char *kCompactOriginalVersionAttr =
 constexpr const char *kCompactDFBFamiliesAttr = "tt.compact_dfb_families";
 constexpr const char *kCompactValueFamiliesAttr = "tt.compact_value_families";
 
-// Schema v3 retains immutable DFB descriptors and adds explicit storage reuse.
-// Keys are canonical decimal DFB IDs, with stable value-based string equality.
-// Groups: Map<String, Integer>, relation: Map<String, Array<Integer>> with
-// [zero-based iteration ordinal, ordinal % min(stages, extent)]. Composed
-// pipelines use [-1, 0] for one prologue/epilogue DFB in its own storage group.
-constexpr const char *kDFBStorageGroupsAttr = "tt.dfb_storage_groups";
+// Legacy v3 pipeline metadata. Current stage-marked Device IR consumes these
+// internal formation maps into typed storage-group descriptors and relations.
 constexpr const char *kPipelineRelationsAttr = "tt.pipeline_relations";
 constexpr const char *kPipelineStagesAttr = "tt.pipeline_stages";
 constexpr const char *kPipelineExtentAttr = "tt.pipeline_extent";
@@ -148,6 +157,34 @@ public:
                                              TensorBackingNode);
 };
 
+/*! \brief Proven physical Tensor storage for a complete logical DFB capacity.
+ *
+ * This is distinct from DFBDescriptor::tensor_backing, which records copy
+ * provenance. Current Lower leaves this unset until byte-range alias and
+ * lifetime proofs are implemented.
+ */
+class TensorStorageBackingNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t global_arg_index;
+  PrimExpr byte_offset;
+  PrimExpr byte_size;
+
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.TensorStorageBacking",
+                                    TensorStorageBackingNode, ffi::Object);
+};
+
+class TensorStorageBacking : public ffi::ObjectRef {
+public:
+  TVM_DLL TensorStorageBacking(int64_t global_arg_index, PrimExpr byte_offset,
+                               PrimExpr byte_size);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TensorStorageBacking,
+                                             ffi::ObjectRef,
+                                             TensorStorageBackingNode);
+};
+
 class OperationIdentityNode : public ffi::Object {
 public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
@@ -203,6 +240,150 @@ public:
                                              TensorDescriptorNode);
 };
 
+/*! \brief One load/store occurrence in a structured compute expression. */
+class TTAccessDescriptorNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t access_id;
+  tirx::Buffer buffer;
+  ffi::String access_kind;
+  tirx::BufferRegion logical_region;
+  ffi::Array<Integer> access_map;
+  ffi::String broadcast_kind;
+  ffi::Array<Integer> broadcast_axes;
+  Span source_span;
+
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.TTAccessDescriptor",
+                                    TTAccessDescriptorNode, ffi::Object);
+};
+
+class TTAccessDescriptor : public ffi::ObjectRef {
+public:
+  TVM_DLL TTAccessDescriptor(int64_t access_id, tirx::Buffer buffer,
+                             ffi::String access_kind,
+                             tirx::BufferRegion logical_region,
+                             ffi::Array<Integer> access_map,
+                             ffi::String broadcast_kind,
+                             ffi::Array<Integer> broadcast_axes,
+                             Span source_span);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TTAccessDescriptor, ffi::ObjectRef,
+                                             TTAccessDescriptorNode);
+};
+
+/*! \brief Structured-stage topology facts for one high-level communication site. */
+class NormalizedTopologyDescriptorNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t site_id;
+  ffi::String kind;
+  tirx::BufferRegion source_region;
+  tirx::BufferRegion destination_region;
+  ffi::Array<PrimExpr> source_coord;
+  ffi::Array<PrimExpr> group_begin;
+  ffi::Array<PrimExpr> group_end;
+  PrimExpr parameter;
+  ffi::String contract;
+  PrimExpr guard;
+  ffi::Array<PrimExpr> occurrence_extents;
+  Span source_span;
+
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL(
+      "tl.tenstorrent.NormalizedTopologyDescriptor",
+      NormalizedTopologyDescriptorNode, ffi::Object);
+};
+
+class NormalizedTopologyDescriptor : public ffi::ObjectRef {
+public:
+  TVM_DLL NormalizedTopologyDescriptor(
+      int64_t site_id, ffi::String kind, tirx::BufferRegion source_region,
+      tirx::BufferRegion destination_region,
+      ffi::Array<PrimExpr> source_coord, ffi::Array<PrimExpr> group_begin,
+      ffi::Array<PrimExpr> group_end, PrimExpr parameter,
+      ffi::String contract, PrimExpr guard,
+      ffi::Array<PrimExpr> occurrence_extents, Span source_span);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(NormalizedTopologyDescriptor,
+                                             ffi::ObjectRef,
+                                             NormalizedTopologyDescriptorNode);
+};
+
+/*! \brief Final high-level communication identity retained in Device IR. */
+class CommunicationDescriptorNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t communication_id;
+  ffi::String kind;
+  ffi::String algorithm;
+  tirx::BufferRegion source_region;
+  tirx::BufferRegion destination_region;
+  ffi::Array<PrimExpr> source_coord;
+  ffi::Array<PrimExpr> group_begin;
+  ffi::Array<PrimExpr> group_end;
+  PrimExpr parameter;
+  ffi::String contract;
+  ffi::Array<PrimExpr> occurrence_extents;
+  Span source_span;
+
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.CommunicationDescriptor",
+                                    CommunicationDescriptorNode, ffi::Object);
+};
+
+class CommunicationDescriptor : public ffi::ObjectRef {
+public:
+  TVM_DLL CommunicationDescriptor(
+      int64_t communication_id, ffi::String kind, ffi::String algorithm,
+      tirx::BufferRegion source_region, tirx::BufferRegion destination_region,
+      ffi::Array<PrimExpr> source_coord, ffi::Array<PrimExpr> group_begin,
+      ffi::Array<PrimExpr> group_end, PrimExpr parameter,
+      ffi::String contract, ffi::Array<PrimExpr> occurrence_extents,
+      Span source_span);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(CommunicationDescriptor,
+                                             ffi::ObjectRef,
+                                             CommunicationDescriptorNode);
+};
+
+/*! \brief One deterministic Device communication/collective algorithm step. */
+class CommunicationStepDescriptorNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t step_id;
+  int64_t communication_id;
+  int64_t occurrence;
+  ffi::String kind;
+  ffi::Optional<CoreCoord> source_core;
+  ffi::Optional<CoreCoord> destination_core;
+  int64_t source_dfb_id;
+  int64_t destination_dfb_id;
+  ffi::String owner_slot;
+  ffi::Array<Integer> dependencies;
+  PrimExpr parameter;
+  Span source_span;
+
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL(
+      "tl.tenstorrent.CommunicationStepDescriptor",
+      CommunicationStepDescriptorNode, ffi::Object);
+};
+
+class CommunicationStepDescriptor : public ffi::ObjectRef {
+public:
+  TVM_DLL CommunicationStepDescriptor(
+      int64_t step_id, int64_t communication_id, int64_t occurrence,
+      ffi::String kind, ffi::Optional<CoreCoord> source_core,
+      ffi::Optional<CoreCoord> destination_core, int64_t source_dfb_id,
+      int64_t destination_dfb_id, ffi::String owner_slot,
+      ffi::Array<Integer> dependencies, PrimExpr parameter, Span source_span);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(CommunicationStepDescriptor,
+                                             ffi::ObjectRef,
+                                             CommunicationStepDescriptorNode);
+};
+
 class DFBDescriptorNode : public ffi::Object {
 public:
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
@@ -241,6 +422,43 @@ public:
                                              DFBDescriptorNode);
 };
 
+/*! \brief One finite logical CB stream shared by compatible DFB generations. */
+class DFBStorageGroupDescriptorNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t storage_group_id;
+  DataType element_dtype;
+  ffi::Array<PrimExpr> tile_shape;
+  ffi::Array<PrimExpr> block_shape_in_tiles;
+  PrimExpr block_count;
+  ffi::String producer_slot;
+  CoreDomain producer_domain;
+  ffi::String consumer_slot;
+  CoreDomain consumer_domain;
+  ffi::Optional<TensorStorageBacking> storage_backing;
+  Span source_span;
+
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL(
+      "tl.tenstorrent.DFBStorageGroupDescriptor",
+      DFBStorageGroupDescriptorNode, ffi::Object);
+};
+
+class DFBStorageGroupDescriptor : public ffi::ObjectRef {
+public:
+  TVM_DLL DFBStorageGroupDescriptor(
+      int64_t storage_group_id, DataType element_dtype,
+      ffi::Array<PrimExpr> tile_shape,
+      ffi::Array<PrimExpr> block_shape_in_tiles, PrimExpr block_count,
+      ffi::String producer_slot, CoreDomain producer_domain,
+      ffi::String consumer_slot, CoreDomain consumer_domain,
+      ffi::Optional<TensorStorageBacking> storage_backing, Span source_span);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(
+      DFBStorageGroupDescriptor, ffi::ObjectRef,
+      DFBStorageGroupDescriptorNode);
+};
+
 /*! \brief Schema v5 persistent fragment, separate from published DFB values. */
 class AccumulatorDescriptorNode : public ffi::Object {
 public:
@@ -252,6 +470,7 @@ public:
   DataType accumulation_dtype;
   DataType output_dtype;
   int64_t full_k_tiles;
+  CoreDomain core_domain;
   Span source_span;
   static void RegisterReflection();
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.AccumulatorDescriptor",
@@ -265,6 +484,12 @@ public:
                                 DataType accumulation_dtype,
                                 DataType output_dtype, int64_t full_k_tiles,
                                 Span source_span);
+  TVM_DLL AccumulatorDescriptor(int64_t accumulator_id,
+                                tirx::BufferRegion accumulator_region,
+                                DataType input_dtype,
+                                DataType accumulation_dtype,
+                                DataType output_dtype, int64_t full_k_tiles,
+                                CoreDomain core_domain, Span source_span);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(AccumulatorDescriptor,
                                              ffi::ObjectRef,
                                              AccumulatorDescriptorNode);
@@ -280,6 +505,13 @@ public:
   int64_t version;
   int64_t previous_value_id;
   int64_t accumulator_id;
+  ffi::String value_kind;
+  ffi::Array<PrimExpr> logical_shape;
+  ffi::Array<PrimExpr> compute_tile_shape;
+  DataType dtype;
+  ffi::String owner_slot;
+  CoreDomain core_domain;
+  ffi::Array<Integer> materialization_refs;
   Span source_span;
   static void RegisterReflection();
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.tenstorrent.ComputeValueDescriptor",
@@ -290,6 +522,13 @@ public:
   TVM_DLL ComputeValueDescriptor(int64_t value_id, tirx::Buffer buffer,
                                  int64_t version, int64_t previous_value_id,
                                  int64_t accumulator_id, Span source_span);
+  TVM_DLL ComputeValueDescriptor(
+      int64_t value_id, tirx::Buffer buffer, int64_t version,
+      int64_t previous_value_id, int64_t accumulator_id,
+      ffi::String value_kind, ffi::Array<PrimExpr> logical_shape,
+      ffi::Array<PrimExpr> compute_tile_shape, DataType dtype,
+      ffi::String owner_slot, CoreDomain core_domain,
+      ffi::Array<Integer> materialization_refs, Span source_span);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ComputeValueDescriptor,
                                              ffi::ObjectRef,
                                              ComputeValueDescriptorNode);
@@ -342,10 +581,38 @@ public:
                                              DeviceIRIntColumnNode);
 };
 
-/*! \brief v9 representation of distinct resources sharing immutable fields.
- * Positions preserve the original table order; fields encode the varying
- * integers. Source parts delimit the integer columns in DFB source identities.
- * Expansion reconstructs one descriptor per position, never shared lifetimes.
+/*! \brief Family-aligned mapping from DFB instances to a logical CB stream. */
+class DFBStorageGroupRelationNode : public ffi::Object {
+public:
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
+      kTVMFFISEqHashKindTreeNode;
+  int64_t dfb_family_id;
+  DeviceIRIntColumn storage_group_ids;
+  DeviceIRIntColumn transaction_ordinals;
+  DeviceIRIntColumn pipeline_iterations;
+
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO_FINAL(
+      "tl.tenstorrent.DFBStorageGroupRelation",
+      DFBStorageGroupRelationNode, ffi::Object);
+};
+
+class DFBStorageGroupRelation : public ffi::ObjectRef {
+public:
+  TVM_DLL DFBStorageGroupRelation(int64_t dfb_family_id,
+                                  DeviceIRIntColumn storage_group_ids,
+                                  DeviceIRIntColumn transaction_ordinals,
+                                  DeviceIRIntColumn pipeline_iterations);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(
+      DFBStorageGroupRelation, ffi::ObjectRef,
+      DFBStorageGroupRelationNode);
+};
+
+/*! \brief Typed relation family for descriptors sharing immutable fields.
+ * Positions preserve deterministic logical order; named integer columns encode
+ * IDs, Core coordinates, occurrences, versions and dependencies. Source parts
+ * delimit integer columns embedded in DFB source identities. Legacy v9 and the
+ * stage-marked Device schema use distinct Module attrs around this common type.
  */
 class DeviceIRDescriptorFamilyNode : public ffi::Object {
 public:

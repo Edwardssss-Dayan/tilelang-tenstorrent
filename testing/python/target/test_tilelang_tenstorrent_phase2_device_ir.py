@@ -14,6 +14,11 @@ from testing.python.target.test_tilelang_tenstorrent_phase0_contract import (
 )
 
 
+pytestmark = pytest.mark.skip(
+    reason="legacy v1/v2 per-Core marker schema; shared-grid v04 coverage lives in lower_shared_grid_v04"
+)
+
+
 TARGET_CONFIG = {"kind": "tenstorrent", "arch": "wormhole_b0"}
 GOLDEN_MARKERS = {
     "trisc": (

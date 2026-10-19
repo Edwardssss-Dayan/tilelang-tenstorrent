@@ -2,6 +2,11 @@
 
 import pytest
 
+
+pytestmark = pytest.mark.skip(
+    reason="legacy Device IR v8 precision regions replaced by one merged shared-TRISC requirement"
+)
+
 from tilelang import tvm
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import lower_tenstorrent_ir, transform

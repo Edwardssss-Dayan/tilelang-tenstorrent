@@ -29,6 +29,7 @@
 #include <tvm/tirx/transform.h>
 
 #include <algorithm>
+#include <map>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -53,6 +54,33 @@ bool IsElementwiseBlock(const SBlock &block) {
          Downcast<ffi::String>(kind.value()) == "elementwise";
 }
 
+std::map<int64_t, TTAccessDescriptor>
+AccessTable(const SBlock &block) {
+  auto table = block->annotations.Get("tl.tt.access_table");
+  if (!table.has_value())
+    return {};
+  std::map<int64_t, TTAccessDescriptor> result;
+  for (const TTAccessDescriptor &access :
+       Downcast<ffi::Array<TTAccessDescriptor>>(table.value())) {
+    if (!access.defined() || access->access_id < 0 ||
+        !result.emplace(access->access_id, access).second)
+      return {};
+  }
+  return result;
+}
+
+ffi::Optional<TTAccessDescriptor>
+ExpressionAccess(const PrimExpr &expression,
+                 const std::map<int64_t, TTAccessDescriptor> &table) {
+  const auto *call = expression.as<CallNode>();
+  if (!call || !call->op.same_as(tenstorrent::compute_access()) ||
+      call->args.size() != 1 || !as_const_int(call->args[0]))
+    return std::nullopt;
+  auto found = table.find(*as_const_int(call->args[0]));
+  return found == table.end() ? ffi::Optional<TTAccessDescriptor>()
+                              : ffi::Optional<TTAccessDescriptor>(found->second);
+}
+
 bool IsDeviceAdd(const SBlock &block,
                  const ffi::Array<TTBufferMetadata> &metadata) {
   if (!IsElementwiseBlock(block)) {
@@ -60,45 +88,42 @@ bool IsDeviceAdd(const SBlock &block,
   }
   const auto *store = block->body.as<BufferStoreNode>();
   const auto *add = store == nullptr ? nullptr : store->value.as<AddNode>();
-  if (add == nullptr || !add->a.as<BufferLoadNode>() ||
-      !add->b.as<BufferLoadNode>()) {
+  auto table = AccessTable(block);
+  auto lhs_access = add ? ExpressionAccess(add->a, table)
+                        : ffi::Optional<TTAccessDescriptor>();
+  auto rhs_access = add ? ExpressionAccess(add->b, table)
+                        : ffi::Optional<TTAccessDescriptor>();
+  auto output_id = block->annotations.Get("tl.tt.output_access_id");
+  auto output_integer =
+      output_id.has_value() ? output_id.value().as<Integer>() : std::nullopt;
+  if (add == nullptr || !lhs_access.has_value() || !rhs_access.has_value() ||
+      !output_integer.has_value() ||
+      !table.count(output_integer.value()->value)) {
     return false;
   }
-  const Buffer &output = store->buffer;
-  const Buffer &lhs = add->a.as<BufferLoadNode>()->buffer;
-  const Buffer &rhs = add->b.as<BufferLoadNode>()->buffer;
+  const TTAccessDescriptor &output_access =
+      table.at(output_integer.value()->value);
+  const Buffer &output = output_access->buffer;
+  const Buffer &lhs = lhs_access.value()->buffer;
+  const Buffer &rhs = rhs_access.value()->buffer;
   if (lhs.same_as(rhs) || lhs.same_as(output) || rhs.same_as(output)) {
     return false;
-  }
-  // The implemented Device TIR transaction protocol currently requires two
-  // blocks per DFB. Other capacities remain valid structured computations.
-  for (const Buffer &buffer : {lhs, rhs, output}) {
-    bool supported_capacity = false;
-    for (const TTBufferMetadata &item : metadata) {
-      if (item->buffer.same_as(buffer) && item->dfb_block_count.has_value() &&
-          is_const_int(item->dfb_block_count.value(), 2)) {
-        supported_capacity = true;
-        break;
-      }
-    }
-    if (!supported_capacity)
-      return false;
   }
   const DataType dtype = output->dtype;
   if (dtype.lanes() != 1 ||
       !(dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32))) {
     return false;
   }
-  auto maps = Downcast<ffi::Map<Var, ffi::Array<Integer>>>(
-      block->annotations.at("tl.tt.access_maps"));
   for (const BufferRegion &region : block->reads) {
     if (region->buffer->dtype != dtype) {
       return false;
     }
   }
-  for (const auto &entry : maps) {
-    if (entry.second.size() != 2 || entry.second[0]->value != 0 ||
-        entry.second[1]->value != 1) {
+  for (const TTAccessDescriptor &access :
+       {lhs_access.value(), rhs_access.value(), output_access}) {
+    if (access->access_map.size() != 2 ||
+        access->access_map[0]->value != 0 ||
+        access->access_map[1]->value != 1) {
       return false;
     }
   }
@@ -869,8 +894,9 @@ private:
     Span span = block->span.defined() ? block->span : op->span;
     if (IsDeviceAdd(block, metadata_)) {
       const auto *add = store->value.as<AddNode>();
-      const Buffer &lhs = add->a.as<BufferLoadNode>()->buffer;
-      const Buffer &rhs = add->b.as<BufferLoadNode>()->buffer;
+      auto table = AccessTable(block);
+      const Buffer &lhs = ExpressionAccess(add->a, table).value()->buffer;
+      const Buffer &rhs = ExpressionAccess(add->b, table).value()->buffer;
       Annotations annotations{
           {"tt.compute_dtype", StringImm(DTypeName(output->dtype))},
           {"tt.compute_tile_shape",
@@ -884,13 +910,22 @@ private:
     }
     ComputeDTypeVerifier dtype_verifier;
     dtype_verifier(store->value);
-    auto access_maps = Downcast<ffi::Map<Var, ffi::Array<Integer>>>(
-        block->annotations.at("tl.tt.access_maps"));
+    auto access_table = AccessTable(block);
+    auto output_id = Downcast<Integer>(
+        block->annotations.at("tl.tt.output_access_id"));
+    Require(access_table.count(output_id->value),
+            "structured output access is missing");
+    const TTAccessDescriptor &output_access =
+        access_table.at(output_id->value);
     ffi::Array<BufferRegion> inputs;
     ffi::Array<ffi::Array<Integer>> maps;
-    for (const BufferRegion &read : block->reads) {
-      inputs.push_back(BufferRegion::FullRegion(read->buffer));
-      maps.push_back(access_maps.at(read->buffer->data));
+    ffi::Array<Integer> access_ids;
+    for (const auto &[id, access] : access_table) {
+      if (access->access_kind != "read")
+        continue;
+      inputs.push_back(BufferRegion::FullRegion(access->buffer));
+      maps.push_back(access->access_map);
+      access_ids.push_back(Integer(id));
     }
     const char *kind = inputs.empty()                ? "fill"
                        : store->value.as<CastNode>() ? "typecast"
@@ -898,8 +933,10 @@ private:
     Annotations annotations = BaseAnnotations(output, kind);
     annotations.Set("tt.expression", store->value);
     annotations.Set("tt.access_maps", maps);
-    return MakeCompute(BufferRegion::FullRegion(output), inputs, annotations,
-                       span);
+    annotations.Set("tt.access_ids", access_ids);
+    annotations.Set("tt.output_access_id", output_id);
+    return MakeCompute(BufferRegion::FullRegion(output_access->buffer), inputs,
+                       annotations, span);
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {

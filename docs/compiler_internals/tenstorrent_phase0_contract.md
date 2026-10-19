@@ -105,17 +105,16 @@ and DST indices, structured compute scheduling, TTKernel, EmitC, and C++.
 
 The active ABI reference was audited from an adjacent production source
 checkout during Phase 0, at commit
-`6e3051bb9b2f7bfbd5fd045aa38deb68b7a6e6bd`, package version
+`e49ce12c2bcd2350565632d9b51239e9eafb2546`, package version
 `1.1.9.dev51`. The public binding surface is `ttl.ir`, `ttl.dialects.ttl`,
 `ttl.dialects.ttcore`, `ttl.dialects.ttkernel`, `ttl.passmanager`, and
 `ttl.passes`; the expected registered pipeline is
 `ttl-to-ttkernel-pipeline`.
 
-That checkout is not vendored by this repository, and the current environment
-does not contain a built importable `ttl` package. The reference was therefore
-source-audited but not import- or runtime-validated here. The older planning
-material referenced commit `e49ce12c2bcd2350565632d9b51239e9eafb2546`;
-that drift must be reconciled before Phase 1 relies on unstable TT-Lang APIs.
-TTL codegen, the TTNN execution path, Add/dataflow lowering, and hardware
-validation remain blockers beyond Phase 1. Typed Device TIR metadata and the
-hardware-independent Phase 1 skeleton pipeline are implemented.
+The repository vendors that exact source as the `3rdparty/tt-lang` gitlink, but
+the current environment does not contain a built `ttlang-opt` or importable
+`ttl` package. The reference was therefore source-audited but not TTL parser or
+compile-only validated here. Current shared-grid TTL emission, the TTNN
+execution path, and hardware validation remain separate blockers. Typed Device
+TIR metadata and the hardware-independent Lower/verifier pipeline are
+implemented.

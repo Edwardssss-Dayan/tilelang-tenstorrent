@@ -2,6 +2,11 @@
 
 import pytest
 
+
+pytestmark = pytest.mark.skip(
+    reason="legacy PipeNet/per-Core SUMMA frontend contract replaced by high-level v04 communication"
+)
+
 from tilelang import tvm
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent import transform

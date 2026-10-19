@@ -4,6 +4,7 @@
  */
 
 #include "../../op/builtin.h"
+#include "../../op/utils.h"
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
@@ -33,6 +34,11 @@ constexpr const char *kTileShape = "tt.tile_shape";
 constexpr const char *kTensorBacked = "tt.tensor_backed";
 constexpr const char *kForeachSrc = "tl.tt.foreach_src";
 constexpr const char *kForeachDst = "tl.tt.foreach_dst";
+
+bool IsIntegerScalar(const PrimExpr &expr) {
+  return expr.dtype().lanes() == 1 && (expr.dtype().is_int() || expr.dtype().is_uint()) &&
+         !expr.dtype().is_bool();
+}
 
 using VarSet = std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 
@@ -123,6 +129,11 @@ public:
       ThrowMalformed("a PipeNet foreach loop cannot be both source and "
                      "destination");
     }
+    if (has_foreach_src || has_foreach_dst) {
+      ThrowUnsupported(
+          "legacy PipeNet foreach is not an active Lower input; use "
+          "T.comm.transfer/put/broadcast/all_gather/all_reduce");
+    }
     for (const char *key : {kForeachSrc, kForeachDst}) {
       if (auto descriptor = op->annotations.Get(key)) {
         if (!descriptor.value().as<ffi::String>().has_value()) {
@@ -162,6 +173,34 @@ public:
         ThrowUnsupported("operation '" + name +
                          "' has target-specific GPU semantics");
       }
+      if (StartsWith(name, "tl.tt.pipe_") || StartsWith(name, "tl.tt.is_")) {
+        ThrowUnsupported(
+            "legacy Pipe/PipeRef operations are not active Lower inputs; use "
+            "the high-level T.comm communication operations");
+      }
+      if (name == "tl.tt.transfer") {
+        ValidateCommunicationCall(ffi::GetRef<Call>(op), name, 10);
+        const auto *contract = op->args[8].as<StringImmNode>();
+        if (contract == nullptr ||
+            (contract->value != "point_to_point" &&
+             contract->value != "collective")) {
+          ThrowMalformed("tl.tt.transfer contract must be point_to_point or collective");
+        }
+      } else if (name == "tl.tt.all_gather") {
+        ValidateCommunicationCall(ffi::GetRef<Call>(op), name, 8);
+        const auto *axis = op->args[6].as<IntImmNode>();
+        if (axis == nullptr || (axis->value != 0 && axis->value != 1)) {
+          ThrowMalformed("tl.tt.all_gather axis must be the normalized value 0 or 1");
+        }
+      } else if (name == "tl.tt.all_reduce") {
+        ValidateCommunicationCall(ffi::GetRef<Call>(op), name, 8);
+        const auto *reduction = op->args[6].as<StringImmNode>();
+        if (reduction == nullptr ||
+            (reduction->value != "sum" && reduction->value != "max" &&
+             reduction->value != "min")) {
+          ThrowMalformed("tl.tt.all_reduce operation must be sum, max or min");
+        }
+      }
     }
     StmtExprVisitor::VisitExpr_(op);
   }
@@ -172,6 +211,43 @@ public:
   }
 
 private:
+  static void ValidateCommunicationCall(const Call &call,
+                                        const std::string &name,
+                                        size_t expected_arity) {
+    if (call->args.size() != expected_arity || !call.dtype().is_handle()) {
+      ThrowMalformed(name + " must retain its frozen " +
+                     std::to_string(expected_arity) +
+                     "-operand opaque frontend encoding");
+    }
+    BufferRegion source =
+        NormalizeToAccessRegion(call->args[0], kAccessRead).region;
+    BufferRegion destination =
+        NormalizeToAccessRegion(call->args[1], kAccessWrite).region;
+    auto shared = [](const Buffer &buffer) {
+      const std::string scope = buffer.scope();
+      return scope == "shared" || scope == "shared.dyn";
+    };
+    if (!shared(source->buffer) || !shared(destination->buffer)) {
+      ThrowMalformed(name + " requires shared/shared.dyn source and destination buffers");
+    }
+    for (size_t index = 2; index < 6; ++index) {
+      if (!IsIntegerScalar(call->args[index])) {
+        ThrowMalformed(name + " coordinates must be scalar integer expressions");
+      }
+    }
+    if (name == "tl.tt.transfer") {
+      for (size_t index = 6; index < 8; ++index) {
+        if (!IsIntegerScalar(call->args[index])) {
+          ThrowMalformed(name + " coordinates must be scalar integer expressions");
+        }
+      }
+    }
+    const auto *site = call->args[expected_arity - 1].as<IntImmNode>();
+    if (site == nullptr || site->dtype.is_bool() || site->value < 0) {
+      ThrowMalformed(name + " site_id must be a nonnegative compile-time integer");
+    }
+  }
+
   static void ValidateAllocationMetadata(const SBlock &block) {
     auto annotation = block->annotations.Get(kAllocBufferAnnotations);
     if (!annotation.has_value()) {
@@ -365,20 +441,21 @@ void ValidateLaunch(const PrimFunc &func, const std::string &function_name) {
 }
 
 IRModule ValidateModule(IRModule mod) {
-  size_t function_count = 0;
+  if (mod->functions.empty())
+    ThrowMalformed("IRModule contains no TIRX PrimFunc");
+  if (mod->functions.size() != 1)
+    ThrowUnsupported("Tenstorrent Lower accepts exactly one frontend PrimFunc");
   for (const auto &[global_var, base_func] : mod->functions) {
     auto func = base_func.as<PrimFunc>();
     if (!func.has_value()) {
-      continue;
+      ThrowUnsupported("non-PrimFunc global '" +
+                       std::string(global_var->name_hint) +
+                       "' is outside the single-operation Lower contract");
     }
-    ++function_count;
     const std::string function_name = global_var->name_hint;
     ValidateTarget(func.value(), function_name);
     ValidateParameters(func.value(), function_name);
     ValidateLaunch(func.value(), function_name);
-  }
-  if (function_count == 0) {
-    ThrowMalformed("IRModule contains no TIRX PrimFunc");
   }
   return mod;
 }

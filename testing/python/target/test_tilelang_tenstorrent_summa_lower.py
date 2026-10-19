@@ -5,6 +5,11 @@ from collections import Counter
 import numpy as np
 import pytest
 
+
+pytestmark = pytest.mark.skip(
+    reason="legacy PipeNet SUMMA Device schema replaced by shared-grid v04 collective lowering"
+)
+
 from tilelang import tvm
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir
 from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR

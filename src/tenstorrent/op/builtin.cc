@@ -47,6 +47,12 @@ TIR_DEFINE_TT_BUILTIN(pipe_send).set_num_inputs(2).set_attr<TCallEffectKind>(
 TIR_DEFINE_TT_BUILTIN(pipe_recv).set_num_inputs(2).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TT_BUILTIN(core_x).set_num_inputs(0).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kPure));
+
+TIR_DEFINE_TT_BUILTIN(core_y).set_num_inputs(0).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kPure));
+
 TIR_DEFINE_TT_BUILTIN(transfer).set_num_inputs(10).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
@@ -67,8 +73,20 @@ TIR_DEFINE_TT_BUILTIN(dfb_compute)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-TIR_DEFINE_TT_BUILTIN(dfb_load).set_num_inputs(1).set_attr<TCallEffectKind>(
-    "TCallEffectKind", Integer(CallEffectKind::kPure));
+TIR_DEFINE_TT_BUILTIN(dfb_load)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kPure))
+    .set_attr<TScriptDtypePrintLocation>(
+        "TScriptDtypePrintLocation",
+        Integer(ScriptDtypePrintLocation::kFirst));
+
+TIR_DEFINE_TT_BUILTIN(compute_access)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure))
+    .set_attr<TScriptDtypePrintLocation>(
+        "TScriptDtypePrintLocation",
+        Integer(ScriptDtypePrintLocation::kFirst));
 
 TIR_DEFINE_TT_BUILTIN(compute_precision)
     .set_num_inputs(1)
@@ -81,7 +99,10 @@ TIR_DEFINE_TT_BUILTIN(compute_value)
 TIR_DEFINE_TT_BUILTIN(compute_value_load)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kPure));
+                               Integer(CallEffectKind::kPure))
+    .set_attr<TScriptDtypePrintLocation>(
+        "TScriptDtypePrintLocation",
+        Integer(ScriptDtypePrintLocation::kFirst));
 TIR_DEFINE_TT_BUILTIN(compute_value_store)
     .set_num_inputs(2)
     .set_attr<TCallEffectKind>("TCallEffectKind",
@@ -144,6 +165,21 @@ TIR_DEFINE_TT_BUILTIN(dfb_to_tensor)
 
 TIR_DEFINE_TT_BUILTIN(dfb_add).set_num_inputs(4).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_local_copy)
+    .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_gather_copy)
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TT_BUILTIN(dfb_collective_reduce)
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TT_BUILTIN(accumulator_init)
     .set_num_inputs(1)
