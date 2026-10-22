@@ -93,3 +93,20 @@ validated lossless schedule for those programs. Logical Device numerical tests
 are separate from real TTL compile-only tests; absent compiler bindings cause
 the latter to skip, not to pass using substitute builders. Hardware execution
 and a production TTNN adapter are outside this implementation.
+
+## CPU numerical test support
+
+Shared Device IR traversal helpers and CPU reference models live together in
+`testing/python/target/test_tilelang_tenstorrent_utils.py`, alongside the hardware-independent
+target tests, not in the production backend or individual integration test files.
+The immutable-value and scheduled-stream
+models retain their separate execution semantics, while sharing dtype conversion.
+Both evaluate constants and `Cast` using the expression dtype and round
+`compute_value_store` results to the destination DFB dtype. This preserves wide
+integer/FP64 constants and models final BF16, FP16, and integer materialization
+without prematurely rounding the compute-local value.
+
+`testing/python/target/test_tilelang_tenstorrent_compute_values.py`
+tests these contracts directly for both models alongside lowered-IR
+integration cases. These are CPU test oracles, not evidence of TTL or hardware
+dtype support.
