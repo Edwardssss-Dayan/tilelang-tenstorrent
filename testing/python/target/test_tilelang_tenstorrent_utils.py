@@ -236,9 +236,10 @@ def interpret_values(mod, tensors):
                 assert output not in values
                 values[output] = _round(result, descriptors[output].buffer.dtype)
             elif name == "tl.tt.compute_value_store":
-                dfbs[args[1]] = _round(
-                    values[args[0]], dfb_descriptors[args[1]].element_dtype,
-                ).copy()
+                value_dtype = str(descriptors[args[0]].buffer.dtype)
+                dfb_dtype = str(dfb_descriptors[args[1]].element_dtype)
+                assert value_dtype == dfb_dtype, "compute_value_store must preserve dtype"
+                dfbs[args[1]] = values[args[0]].copy()
             elif name == "tl.tt.dfb_release":
                 del dfbs[args[0]]
             else:
@@ -397,7 +398,10 @@ def interpret(mod, inputs, seed=0):
             elif name == "tl.tt.accumulator_materialize":
                 dfbs[args[1]] = _round(accumulators.pop(args[0]), dfb_info[args[1]].element_dtype)
             elif name == "tl.tt.compute_value_store":
-                dfbs[args[1]] = _round(values[args[0]], dfb_info[args[1]].element_dtype).copy()
+                value_dtype = str(value_info[args[0]].buffer.dtype)
+                dfb_dtype = str(dfb_info[args[1]].element_dtype)
+                assert value_dtype == dfb_dtype, "compute_value_store must preserve dtype"
+                dfbs[args[1]] = values[args[0]].copy()
             elif name == "tl.tt.dfb_release":
                 assert args[0] not in pending, "Release before copy completion"
                 occupied.remove(args[0])
@@ -414,5 +418,3 @@ def interpret(mod, inputs, seed=0):
             advanced = True
         assert advanced, "Device streams deadlocked"
     raise AssertionError("Device stream instruction bound exceeded")
-
-

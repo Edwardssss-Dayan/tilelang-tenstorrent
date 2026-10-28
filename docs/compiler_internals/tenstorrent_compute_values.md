@@ -101,10 +101,11 @@ Shared Device IR traversal helpers and CPU reference models live together in
 target tests, not in the production backend or individual integration test files.
 The immutable-value and scheduled-stream
 models retain their separate execution semantics, while sharing dtype conversion.
-Both evaluate constants and `Cast` using the expression dtype and round
-`compute_value_store` results to the destination DFB dtype. This preserves wide
-integer/FP64 constants and models final BF16, FP16, and integer materialization
-without prematurely rounding the compute-local value.
+Both evaluate constants and explicit `Cast` nodes using the expression dtype.
+`compute_value_store` requires the compute value and destination DFB to have the
+same dtype and copies the already-typed value without an implicit conversion.
+This preserves wide integer/FP64 constants in the conversion helpers while
+keeping the Device IR exact-dtype materialization contract fail-closed.
 
 `testing/python/target/test_tilelang_tenstorrent_compute_values.py`
 tests these contracts directly for both models alongside lowered-IR

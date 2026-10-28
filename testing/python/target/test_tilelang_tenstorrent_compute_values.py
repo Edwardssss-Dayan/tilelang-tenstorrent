@@ -303,13 +303,23 @@ def test_interpreter_typed_expressions(monkeypatch, expr, expected, interpreter)
     (1.0 + 2**-30, "float64", "float64", 1.0 + 2**-30),
 ])
 @pytest.mark.parametrize("interpreter", [interpret_values, interpret])
-def test_interpreter_materialization_rounds_to_dfb_dtype(
+def test_interpreter_explicit_cast_materializes_exact_dtype(
     monkeypatch, value, expression_dtype, output_dtype, expected, interpreter,
 ):
     monkeypatch.setattr(D, "expand_current_device_tables", lambda mod: mod)
-    mod = _interpreter_expression_module(tirx.FloatImm(expression_dtype, value), output_dtype)
+    expression = tirx.Cast(output_dtype, tirx.FloatImm(expression_dtype, value))
+    mod = _interpreter_expression_module(expression, output_dtype)
     tensor_dtype = "float32" if output_dtype == "bfloat16" else output_dtype
     arrays, values = interpreter(mod, [np.zeros((1, 1), dtype=tensor_dtype)])
-    assert values[0].dtype == np.dtype(expression_dtype)
-    assert values[0][0, 0] == value
+    expected_storage_dtype = "float32" if output_dtype == "bfloat16" else output_dtype
+    assert values[0].dtype == np.dtype(expected_storage_dtype)
+    assert values[0][0, 0] == expected
     assert arrays[0][0, 0] == expected
+
+
+@pytest.mark.parametrize("interpreter", [interpret_values, interpret])
+def test_interpreter_rejects_cross_dtype_compute_value_store(monkeypatch, interpreter):
+    monkeypatch.setattr(D, "expand_current_device_tables", lambda mod: mod)
+    mod = _interpreter_expression_module(tirx.FloatImm("float32", 1.5), "bfloat16")
+    with pytest.raises(AssertionError, match="compute_value_store must preserve dtype"):
+        interpreter(mod, [np.zeros((1, 1), dtype="float32")])

@@ -122,7 +122,7 @@ Hardware-independent tests cover schema serialization, deterministic lowering,
 full-K lifetime, conflicting requirements, structured return and a CPU numerical
 reference executing the generated Device stream. The shared CPU models in
 `testing/python/target/test_tilelang_tenstorrent_utils.py` model typed constants and
-casts as well as destination-dtype rounding at materialization. The numerical
+explicit casts while requiring exact-dtype compute-value materialization. The numerical
 reference distinguishes final BF16 materialization from erroneous
 intermediate BF16 pack/reload; it does not certify hardware arithmetic.
 
