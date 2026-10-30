@@ -98,6 +98,24 @@ def test_supported_computation_still_returns_device_ir():
     assert lower_tenstorrent_ir(result, TARGET).same_as(result)
 
 
+@pytest.mark.parametrize(
+    "bound_target, lowering_target",
+    [
+        (TARGET, TARGET),
+        (TARGET, tvm.target.Target({"kind": "tenstorrent", "arch": "blackhole"})),
+        (tvm.target.Target("llvm"), TARGET),
+    ],
+)
+def test_frontend_prebound_target_is_rejected_without_mutation(bound_target, lowering_target):
+    frontend = tvm.IRModule({"main": program("float32").with_attr("target", bound_target)})
+    before = ir.save_json(frontend)
+
+    with pytest.raises(ValueError, match="target-free frontend IR.*pre-bound target"):
+        lower_tenstorrent_ir(frontend, lowering_target)
+
+    assert ir.save_json(frontend) == before
+
+
 def test_unconsumed_compute_is_rejected_before_host_device_filtering():
     with pytest.raises(NotImplementedError, match="compute block has no Device consumer"):
         TENSTORRENT_PIPELINE.lower(tvm.IRModule({"main": program()}), TARGET)

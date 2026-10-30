@@ -28,6 +28,17 @@ TENSTORRENT_LOWER_PASS_ORDER = (
 )
 
 
+def _reject_prebound_frontend_targets(mod: IRModule) -> None:
+    for symbol, func in mod.functions.items():
+        if not isinstance(func, tirx.PrimFunc):
+            continue
+        if func.attrs is not None and "target" in func.attrs:
+            raise ValueError(
+                "Tenstorrent lowering requires target-free frontend IR; "
+                f"function {symbol.name_hint!r} has a pre-bound target"
+            )
+
+
 def _has_compute_blocks(func: tirx.PrimFunc) -> bool:
     found = False
 
@@ -80,6 +91,7 @@ def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
     # Do not skip frontend validation based on an untrusted stage annotation.
     if stage:
         raise ValueError("Cannot re-lower normalized structured IR; pass the original frontend module instead")
+    _reject_prebound_frontend_targets(mod)
     if mod.attrs is not None and "tt.deferred_reasons" in mod.attrs:
         mod = mod.without_attr("tt.deferred_reasons")
 
