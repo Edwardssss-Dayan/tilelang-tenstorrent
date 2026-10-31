@@ -28,6 +28,7 @@ def _normalized_through_layout(name: str):
     mod = _bound(name)
     for pass_name in (
         "ValidateTenstorrentFrontendIR",
+        "CanonicalizeTTElementwise",
         "NormalizeTenstorrentLaunch",
         "NormalizeTenstorrentBufferMetadata",
         "NormalizeTenstorrentRegions",
@@ -54,6 +55,44 @@ def test_validate_rejects_missing_launch_as_malformed():
     mod = tirx.transform.BindTarget(TARGET)(tvm.IRModule({"no_launch": no_launch}))
     with pytest.raises(ValueError, match="Malformed Tenstorrent frontend IR"):
         _apply("ValidateTenstorrentFrontendIR", mod)
+
+
+def test_validate_rejects_vectorized_frontend_loop_without_mutation():
+    mod = _bound("add")
+
+    def vectorize_tiles_scope(node):
+        if isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
+            return tirx.For(node.loop_var, node.min, node.extent, tirx.ForKind.VECTORIZED, node.body)
+        return None
+
+    func = mod["add"]
+    malformed = tvm.IRModule({"add": func.with_body(tirx.stmt_functor.ir_transform(func.body, None, vectorize_tiles_scope))})
+    before = ir.save_json(malformed)
+    with pytest.raises(NotImplementedError, match="vectorized loops are not supported"):
+        _apply("ValidateTenstorrentFrontendIR", malformed)
+    assert ir.save_json(malformed) == before
+
+
+def test_validate_rejects_nontrivial_block_predicate_without_mutation():
+    mod = _bound("add")
+    wrapped = False
+
+    def predicate_tiles_scope(node):
+        nonlocal wrapped
+        if not wrapped and isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
+            wrapped = True
+            block = tirx.SBlock([], [], [], "predicated_tiles", node)
+            return tirx.SBlockRealize([], tirx.Var("condition", "bool"), block)
+        return None
+
+    func = mod["add"]
+    body = tirx.stmt_functor.ir_transform(func.body, None, predicate_tiles_scope)
+    assert wrapped
+    malformed = tvm.IRModule({"add": func.with_body(body)})
+    before = ir.save_json(malformed)
+    with pytest.raises(NotImplementedError, match="block predicates/T.where are not supported"):
+        _apply("ValidateTenstorrentFrontendIR", malformed)
+    assert ir.save_json(malformed) == before
 
 
 def test_launch_normalizes_static_2d_and_is_idempotent():

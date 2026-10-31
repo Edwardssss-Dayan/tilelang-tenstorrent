@@ -11,7 +11,6 @@ from tilelang.tenstorrent import language as T
 from tvm import ir, tirx
 
 from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute import (
-    batch_elementwise,
     cast_program,
     elementwise_program,
     fill_program,
@@ -22,7 +21,6 @@ from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute i
 )
 from testing.python.tenstorrent.legacy.test_tilelang_tenstorrent_phase2_device_ir import (
     _replace_dfb,
-    _replace_slot_body,
     _slots,
 )
 from testing.python.tenstorrent._support.reference import _calls, _core_statements, _with_core_statements
@@ -62,9 +60,7 @@ def reference_device(mod, inputs):
         if index in inputs:
             ordered.append(inputs[index])
         else:
-            ordered.append(
-                np.zeros(tuple(map(int, descriptor.shape)), dtype="float32")
-            )
+            ordered.append(np.zeros(tuple(map(int, descriptor.shape)), dtype="float32"))
     return {index: value for index, value in enumerate(run_device(mod, ordered))}
 
     # Retained below as documentation of the legacy v2 marker interpreter.
@@ -156,11 +152,10 @@ def reference_device(mod, inputs):
     return tensors
 
 
-@pytest.mark.parametrize("tiles", [False, True])
 @pytest.mark.parametrize("broadcast", [False, True])
 @pytest.mark.parametrize("inplace", [False, True])
-def test_elementwise_semantics(monkeypatch, tiles, broadcast, inplace):
-    mod = lower(monkeypatch, elementwise_program(tiles=tiles, broadcast=broadcast, inplace=inplace))
+def test_elementwise_semantics(monkeypatch, broadcast, inplace):
+    mod = lower(monkeypatch, elementwise_program(broadcast=broadcast, inplace=inplace))
     rng = np.random.default_rng(3)
     a = rng.uniform(0.5, 2, (64, 64)).astype("float32")
     b = rng.uniform(0.5, 2, (32 if broadcast else 64, 64)).astype("float32")
@@ -169,14 +164,7 @@ def test_elementwise_semantics(monkeypatch, tiles, broadcast, inplace):
     assert all(".generation" in str(d.source_buffer_identity) for d in mod.attrs["tt.dfb_table"])
 
 
-def test_tiles_parallel_device_equivalence(monkeypatch):
-    left = lower(monkeypatch, elementwise_program(tiles=False))
-    right = lower(monkeypatch, elementwise_program(tiles=True))
-    for slot in _slots(left):
-        ir.assert_structural_equal(_slots(left)[slot].body, _slots(right)[slot].body, map_free_vars=True)
-
-
-@pytest.mark.parametrize("program", [batch_elementwise, cast_program, fill_program, transpose_program])
+@pytest.mark.parametrize("program", [cast_program, fill_program, transpose_program])
 def test_device_capabilities_and_round_trip(monkeypatch, program):
     mod = lower(monkeypatch, program)
     loaded = ir.load_json(ir.save_json(mod))
@@ -228,12 +216,7 @@ def test_missing_wait_rejected(monkeypatch):
     mod = lower(monkeypatch, elementwise_program())
     statements = _core_statements(_slots(mod)["trisc"])
     statements = [
-        statement
-        for statement in statements
-        if not (
-            statement.value.op.name == "tl.tt.dfb_wait"
-            and int(statement.value.args[0]) == 0
-        )
+        statement for statement in statements if not (statement.value.op.name == "tl.tt.dfb_wait" and int(statement.value.args[0]) == 0)
     ]
     replace_core_statements(mod, "trisc", statements)
     with pytest.raises(ValueError, match="missing consumer wait"):
@@ -242,9 +225,7 @@ def test_missing_wait_rejected(monkeypatch):
 
 def test_cross_slot_cycle_rejected(monkeypatch):
     mod = lower(monkeypatch, elementwise_program())
-    statements = [
-        tirx.Evaluate(call) for call in _calls(_slots(mod)["ncrisc"].body)
-    ]
+    statements = [tirx.Evaluate(call) for call in _calls(_slots(mod)["ncrisc"].body)]
     export_wait = next(i for i, statement in enumerate(statements) if statement.value.op.name == "tl.tt.dfb_wait")
     statements.insert(0, statements.pop(export_wait))
     replace_core_statements(mod, "ncrisc", statements)
@@ -258,7 +239,7 @@ def test_read_before_write_rejected(monkeypatch):
         with T.Kernel(1, 1, threads=1):
             a = shared((64, 64))
             c = shared((64, 64))
-            for i, j in T.Parallel(64, 64):
+            for i, j in T.Tiles(c):
                 c[i, j] = a[i, j] * T.float32(2)
             T.copy(c, C)
 
@@ -273,7 +254,7 @@ def test_inout_and_static_loop(monkeypatch):
             a = shared((64, 64))
             T.copy(A, a)
             for _step in T.serial(3):
-                for i, j in T.Parallel(64, 64):
+                for i, j in T.Tiles(a):
                     a[i, j] = a[i, j] * T.float32(2)
             T.copy(a, A)
 
@@ -368,8 +349,8 @@ def test_dead_pure_write_eliminated(monkeypatch):
 
 
 def test_padded_input_shape_matches_producer(monkeypatch):
-    mod = lower(monkeypatch, batch_elementwise)
-    replace_compute_annotation(mod, "tt.input_shapes", ir_metadata([[2, 64, 64], [1, 1, 64]]))
+    mod = lower(monkeypatch, elementwise_program(broadcast=True))
+    replace_compute_annotation(mod, "tt.input_shapes", ir_metadata([[64, 64], [64, 64], [1, 64]]))
     with pytest.raises(ValueError, match="input logical shape disagrees with its Tensor producer"):
         transform.VerifyTenstorrentDeviceIR()(mod)
 

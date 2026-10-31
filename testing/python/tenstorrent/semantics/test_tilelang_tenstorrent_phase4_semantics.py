@@ -16,7 +16,6 @@ from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
 from tvm import ir, tirx
 
 from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute import (
-    batch_elementwise,
     cast_program,
     elementwise_program,
     fill_program,
@@ -198,9 +197,7 @@ def run_device(mod, inputs):
 
 def lower(func, arch="wormhole_b0"):
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
-    mod = D.expand_current_device_tables(
-        TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), target)
-    )
+    mod = D.expand_current_device_tables(TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), target))
     assert str(mod.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in mod.attrs
     restored = ir.load_json(ir.save_json(mod))
@@ -211,23 +208,14 @@ def lower(func, arch="wormhole_b0"):
 @pytest.mark.parametrize("broadcast", [False, True])
 @pytest.mark.parametrize("inplace", [False, True])
 @pytest.mark.parametrize("arch", ["wormhole_b0", "blackhole"])
-def test_final_tiles_and_parallel_expression_semantics(broadcast, inplace, arch):
+def test_final_tiles_expression_semantics(broadcast, inplace, arch):
     rng = np.random.default_rng(12)
     a = rng.uniform(1, 5, (64, 64)).astype(np.float32)
     b = rng.uniform(1, 5, (32 if broadcast else 64, 64)).astype(np.float32)
     expected = np.sqrt(a * a + (b[0:1] if broadcast else b)) / np.float32(2)
-    modules = [lower(elementwise_program(tiles=tiles, broadcast=broadcast, inplace=inplace), arch) for tiles in (False, True)]
-    ir.assert_structural_equal(*modules)
-    for module in modules:
-        output = run_device(module, [a, b, np.zeros_like(a)])[-1]
-        np.testing.assert_array_equal(output, expected)
-
-
-def test_final_batch_broadcast_semantics():
-    a = np.arange(2 * 64 * 64, dtype=np.float32).reshape(2, 64, 64)
-    b = np.arange(32 * 64, dtype=np.float32).reshape(1, 32, 64)
-    output = run_device(lower(batch_elementwise), [a, b, np.zeros_like(a)])[-1]
-    np.testing.assert_array_equal(output, a - b[:, :1, :])
+    module = lower(elementwise_program(broadcast=broadcast, inplace=inplace), arch)
+    output = run_device(module, [a, b, np.zeros_like(a)])[-1]
+    np.testing.assert_array_equal(output, expected)
 
 
 def test_final_fill_cast_transpose_semantics():
@@ -271,7 +259,7 @@ def tensor_inout(A: T.Tensor((64, 64), "float32")):
     with T.Kernel(1, 1, threads=1):
         a = shared((64, 64))
         T.copy(A, a)
-        for i, j in T.Parallel(64, 64):
+        for i, j in T.Tiles(a):
             a[i, j] = a[i, j] + T.float32(2)
         T.copy(a, A)
 

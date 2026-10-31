@@ -5,6 +5,7 @@
 
 #include "../../op/builtin.h"
 #include "../../op/utils.h"
+#include "attr.h"
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/attrs.h>
@@ -36,7 +37,8 @@ constexpr const char *kForeachSrc = "tl.tt.foreach_src";
 constexpr const char *kForeachDst = "tl.tt.foreach_dst";
 
 bool IsIntegerScalar(const PrimExpr &expr) {
-  return expr.dtype().lanes() == 1 && (expr.dtype().is_int() || expr.dtype().is_uint()) &&
+  return expr.dtype().lanes() == 1 &&
+         (expr.dtype().is_int() || expr.dtype().is_uint()) &&
          !expr.dtype().is_bool();
 }
 
@@ -106,22 +108,29 @@ public:
 
   void VisitStmt_(const ForNode *op) final {
     For loop = ffi::GetRef<For>(op);
+    if (op->kind == ForKind::kParallel) {
+      ThrowUnsupported(
+          "Tenstorrent elementwise compute requires T.Tiles; T.Parallel is "
+          "unsupported");
+    }
+    if (op->kind == ForKind::kVectorized) {
+      ThrowUnsupported(
+          "vectorized loops are not supported at the Tenstorrent frontend "
+          "boundary");
+    }
     if (op->kind == ForKind::kThreadBinding) {
       ffi::Optional<ffi::String> tag = GetThreadTag(loop);
-      if (!tag.has_value()) {
-        ThrowMalformed("a thread-binding loop is missing its thread tag");
-      }
-      const std::string tag_string = tag.value();
-      if (tag_string == "blockIdx.z") {
-        ThrowUnsupported("blockIdx.z is not part of the two-dimensional "
-                         "Tenstorrent Core grid");
-      }
-      if (!StartsWith(tag_string, "blockIdx.") &&
-          !StartsWith(tag_string, "threadIdx.")) {
-        ThrowUnsupported("thread binding '" + tag_string +
-                         "' has GPU-specific scheduling semantics");
-      }
+      const std::string tag_string =
+          tag.has_value() ? std::string(tag.value()) : std::string("<missing>");
+      ThrowUnsupported("nested thread binding '" + tag_string +
+                       "' is not supported in a Tenstorrent kernel body");
     }
+
+    for (const char *key :
+         {"tl_pipeline_order", "tl_pipeline_stage", "tl_pipeline_group"})
+      if (op->annotations.count(key))
+        ThrowUnsupported(
+            "T.Pipelined manual stage/order/group schedules are unsupported");
 
     bool has_foreach_src = op->annotations.count(kForeachSrc);
     bool has_foreach_dst = op->annotations.count(kForeachDst);
@@ -146,7 +155,12 @@ public:
         }
       }
     }
+    const bool tiles_scope = op->annotations.count(kTTTilesScope);
+    if (tiles_scope)
+      ++tiles_depth_;
     StmtExprVisitor::VisitStmt_(op);
+    if (tiles_scope)
+      --tiles_depth_;
   }
 
   void VisitStmt_(const WhileNode *op) final {
@@ -158,6 +172,24 @@ public:
     if (op->attr_key == tirx::attr::thread_extent) {
       ThrowUnsupported("pre-materialized GPU thread_extent attributes are "
                        "not accepted at the Tenstorrent frontend boundary");
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    if (tiles_depth_ == 0) {
+      ThrowUnsupported(
+          "BufferStore compute must be enclosed by T.Tiles or represented by "
+          "a supported TileOp");
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const SBlockRealizeNode *op) final {
+    if (!is_one(op->predicate)) {
+      ThrowUnsupported(
+          "non-trivial block predicates/T.where are not supported at the "
+          "Tenstorrent frontend boundary");
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -181,16 +213,17 @@ public:
       if (name == "tl.tt.transfer") {
         ValidateCommunicationCall(ffi::GetRef<Call>(op), name, 10);
         const auto *contract = op->args[8].as<StringImmNode>();
-        if (contract == nullptr ||
-            (contract->value != "point_to_point" &&
-             contract->value != "collective")) {
-          ThrowMalformed("tl.tt.transfer contract must be point_to_point or collective");
+        if (contract == nullptr || (contract->value != "point_to_point" &&
+                                    contract->value != "collective")) {
+          ThrowMalformed(
+              "tl.tt.transfer contract must be point_to_point or collective");
         }
       } else if (name == "tl.tt.all_gather") {
         ValidateCommunicationCall(ffi::GetRef<Call>(op), name, 8);
         const auto *axis = op->args[6].as<IntImmNode>();
         if (axis == nullptr || (axis->value != 0 && axis->value != 1)) {
-          ThrowMalformed("tl.tt.all_gather axis must be the normalized value 0 or 1");
+          ThrowMalformed(
+              "tl.tt.all_gather axis must be the normalized value 0 or 1");
         }
       } else if (name == "tl.tt.all_reduce") {
         ValidateCommunicationCall(ffi::GetRef<Call>(op), name, 8);
@@ -206,7 +239,13 @@ public:
   }
 
   void VisitStmt_(const SBlockNode *op) final {
-    ValidateAllocationMetadata(ffi::GetRef<SBlock>(op));
+    SBlock block = ffi::GetRef<SBlock>(op);
+    ValidateAllocationMetadata(block);
+    if (!op->match_buffers.empty()) {
+      ThrowUnsupported(
+          "match-buffer aliases are not supported at the Tenstorrent frontend "
+          "boundary");
+    }
     StmtExprVisitor::VisitStmt_(op);
   }
 
@@ -228,23 +267,27 @@ private:
       return scope == "shared" || scope == "shared.dyn";
     };
     if (!shared(source->buffer) || !shared(destination->buffer)) {
-      ThrowMalformed(name + " requires shared/shared.dyn source and destination buffers");
+      ThrowMalformed(
+          name + " requires shared/shared.dyn source and destination buffers");
     }
     for (size_t index = 2; index < 6; ++index) {
       if (!IsIntegerScalar(call->args[index])) {
-        ThrowMalformed(name + " coordinates must be scalar integer expressions");
+        ThrowMalformed(name +
+                       " coordinates must be scalar integer expressions");
       }
     }
     if (name == "tl.tt.transfer") {
       for (size_t index = 6; index < 8; ++index) {
         if (!IsIntegerScalar(call->args[index])) {
-          ThrowMalformed(name + " coordinates must be scalar integer expressions");
+          ThrowMalformed(name +
+                         " coordinates must be scalar integer expressions");
         }
       }
     }
     const auto *site = call->args[expected_arity - 1].as<IntImmNode>();
     if (site == nullptr || site->dtype.is_bool() || site->value < 0) {
-      ThrowMalformed(name + " site_id must be a nonnegative compile-time integer");
+      ThrowMalformed(name +
+                     " site_id must be a nonnegative compile-time integer");
     }
   }
 
@@ -316,6 +359,8 @@ private:
       }
     }
   }
+
+  int tiles_depth_{0};
 };
 
 std::vector<For> CollectLaunchPrefix(const PrimFunc &func) {

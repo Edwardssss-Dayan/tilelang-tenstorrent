@@ -1,7 +1,7 @@
 /*!
  * \file tenstorrent/transform/canonicalize_tiles.cc
- * \brief Capture Tiles and Parallel elementwise semantics before logical loop
- * binders disappear.
+ * \brief Capture Tiles elementwise semantics before logical loop binders
+ * disappear.
  */
 #include "../../op/copy.h"
 #include "../../op/region.h"
@@ -35,7 +35,6 @@ using Metadata =
     std::unordered_map<Var, Entries, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 using Allocations =
     std::unordered_map<Var, Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
-using AxisMaps = Map<Var, Array<Integer>>;
 using ValueKinds = Map<Var, String>;
 
 [[noreturn]] void ThrowElementwiseError(const std::string &message) {
@@ -322,16 +321,16 @@ private:
       int64_t expected =
           axes[axis]->value < 0 ? padding : Static(domain[axis], "domain");
       int64_t actual = Static(buffer->shape[axis], "buffer shape");
-      bool full_shape_broadcast = axes[axis]->value < 0 &&
-                                  actual == Static(domain[axis], "domain");
+      bool full_shape_broadcast =
+          axes[axis]->value < 0 && actual == Static(domain[axis], "domain");
       Require(actual == expected || full_shape_broadcast ||
-                  (value_kind == "compute_fragment" &&
-                   axes[axis]->value < 0 && actual == 1),
+                  (value_kind == "compute_fragment" && axes[axis]->value < 0 &&
+                   actual == 1),
               "buffer '" + std::string(buffer->name) +
                   "' shape does not match identity or compact padded broadcast "
-                  "shape on axis " + std::to_string(axis) + " (actual=" +
-                  std::to_string(actual) + ", expected=" +
-                  std::to_string(expected) + ", domain=" +
+                  "shape on axis " +
+                  std::to_string(axis) + " (actual=" + std::to_string(actual) +
+                  ", expected=" + std::to_string(expected) + ", domain=" +
                   std::to_string(Static(domain[axis], "domain")) + ")");
     }
     auto record = allocation_.metadata.find(buffer->data);
@@ -532,9 +531,7 @@ private:
 SBlockRealize ApplyPlan(const ScopePlan &plan) {
   Array<BufferRegion> reads, writes;
   Array<TTAccessDescriptor> access_table;
-  AxisMaps maps;
   ValueKinds value_kinds;
-  Map<Var, Map<String, ffi::Any>> recipes;
   int64_t output_access_id = -1;
   auto add_effect = [](Array<BufferRegion> *effects, const Buffer &buffer) {
     for (const BufferRegion &region : *effects)
@@ -544,19 +541,12 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
   };
   for (const Access &access : plan.accesses) {
     Array<Range> ranges;
-    Array<PrimExpr> logical, physical_tiles;
     Array<Integer> broadcast_axes;
     for (size_t axis = 0; axis < plan.domain.size(); ++axis) {
       PrimExpr extent = access.axes[axis]->value < 0
                             ? make_const(plan.domain[axis].dtype(), 1)
                             : plan.domain[axis];
       ranges.push_back(Range::FromMinExtent(make_zero(extent.dtype()), extent));
-      logical.push_back(extent);
-      physical_tiles.push_back(
-          make_const(access.buffer->shape[axis].dtype(),
-                     (Static(access.buffer->shape[axis], "shape") +
-                      (axis + 2 < plan.domain.size() ? 0 : 31)) /
-                         (axis + 2 < plan.domain.size() ? 1 : 32)));
       if (access.axes[axis]->value < 0)
         broadcast_axes.push_back(Integer(axis));
     }
@@ -567,28 +557,18 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
       add_effect(&writes, access.buffer);
       output_access_id = access.access_id;
     }
-    maps.Set(access.buffer->data, access.axes);
     value_kinds.Set(access.buffer->data, GetValueKind(access.buffer));
     String kind =
-        broadcast_axes.empty()
-            ? String("identity")
-            : plan.domain.size() == 2
-                  ? (broadcast_axes.size() == 2
-                         ? String("scalar")
-                         : (broadcast_axes[0]->value == 0 ? String("row")
-                                                         : String("column")))
-                  : String("batch");
+        broadcast_axes.empty() ? String("identity")
+        : plan.domain.size() == 2
+            ? (broadcast_axes.size() == 2
+                   ? String("scalar")
+                   : (broadcast_axes[0]->value == 0 ? String("row")
+                                                    : String("column")))
+            : String("batch");
     access_table.push_back(TTAccessDescriptor(
         access.access_id, access.buffer, access.read ? "read" : "write", region,
         access.axes, kind, broadcast_axes, access.span));
-    if (!broadcast_axes.empty()) {
-      recipes.Set(access.buffer->data,
-                  {{"broadcast_kind", kind},
-                   {"broadcast_axes", broadcast_axes},
-                   {"logical_region", logical},
-                   {"physical_shape", access.buffer->shape},
-                   {"block_shape", physical_tiles}});
-    }
   }
   Array<PrimExpr> block_shape;
   Array<String> iterator_types;
@@ -608,9 +588,7 @@ SBlockRealize ApplyPlan(const ScopePlan &plan) {
       {kTTIteratorTypes, iterator_types},
       {kTTAccessTable, access_table},
       {kTTOutputAccessID, Integer(output_access_id)},
-      {kTTAccessMaps, maps},
-      {kTTValueKinds, value_kinds},
-      {kTTBroadcastRecipes, recipes}};
+      {kTTValueKinds, value_kinds}};
   Require(output_access_id >= 0,
           "structured computation has no output access descriptor");
   TemplateBuilder builder(plan);
@@ -685,15 +663,27 @@ public:
       if (match->source->buffer->data.same_as(buffer_->data))
         valid_ = false;
     }
-    // Captured templates replace logical indices with zero. Their read
-    // descriptors retain the accessed region and must govern repeat passes.
+    // Captured templates replace logical indices with zero. The per-access
+    // descriptors retain the logical region and must govern repeat passes.
     if (op->annotations.count(kTTComputeKind)) {
-      for (const BufferRegion &region : op->reads) {
-        if (region->buffer->data.same_as(buffer_->data) &&
-            (!region->buffer.same_as(buffer_) || region->region.size() != 2 ||
-             !is_zero(region->region[1]->min) ||
-             !is_one(region->region[1]->extent)))
-          valid_ = false;
+      auto value = op->annotations.Get(kTTAccessTable);
+      auto accesses = value.has_value()
+                          ? value.value().as<Array<TTAccessDescriptor>>()
+                          : std::nullopt;
+      if (!accesses.has_value()) {
+        valid_ = false;
+      } else {
+        for (const TTAccessDescriptor &access : accesses.value()) {
+          if (!access.defined() || !access->buffer->data.same_as(buffer_->data))
+            continue;
+          const BufferRegion &region = access->logical_region;
+          if (access->access_kind != "read" ||
+              !access->buffer.same_as(buffer_) ||
+              !region->buffer.same_as(buffer_) || region->region.size() != 2 ||
+              !is_zero(region->region[1]->min) ||
+              !is_one(region->region[1]->extent))
+            valid_ = false;
+        }
       }
     }
     StmtExprVisitor::VisitStmt_(op);
@@ -727,14 +717,13 @@ public:
   }
   Stmt VisitStmt_(const ForNode *op) final {
     bool tiles = op->annotations.count(kTTTilesScope);
-    if (tiles || op->kind == ForKind::kParallel) {
+    if (tiles) {
       auto target = func_->GetAttr<Target>(tvm::attr::kTarget);
       Require(target.has_value() && target.value()->kind->name == "tenstorrent",
               "canonicalization requires a bound Tenstorrent target");
-      // The explicit Tiles marker selects its stricter frontend contract.
       // Capture the whole loop chain before visiting its nested binders.
-      ScopeAnalyzer analyzer(allocation_, tiles, scalar_parameters_);
-      return ApplyPlan(analyzer.Analyze(ffi::GetRef<For>(op), tiles));
+      ScopeAnalyzer analyzer(allocation_, true, scalar_parameters_);
+      return ApplyPlan(analyzer.Analyze(ffi::GetRef<For>(op), true));
     }
     Require(!HasFrontendTilesAnnotations(op->annotations),
             "orphan frontend T.Tiles annotations without a tiles_scope root");
@@ -828,8 +817,8 @@ public:
             "structured output descriptor disagrees with store Buffer");
     Require(!op->predicate.has_value(),
             "structured store predicate is unsupported");
-    return BufferStore(op->buffer, VisitExpr(op->value),
-                       RestoreIndices(output), std::nullopt, op->span);
+    return BufferStore(op->buffer, VisitExpr(op->value), RestoreIndices(output),
+                       std::nullopt, op->span);
   }
 
 private:
@@ -922,8 +911,7 @@ Stmt MergeComputeBranch(const IfThenElse &branch,
   TemplateRestorer then_restorer(
       Downcast<Array<TTAccessDescriptor>>(
           then_block.value()->annotations.at(kTTAccessTable)),
-      Downcast<Integer>(
-          then_block.value()->annotations.at(kTTOutputAccessID))
+      Downcast<Integer>(then_block.value()->annotations.at(kTTOutputAccessID))
           ->value,
       variables);
   then_store = Downcast<BufferStore>(then_restorer(then_store));
@@ -933,8 +921,7 @@ Stmt MergeComputeBranch(const IfThenElse &branch,
     TemplateRestorer else_restorer(
         Downcast<Array<TTAccessDescriptor>>(
             else_block.value()->annotations.at(kTTAccessTable)),
-        Downcast<Integer>(
-            else_block.value()->annotations.at(kTTOutputAccessID))
+        Downcast<Integer>(else_block.value()->annotations.at(kTTOutputAccessID))
             ->value,
         variables);
     otherwise =
@@ -955,10 +942,15 @@ Stmt MergeComputeBranch(const IfThenElse &branch,
 class ComputeVerifier : public StmtVisitor {
 public:
   void Verify(const Stmt &body) { VisitStmt(body); }
-  explicit ComputeVerifier(const PrimFunc &func) : func_(func) {
+  explicit ComputeVerifier(const PrimFunc &func,
+                           bool allow_raw_frontend_scopes = false)
+      : func_(func), allow_raw_frontend_scopes_(allow_raw_frontend_scopes) {
     allocation_.Collect(func->body);
   }
   void VisitStmt_(const ForNode *op) final {
+    if (allow_raw_frontend_scopes_ &&
+        HasFrontendTilesAnnotations(op->annotations))
+      return;
     Require(!HasFrontendTilesAnnotations(op->annotations),
             "uncanonicalized frontend T.Tiles scope");
     bool scalar = IsStaticScalarLoop(ffi::GetRef<For>(op));
@@ -993,7 +985,7 @@ public:
     for (const char *key :
          {kTTComputeKind, kTTTilesStage, kTTLogicalDomain, kTTPhysicalTileShape,
           kTTBlockShape, kTTIteratorTypes, kTTAccessTable, kTTOutputAccessID,
-          kTTAccessMaps, kTTBroadcastRecipes, kTTValueKinds}) {
+          kTTValueKinds}) {
       Require(op->annotations.count(key),
               std::string("structured block missing metadata ") + key);
     }
@@ -1005,17 +997,17 @@ public:
     Require(value_kinds.has_value(),
             "invalid structured tl.tt.value_kinds schema: expected "
             "Map<Var, String> keyed by Buffer data identity");
-    Require(
-        domain.has_value() && domain.value().size() >= 2 &&
-            access_table.has_value() && output_access.has_value(),
-        "invalid structured logical domain or access table schema");
+    Require(domain.has_value() && domain.value().size() == 2 &&
+                access_table.has_value() && output_access.has_value(),
+            "structured elementwise logical domain must have rank 2 with a "
+            "valid access table");
     Array<Var> variables;
     for (const PrimExpr &extent : domain.value()) {
       Static(extent, "structured logical domain");
       variables.push_back(Var("tt_verify_axis", extent.dtype()));
     }
-    TemplateRestorer restorer(access_table.value(), output_access.value()->value,
-                              variables);
+    TemplateRestorer restorer(access_table.value(),
+                              output_access.value()->value, variables);
     Stmt body = restorer(op->body);
     for (int axis = static_cast<int>(variables.size()) - 1; axis >= 0; --axis) {
       body = For(variables[axis], make_zero(variables[axis].dtype()),
@@ -1048,6 +1040,7 @@ private:
   PrimFunc func_;
   AllocationCollector allocation_;
   Array<Var> scalar_parameters_;
+  bool allow_raw_frontend_scopes_{false};
 };
 
 } // namespace
@@ -1055,6 +1048,11 @@ private:
 tvm::transform::Pass CanonicalizeTTElementwise() {
   auto pass_func = [](PrimFunc func, const IRModule &,
                       const tvm::transform::PassContext &) {
+    // Diagnose malformed existing blocks before analyzing any remaining raw
+    // Tiles scope. The full verifier below still rejects every unconsumed
+    // scope.
+    ComputeVerifier existing_verifier(func, true);
+    existing_verifier.Verify(func->body);
     Canonicalizer rewriter(func);
     Stmt body = rewriter(func->body);
     if (!body.same_as(func->body))

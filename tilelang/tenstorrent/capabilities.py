@@ -111,15 +111,15 @@ def lower_capability(
     ):
         return reject(f"Unknown Lower operation {operation!r}")
     if operation == "pipe":
-        return reject(
-            "PipeNet is a legacy compatibility frontend and is not an active Lower input"
-        )
+        return reject("PipeNet is a legacy compatibility frontend and is not an active Lower input")
     input_dtype = str(input_dtype)
     output_dtype = input_dtype if output_dtype is None else str(output_dtype)
     if input_dtype not in ("bfloat16", "float32") or output_dtype not in ("bfloat16", "float32"):
         return reject("Device Lower storage supports scalar BF16/FP32 only")
     if rank < 1 or tuple(tile_shape) != (32, 32):
         return reject("Device Lower requires positive rank and 32x32 tiles")
+    if operation == "elementwise" and rank != 2:
+        return reject("Tenstorrent elementwise requires a rank-2 T.Tiles domain")
     if shape_class != "static_tile_aligned":
         return reject("Device Lower requires positive static tile-aligned shapes; padding/masks are not implemented")
     if memory_layout != "interleaved" or sharded or not compact or aliased:

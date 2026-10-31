@@ -38,7 +38,7 @@ def _make_frontend_programs():
             )
             T.copy(A, a)
             T.copy(B, b)
-            for i, j in T.Parallel(32, 32):
+            for i, j in T.Tiles(c):
                 c[i, j] = a[i, j] + b[i, j]
             T.copy(c, C)
 
@@ -234,8 +234,8 @@ def test_frozen_target_and_execution_preflight_matches_registered_backend():
 def test_structured_compute_precedes_device_lowering_in_pass_order():
     assert TENSTORRENT_LOWER_PASS_ORDER == (
         "BindTarget",
-        "CanonicalizeTTElementwise",
         "ValidateTenstorrentFrontendIR",
+        "CanonicalizeTTElementwise",
         "NormalizeTenstorrentLaunch",
         "NormalizeTenstorrentBufferMetadata",
         "VerifyTTGemmAccumulators",

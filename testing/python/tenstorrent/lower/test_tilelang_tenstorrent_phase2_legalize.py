@@ -39,7 +39,7 @@ def float32_add(
         c = _shared(dtype=T.float32)
         T.copy(A, a)
         T.copy(B, b)
-        for i, j in T.Parallel(32, 32):
+        for i, j in T.Tiles(c):
             c[i, j] = a[i, j] + b[i, j]
         T.copy(c, C)
 
@@ -56,7 +56,7 @@ def subtract(
         c = _shared()
         T.copy(A, a)
         T.copy(B, b)
-        for i, j in T.Parallel(32, 32):
+        for i, j in T.Tiles(c):
             c[i, j] = a[i, j] - b[i, j]
         T.copy(c, C)
 
@@ -73,7 +73,7 @@ def broadcast_add(
         c = _shared()
         T.copy(A, a)
         T.copy(B, b)
-        for i, j in T.Parallel(32, 32):
+        for i, j in T.Tiles(c):
             c[i, j] = a[0, j] + b[i, j]
         T.copy(c, C)
 
@@ -90,7 +90,7 @@ def partial_copy_add(
         c = _shared()
         T.copy(A[0:16, 0:32], a[0:16, 0:32])
         T.copy(B, b)
-        for i, j in T.Parallel(32, 32):
+        for i, j in T.Tiles(c):
             c[i, j] = a[i, j] + b[i, j]
         T.copy(c, C)
 
@@ -107,7 +107,7 @@ def single_buffer_add(
         c = _shared()
         T.copy(A, a)
         T.copy(B, b)
-        for i, j in T.Parallel(32, 32):
+        for i, j in T.Tiles(c):
             c[i, j] = a[i, j] + b[i, j]
         T.copy(c, C)
 
@@ -115,9 +115,9 @@ def single_buffer_add(
 def _normalized(func):
     mod = tirx.transform.BindTarget(TARGET)(tvm.IRModule({"main": func}))
     for compiler_pass in (
+        transform.ValidateTenstorrentFrontendIR(),
         transform.CanonicalizeTTElementwise(),
         transform.VerifyTTComputeBlocks(),
-        transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
         transform.NormalizeTenstorrentRegions(),

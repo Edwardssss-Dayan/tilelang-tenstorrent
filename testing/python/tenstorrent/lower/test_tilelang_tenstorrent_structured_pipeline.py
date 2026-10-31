@@ -9,20 +9,21 @@ from tilelang.tenstorrent.pipeline import TENSTORRENT_PIPELINE
 from tvm import ir, tirx
 
 TARGET = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
+METADATA = {"tt.tile_shape": (32, 32), "tt.dfb_block_count": 2}
 
 
 def program(dtype="float16", *, initialize=True, partial=False):
     @T.prim_func
     def main(A: T.Tensor((32, 32), dtype), C: T.Tensor((32, 32), dtype)):
         with T.Kernel(1, 1, threads=1):
-            a = T.alloc_shared((32, 32), dtype)
-            c = T.alloc_shared((32, 32), dtype)
+            a = T.alloc_shared((32, 32), dtype, annotations=METADATA)
+            c = T.alloc_shared((32, 32), dtype, annotations=METADATA)
             if initialize:
                 if partial:
                     T.copy(A[0:16, 0:32], a[0:16, 0:32])
                 else:
                     T.copy(A, a)
-            for i, j in T.Parallel(32, 32):
+            for i, j in T.Tiles(c):
                 c[i, j] = a[i, j] + T.cast(1, dtype)
             T.copy(c, C)
 

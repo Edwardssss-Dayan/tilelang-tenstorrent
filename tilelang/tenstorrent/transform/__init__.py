@@ -9,7 +9,7 @@ tvm_ffi.register_error("NotImplementedError", NotImplementedError)
 
 
 def CanonicalizeTTElementwise():
-    """Capture Tiles and supported Parallel loops as structured compute blocks.
+    """Capture rank-2 Tiles scopes as structured compute blocks.
 
     Run after BindTarget and before frontend normalization or loop/block
     lowering so the shared analysis can preserve logical access relations.
@@ -42,6 +42,7 @@ def VerifyTTGemmAccumulators():
 
 
 def ValidateTenstorrentFrontendIR():
+    """Validate target-bound raw Frontend syntax and module ABI."""
     return _ffi_api.ValidateTenstorrentFrontendIR()  # type: ignore[attr-defined]
 
 

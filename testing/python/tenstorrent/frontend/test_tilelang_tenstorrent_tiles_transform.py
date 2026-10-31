@@ -6,6 +6,7 @@ from tilelang import transform, tvm
 from tilelang.backend import create_backend_context
 from tilelang.tenstorrent import execution_backend
 from tilelang.tenstorrent import language as T
+from tilelang.tenstorrent.device_ir import TTAccessDescriptor
 from tvm import ir, tirx
 
 
@@ -122,6 +123,15 @@ def _reject(mod, match):
     assert ir.save_json(mod) == before, "A failed analysis must not partially rewrite its input"
 
 
+def _reject_frontend(mod, match):
+    from tilelang.tenstorrent import transform as tt_transform
+
+    before = ir.save_json(mod)
+    with pytest.raises((NotImplementedError, ValueError), match="(?i)" + match):
+        tt_transform.ValidateTenstorrentFrontendIR()(mod)
+    assert ir.save_json(mod) == before, "Frontend validation must be read-only"
+
+
 @pytest.mark.parametrize("shape,block_shape", [((32, 32), [1, 1]), ((64, 64), [2, 2]), ((128, 32), [4, 1])])
 def test_identity_captures_full_regions_and_tile_geometry(shape, block_shape):
     mod = _canonicalize(_module(shape))
@@ -137,8 +147,9 @@ def test_identity_captures_full_regions_and_tile_geometry(shape, block_shape):
     assert _effects_by_name(block.writes) == {"C": list(shape)}
     for region in [*block.reads, *block.writes]:
         assert _integers([dim.min for dim in region.region]) == [0, 0]
-        assert _integers(block.annotations["tl.tt.access_maps"][region.buffer.data]) == [0, 1]
-    assert not block.annotations["tl.tt.broadcast_recipes"]
+    assert all(_integers(access.access_map) == [0, 1] for access in block.annotations["tl.tt.access_table"])
+    assert "tl.tt.access_maps" not in block.annotations
+    assert "tl.tt.broadcast_recipes" not in block.annotations
     assert isinstance(block.body, tirx.BufferStore)
     assert _integers(block.body.indices) == [0, 0]
     assert isinstance(block.body.value, tirx.Add)
@@ -200,11 +211,7 @@ def test_padded_broadcast_preserves_compact_operand_recipe(kind, b_shape, axes, 
 
     (block,) = _blocks(_canonicalize(_module((64, 256), b_shape=b_shape, expression=expression)))
     operand = next(region for region in block.reads if region.buffer.name == "B")
-    access = next(
-        entry
-        for entry in block.annotations["tl.tt.access_table"]
-        if entry.buffer.name == "B"
-    )
+    access = next(entry for entry in block.annotations["tl.tt.access_table"] if entry.buffer.name == "B")
     assert _integers([dim.extent for dim in access.logical_region.region]) == logical
     assert _integers(operand.buffer.shape) == list(b_shape)
     assert _integers(access.access_map) == axes
@@ -222,14 +229,12 @@ def test_different_access_maps_for_one_buffer_keep_distinct_access_ids():
             expression=lambda a, b, c, ij: a[tuple(ij)] + a[0, ij[1]],
         )
     )
-    reads = [
-        access
-        for access in _blocks(mod)[0].annotations["tl.tt.access_table"]
-        if str(access.access_kind) == "read"
-    ]
+    reads = [access for access in _blocks(mod)[0].annotations["tl.tt.access_table"] if str(access.access_kind) == "read"]
     assert [int(access.access_id) for access in reads] == [0, 1]
     assert [_integers(access.access_map) for access in reads] == [[0, 1], [-1, 1]]
     assert reads[0].buffer.same_as(reads[1].buffer)
+    assert "tl.tt.access_maps" not in _blocks(mod)[0].annotations
+    assert "tl.tt.broadcast_recipes" not in _blocks(mod)[0].annotations
 
 
 @pytest.mark.parametrize("outer_loop,twice", [(False, True), (True, False)])
@@ -253,7 +258,7 @@ def test_idempotency_and_json_roundtrip_preserve_buffer_identity(broadcast):
     transform.VerifyTTComputeBlocks()(restored)
     (block,) = _blocks(restored)
     for effect in [*block.reads, *block.writes]:
-        assert effect.buffer.data in block.annotations["tl.tt.access_maps"]
+        assert any(access.buffer.data.same_as(effect.buffer.data) for access in block.annotations["tl.tt.access_table"])
 
 
 @pytest.mark.parametrize("flat_allocations", [False, True])
@@ -428,14 +433,24 @@ def _change_compute_block(mod, change):
         "tl.tt.physical_tile_shape",
         "tl.tt.block_shape",
         "tl.tt.iterator_types",
-        "tl.tt.access_maps",
-        "tl.tt.broadcast_recipes",
+        "tl.tt.access_table",
+        "tl.tt.output_access_id",
         "tl.tt.value_kinds",
     ],
 )
 def test_verifier_rejects_missing_contract_metadata(key):
     mod = _change_compute_block(_canonicalize(_module()), lambda fields: fields["annotations"].pop(key))
     with pytest.raises((tvm.error.TVMError, ValueError), match="tl.tt|metadata|structured"):
+        transform.VerifyTTComputeBlocks()(mod)
+
+
+@pytest.mark.parametrize("key", ["tl.tt.access_maps", "tl.tt.broadcast_recipes"])
+def test_verifier_rejects_legacy_per_buffer_access_metadata(key):
+    def add_legacy_metadata(fields):
+        fields["annotations"][key] = {}
+
+    mod = _change_compute_block(_canonicalize(_module()), add_legacy_metadata)
+    with pytest.raises((tvm.error.TVMError, ValueError), match="unsupported structured block annotation"):
         transform.VerifyTTComputeBlocks()(mod)
 
 
@@ -554,33 +569,40 @@ def test_reject_malformed_frontend_loop_chain(kind):
     _reject(mod, "stage|domain|extent|zero|step|chain|loop|Loop|Phase 1")
 
 
-@pytest.mark.parametrize(
-    "kind", ["missing_recipe", "broadcast_axes", "logical_region", "physical_shape", "block_shape", "access_map", "region"]
-)
-def test_verifier_rejects_corrupted_broadcast_recipe(kind):
+@pytest.mark.parametrize("kind", ["missing_access", "broadcast_kind", "broadcast_axes", "logical_region", "access_map"])
+def test_verifier_rejects_corrupted_access_descriptor(kind):
     mod = _canonicalize(_module((64, 256), b_shape=(32, 256), expression=lambda a, b, c, ij: a[tuple(ij)] + b[0, ij[1]]))
 
     def change(fields):
-        region = next(region for region in fields["reads"] if region.buffer.name == "B")
-        data = region.buffer.data
-        if kind == "access_map":
-            maps = dict(fields["annotations"]["tl.tt.access_maps"])
-            maps[data] = [1, 0]
-            fields["annotations"]["tl.tt.access_maps"] = maps
-        elif kind == "region":
-            fields["reads"] = [
-                tirx.BufferRegion(item.buffer, [ir.Range(0, 64), ir.Range(0, 256)]) if item.buffer.same_as(region.buffer) else item
-                for item in fields["reads"]
-            ]
+        accesses = list(fields["annotations"]["tl.tt.access_table"])
+        index = next(i for i, access in enumerate(accesses) if access.buffer.name == "B")
+        access = accesses[index]
+        if kind == "missing_access":
+            del accesses[index]
         else:
-            recipes = dict(fields["annotations"]["tl.tt.broadcast_recipes"])
-            if kind == "missing_recipe":
-                del recipes[data]
+            logical_region = access.logical_region
+            access_map = access.access_map
+            broadcast_kind = access.broadcast_kind
+            broadcast_axes = access.broadcast_axes
+            if kind == "logical_region":
+                logical_region = tirx.BufferRegion(access.buffer, [ir.Range(0, 64), ir.Range(0, 256)])
+            elif kind == "access_map":
+                access_map = [1, 0]
+            elif kind == "broadcast_kind":
+                broadcast_kind = "identity"
             else:
-                recipe = dict(recipes[data])
-                recipe[kind] = [1] if kind == "broadcast_axes" else [64, 256]
-                recipes[data] = recipe
-            fields["annotations"]["tl.tt.broadcast_recipes"] = recipes
+                broadcast_axes = [1]
+            accesses[index] = TTAccessDescriptor(
+                access.access_id,
+                access.buffer,
+                access.access_kind,
+                logical_region,
+                access_map,
+                broadcast_kind,
+                broadcast_axes,
+                access.source_span,
+            )
+        fields["annotations"]["tl.tt.access_table"] = accesses
 
     malformed = _change_compute_block(mod, change)
     with pytest.raises((tvm.error.TVMError, ValueError), match="T.Tiles|TT|tl.tt|structured|elementwise"):
@@ -755,10 +777,89 @@ def _parallel_module(mod):
     return tvm.IRModule({"main": func.with_body(tirx.stmt_functor.ir_transform(func.body, None, change))})
 
 
-def test_reject_parallel_bound_to_another_target():
-    mod = _parallel_module(_module())
-    mod = tvm.IRModule({"main": mod["main"].with_attr("target", tvm.target.Target("llvm"))})
-    _reject(mod, "Tenstorrent target|tenstorrent")
+@pytest.mark.parametrize("shape", [(32, 32), (2, 32, 32)])
+def test_reject_tenstorrent_parallel_with_tiles_guidance(shape):
+    if len(shape) == 2:
+        raw = tvm.IRModule({"main": _io_function()})
+        parallel = _parallel_module(tirx.transform.BindTarget(tvm.target.Target(TARGET))(raw))
+    else:
+
+        @T.prim_func
+        def batch_parallel():
+            with T.Kernel(1, 1, threads=1):
+                a = T.alloc_shared(shape, T.float32, annotations=METADATA)
+                c = T.alloc_shared(shape, T.float32, annotations=METADATA)
+                for batch, i, j in T.Parallel(*shape):
+                    c[batch, i, j] = a[batch, i, j]
+
+        parallel = tirx.transform.BindTarget(tvm.target.Target(TARGET))(tvm.IRModule({"main": batch_parallel}))
+    _reject_frontend(parallel, "requires T.Tiles.*T.Parallel is unsupported")
+
+
+def test_pipeline_rejects_parallel_before_canonicalization_without_mutation(monkeypatch):
+    monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
+    context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
+    raw = _parallel_module(tvm.IRModule({"main": _io_function()}))
+    before = ir.save_json(raw)
+    with pytest.raises(NotImplementedError, match="requires T.Tiles.*T.Parallel is unsupported"):
+        context.lower(raw)
+    assert ir.save_json(raw) == before
+
+
+def _rank3_structured_module():
+    raw = _module((2, 32, 32))
+    func = raw["main"]
+    store = _nodes(func, tirx.BufferStore)[0]
+    loads = {str(load.buffer.name): load.buffer for load in _nodes(func, tirx.BufferLoad)}
+    buffers = [loads["A"], loads["B"], store.buffer]
+    domain = [tirx.IntImm("int32", extent) for extent in (2, 32, 32)]
+
+    def region(buffer):
+        return tirx.BufferRegion(buffer, [ir.Range.from_min_extent(0, extent) for extent in domain])
+
+    accesses = [
+        TTAccessDescriptor(index, buffer, "write" if index == 2 else "read", region(buffer), [0, 1, 2], "identity", [])
+        for index, buffer in enumerate(buffers)
+    ]
+    compute_access = ir.Op.get("tl.tt.compute_access")
+    value = tirx.Call("float32", compute_access, [0]) + tirx.Call("float32", compute_access, [1])
+    body = tirx.BufferStore(store.buffer, value, [0, 0, 0])
+    annotations = _annotation_value(
+        {
+            "tl.tt.compute_kind": "elementwise",
+            "tl.tt.tiles_stage": 1,
+            "tl.tt.logical_domain": domain,
+            "tl.tt.physical_tile_shape": [32, 32],
+            "tl.tt.block_shape": [2, 1, 1],
+            "tl.tt.iterator_types": ["parallel", "parallel", "parallel"],
+            "tl.tt.access_table": accesses,
+            "tl.tt.output_access_id": 2,
+            "tl.tt.value_kinds": {buffer.data: "shared_dfb" for buffer in buffers},
+        }
+    )
+    block = tirx.SBlock(
+        [], [region(buffers[0]), region(buffers[1])], [region(buffers[2])], "tl.tt.elementwise", body, annotations=annotations
+    )
+    realize = tirx.SBlockRealize([], True, block)
+
+    def replace_scope(node):
+        if isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
+            return realize
+        return None
+
+    return tvm.IRModule({"main": func.with_body(tirx.stmt_functor.ir_transform(func.body, None, replace_scope))})
+
+
+@pytest.mark.parametrize("pass_factory", [transform.VerifyTTComputeBlocks, transform.CanonicalizeTTElementwise])
+@pytest.mark.parametrize("round_trip", [False, True])
+def test_reject_rank3_existing_structured_block(pass_factory, round_trip):
+    mod = _rank3_structured_module()
+    if round_trip:
+        mod = ir.load_json(ir.save_json(mod))
+    before = ir.save_json(mod)
+    with pytest.raises(ValueError, match="structured elementwise logical domain must have rank 2"):
+        pass_factory()(mod)
+    assert ir.save_json(mod) == before
 
 
 @pytest.mark.parametrize("outer_frontend", ["tiles", "parallel"])
@@ -775,28 +876,8 @@ def test_reject_mixed_frontends_within_one_loop_nest(outer_frontend):
     _reject(malformed, "loop|annotation|scope|rank|Parallel|Tiles")
 
 
-@pytest.mark.parametrize("shape", [(32, 32), (64, 64), (128, 32)])
-@pytest.mark.parametrize(
-    "expression",
-    [
-        lambda a, b, c, ij: a[tuple(ij)] + b[tuple(ij)],
-        lambda a, b, c, ij: a[tuple(ij)] * b[tuple(ij)] + a[tuple(ij)],
-        lambda a, b, c, ij: a[tuple(ij)] - b[tuple(ij)],
-        lambda a, b, c, ij: a[tuple(ij)] * tirx.const(2, "float32"),
-    ],
-)
-def test_parallel_and_tiles_have_the_same_structured_semantics(shape, expression):
-    raw = _module(shape, expression=expression)
-    tiles = _canonicalize(raw)
-    parallel = transform.CanonicalizeTTElementwise()(_parallel_module(raw))
-    ir.assert_structural_equal(tiles, parallel)
-    transform.VerifyTTComputeBlocks()(parallel)
-    ir.assert_structural_equal(parallel, transform.CanonicalizeTTElementwise()(parallel))
-
-
 @pytest.mark.parametrize("kind", ["identity", "compound", "row", "column", "scalar", "inplace"])
-@pytest.mark.parametrize("frontend", ["tiles", "parallel"])
-def test_structured_expression_and_access_maps_match_numpy(kind, frontend):
+def test_structured_expression_and_access_maps_match_numpy(kind):
     import numpy as np
 
     shape = (64, 64)
@@ -817,7 +898,7 @@ def test_structured_expression_and_access_maps_match_numpy(kind, frontend):
         return lhs + b[tuple(ij)]
 
     raw = _module(shape, b_shape=b_shape, expression=expression)
-    lowered = _canonicalize(raw) if frontend == "tiles" else transform.CanonicalizeTTElementwise()(_parallel_module(raw))
+    lowered = _canonicalize(raw)
     (block,) = _blocks(lowered)
     rng = np.random.default_rng(42)
     arrays = {
@@ -825,10 +906,7 @@ def test_structured_expression_and_access_maps_match_numpy(kind, frontend):
         for region in [*block.reads, *block.writes]
     }
     coordinates = np.indices(shape)
-    accesses = {
-        int(access.access_id): access
-        for access in block.annotations["tl.tt.access_table"]
-    }
+    accesses = {int(access.access_id): access for access in block.annotations["tl.tt.access_table"]}
 
     def evaluate(expr):
         if isinstance(expr, tirx.Call) and expr.op.name == "tl.tt.compute_access":
@@ -858,7 +936,7 @@ def test_structured_expression_and_access_maps_match_numpy(kind, frontend):
     np.testing.assert_array_equal(evaluate(block.body.value), expected)
 
 
-def _io_function(frontend, size=32, compound=False, mixed=False, explicit_metadata=True, broadcast=False):
+def _io_function(size=32, compound=False, twice=False, explicit_metadata=True, broadcast=False):
     @T.prim_func
     def main(
         A: T.Tensor((size, size), T.float32),
@@ -871,29 +949,16 @@ def _io_function(frontend, size=32, compound=False, mixed=False, explicit_metada
             c = T.alloc_shared((size, size), T.float32, annotations=METADATA if explicit_metadata else {})
             T.copy(A, a)
             T.copy(B, b)
-            if frontend == "tiles":
-                for i, j in T.Tiles(c):
-                    if broadcast:
-                        c[i, j] = a[i, j] + b[0, j]
-                    elif compound:
-                        c[i, j] = a[i, j] * b[i, j] + a[i, j]
-                    else:
-                        c[i, j] = a[i, j] + b[i, j]
-            else:
-                for i, j in T.Parallel(size, size):
-                    if broadcast:
-                        c[i, j] = a[i, j] + b[0, j]
-                    elif compound:
-                        c[i, j] = a[i, j] * b[i, j] + a[i, j]
-                    else:
-                        c[i, j] = a[i, j] + b[i, j]
-            if mixed:
-                if frontend == "tiles":
-                    for i, j in T.Parallel(size, size):
-                        c[i, j] = c[i, j] * a[i, j]
+            for i, j in T.Tiles(c):
+                if broadcast:
+                    c[i, j] = a[i, j] + b[0, j]
+                elif compound:
+                    c[i, j] = a[i, j] * b[i, j] + a[i, j]
                 else:
-                    for i, j in T.Tiles(c):
-                        c[i, j] = c[i, j] * a[i, j]
+                    c[i, j] = a[i, j] + b[i, j]
+            if twice:
+                for i, j in T.Tiles(c):
+                    c[i, j] = c[i, j] * a[i, j]
             T.copy(c, C)
 
     return main
@@ -905,7 +970,7 @@ def _io_function(frontend, size=32, compound=False, mixed=False, explicit_metada
 def test_pipeline_rejects_canceled_effects_in_original_tiles_extent(size, source, inner):
     from tilelang.tenstorrent.pipeline import lower_tenstorrent_ir
 
-    func = _replace_tiles_loop_extent(_io_function("tiles", size=size), source, inner)
+    func = _replace_tiles_loop_extent(_io_function(size=size), source, inner)
     mod = tvm.IRModule({"main": func})
     before = ir.save_json(mod)
     with pytest.raises(ValueError, match="loop extent.*compile-time constant"):
@@ -917,27 +982,79 @@ def test_pipeline_rejects_canceled_effects_in_original_tiles_extent(size, source
 def test_pipeline_accepts_static_original_tiles_extents(size):
     from tilelang.tenstorrent.pipeline import lower_tenstorrent_ir
 
-    mod = tvm.IRModule({"main": _io_function("tiles", size=size)})
+    mod = tvm.IRModule({"main": _io_function(size=size)})
     lowered = lower_tenstorrent_ir(mod, tvm.target.Target(TARGET))
     assert str(lowered.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in lowered.attrs
 
 
-@pytest.mark.parametrize("first_frontend", ["tiles", "parallel"])
-def test_one_elementwise_pass_captures_mixed_scopes_and_is_idempotent(first_frontend):
-    raw = tvm.IRModule({"main": _io_function(first_frontend, size=64, mixed=True)})
-    raw = tirx.transform.BindTarget(tvm.target.Target(TARGET))(raw)
-    lowered = _canonicalize(raw)
-    first, second = _blocks(lowered)
-    assert isinstance(first.body.value, tirx.Add)
-    assert isinstance(second.body.value, tirx.Mul)
-    assert first.writes[0].buffer.same_as(second.writes[0].buffer)
-    assert any(region.buffer.same_as(first.writes[0].buffer) for region in second.reads)
-    assert all(
-        node.kind != tirx.ForKind.PARALLEL and "tl.tt.tiles_scope" not in node.annotations for node in _nodes(lowered["main"], tirx.For)
-    )
-    transform.VerifyTTComputeBlocks()(lowered)
-    ir.assert_structural_equal(lowered, _canonicalize(lowered))
+def _partially_canonicalized_two_scope_module(*, malformed=False):
+    raw = tirx.transform.BindTarget(tvm.target.Target(TARGET))(tvm.IRModule({"main": _io_function(size=64, twice=True)}))
+    fully_canonical = _canonicalize(raw)
+    first = _blocks(fully_canonical)[0]
+    if malformed:
+        annotations = dict(first.annotations)
+        del annotations["tl.tt.access_table"]
+        first = tirx.SBlock(
+            first.iter_vars,
+            first.reads,
+            first.writes,
+            first.name_hint,
+            first.body,
+            init=first.init,
+            alloc_buffers=first.alloc_buffers,
+            match_buffers=first.match_buffers,
+            annotations=annotations,
+        )
+    replacement = tirx.SBlockRealize([], True, first)
+    replaced = False
+
+    def replace_first_scope(node):
+        nonlocal replaced
+        if not replaced and isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
+            replaced = True
+            return replacement
+        return None
+
+    body = tirx.stmt_functor.ir_transform(raw["main"].body, None, replace_first_scope)
+    assert replaced
+    if malformed:
+        corrupted_raw = False
+
+        def corrupt_remaining_raw_scope(node):
+            nonlocal corrupted_raw
+            if not corrupted_raw and isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
+                corrupted_raw = True
+                return tirx.For(
+                    node.loop_var,
+                    node.min,
+                    48,
+                    node.kind,
+                    node.body,
+                    node.thread_binding,
+                    node.annotations,
+                    node.step,
+                )
+            return None
+
+        body = tirx.stmt_functor.ir_transform(body, None, corrupt_remaining_raw_scope)
+        assert corrupted_raw
+    return tvm.IRModule({"main": raw["main"].with_body(body)}), fully_canonical
+
+
+def test_partial_canonical_input_converges_with_fully_raw_input():
+    partial, fully_canonical = _partially_canonicalized_two_scope_module()
+    result = _canonicalize(partial)
+    ir.assert_structural_equal(result, fully_canonical)
+    ir.assert_structural_equal(result, _canonicalize(result))
+
+
+def test_malformed_partial_canonical_input_fails_without_mutation():
+    partial, _ = _partially_canonicalized_two_scope_module(malformed=True)
+    before = ir.save_json(partial)
+    with pytest.raises(ValueError, match="structured block missing metadata.*access_table"):
+        _canonicalize(partial)
+    assert ir.save_json(partial) == before
 
 
 @pytest.mark.parametrize("size", [32, 64])
@@ -965,7 +1082,7 @@ def test_pipeline_executes_elementwise_once_before_verification_and_consumption(
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     recorder = RecordPasses()
     with tvm.transform.PassContext(instruments=[recorder]):
-        lowered = context.lower(tvm.IRModule({"main": _io_function("tiles", size=size)}))
+        lowered = context.lower(tvm.IRModule({"main": _io_function(size=size)}))
     # Legalization internally verifies and runs a nested PrimFunc pass; record
     # backend pipeline stages separately from those implementation details.
     names = [name for name in recorder.top_level_names if name in TENSTORRENT_LOWER_PASS_ORDER]
@@ -976,48 +1093,18 @@ def test_pipeline_executes_elementwise_once_before_verification_and_consumption(
     assert recorder.names.count("CanonicalizeTTElementwise") == 1
 
 
-def test_parallel_and_tiles_add_produce_equivalent_device_ir(monkeypatch):
+@pytest.mark.parametrize("size,compound,twice", [(64, False, False), (32, True, False), (64, True, False), (32, False, True)])
+def test_pipeline_consumes_complete_compute_dataflow(monkeypatch, size, compound, twice):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
-    parallel = context.lower(tvm.IRModule({"main": _io_function("parallel")}))
-    tiles = context.lower(tvm.IRModule({"main": _io_function("tiles")}))
-    ir.assert_structural_equal(parallel, tiles)
-    assert any(
-        isinstance(call.op, ir.Op)
-        and call.op.name == "tl.tt.dfb_compute"
-        and str(call.annotations["tt.compute_kind"].value) == "elementwise"
-        for func in tiles.functions.values()
-        for call in _nodes(func, tirx.Call)
-    )
-    assert all(
-        not any("tl.tt.compute_kind" in block.annotations for block in _nodes(func, tirx.SBlock)) for func in tiles.functions.values()
-    )
-
-
-@pytest.mark.parametrize("frontend", ["tiles", "parallel"])
-@pytest.mark.parametrize("size,compound,mixed", [(64, False, False), (32, True, False), (64, True, False), (32, False, True)])
-def test_pipeline_consumes_complete_compute_dataflow(monkeypatch, frontend, size, compound, mixed):
-    monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
-    context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
-    lowered = context.lower(tvm.IRModule({"main": _io_function(frontend, size, compound, mixed)}))
+    lowered = context.lower(tvm.IRModule({"main": _io_function(size, compound, twice)}))
     assert str(lowered.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in lowered.attrs
     calls = [call for func in lowered.functions.values() for call in _nodes(func, tirx.Call) if isinstance(call.op, ir.Op)]
     computes = [call for call in calls if call.op.name == "tl.tt.dfb_compute" and str(call.annotations["tt.compute_kind"].value) != "copy"]
-    assert len(computes) == (2 if mixed else 1)
+    assert len(computes) == (2 if twice else 1)
     assert all(_integers(call.annotations["tt.logical_domain"]) == [size, size] for call in computes)
     assert not any(call.op.name.startswith("tl.tileop.") for call in calls)
-    from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
-
-    VerifyTenstorrentDeviceIR()(lowered)
-
-
-def test_pipeline_parallel_default_allocation_metadata_reaches_device(monkeypatch):
-    monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
-    context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
-    lowered = context.lower(tvm.IRModule({"main": _io_function("parallel", explicit_metadata=False)}))
-    assert str(lowered.attrs["tt.ir_stage"]) == "device"
-    assert "tt.device_ir_version" not in lowered.attrs
     from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
 
     VerifyTenstorrentDeviceIR()(lowered)
@@ -1028,8 +1115,8 @@ def test_pipeline_rejects_multiple_operations_atomically(monkeypatch):
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     raw = tvm.IRModule(
         {
-            "small": _io_function("parallel", 32).with_attr("global_symbol", "small"),
-            "large": _io_function("tiles", 64).with_attr("global_symbol", "large"),
+            "small": _io_function(32).with_attr("global_symbol", "small"),
+            "large": _io_function(64).with_attr("global_symbol", "large"),
         }
     )
     before = ir.save_json(raw)
@@ -1098,15 +1185,10 @@ def test_reject_allocation_metadata_without_owning_allocation():
 def test_two_single_tile_adds_reach_device_stage(monkeypatch):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
-    func = _io_function("parallel")
+    func = _io_function()
 
     def duplicate_compute(node):
-        if (
-            isinstance(node, tirx.For)
-            and node.kind == tirx.ForKind.PARALLEL
-            and isinstance(node.body, tirx.For)
-            and node.body.kind == tirx.ForKind.PARALLEL
-        ):
+        if isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations and isinstance(node.body, tirx.For):
             return tirx.SeqStmt([node, node])
         return None
 
@@ -1119,12 +1201,11 @@ def test_two_single_tile_adds_reach_device_stage(monkeypatch):
     VerifyTenstorrentDeviceIR()(lowered)
 
 
-@pytest.mark.parametrize("frontend", ["tiles", "parallel"])
 @pytest.mark.parametrize("size", [32, 64])
-def test_pipeline_preserves_padded_broadcast_recipe(monkeypatch, frontend, size):
+def test_pipeline_preserves_padded_broadcast_recipe(monkeypatch, size):
     monkeypatch.setattr(execution_backend.importlib.util, "find_spec", lambda _: object())
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
-    lowered = context.lower(tvm.IRModule({"main": _io_function(frontend, size, broadcast=True)}))
+    lowered = context.lower(tvm.IRModule({"main": _io_function(size, broadcast=True)}))
     assert str(lowered.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in lowered.attrs
     computes = [
@@ -1166,7 +1247,7 @@ def test_deferred_compute_cannot_bypass_topology_validation(monkeypatch):
     context = create_backend_context(TARGET, target_host="c", execution_backend="ttnn")
     raw = tvm.IRModule(
         {
-            "compute": _io_function("tiles", 64).with_attr("global_symbol", "compute"),
+            "compute": _io_function(64).with_attr("global_symbol", "compute"),
             "p2p": FRONTEND_PROGRAMS["p2p"],
         }
     )
@@ -1201,7 +1282,11 @@ def test_tiles02_scope_combinations_preserve_value_kinds(a_scope, b_scope, c_sco
         buffer = effect.buffer
         assert buffer.same_as(by_name[buffer.name])
         assert str(kinds[buffer.data]) == ("compute_fragment" if buffer.scope() == "local.fragment" else "shared_dfb")
-        assert _integers(block.annotations["tl.tt.access_maps"][buffer.data]) == [0, 1]
+        assert all(
+            _integers(access.access_map) == [0, 1]
+            for access in block.annotations["tl.tt.access_table"]
+            if access.buffer.data.same_as(buffer.data)
+        )
         assert buffer.dtype == "float32"
     assert _integers(block.annotations["tl.tt.block_shape"]) == [2, 2]
     assert not _nodes(restored["main"], tirx.For)
@@ -1241,12 +1326,6 @@ def test_tiles02_fragment_does_not_require_dfb_metadata_but_shared_input_does():
         _module(b_scope="local.fragment", c_scope="local.fragment", a_metadata={**METADATA, "tt.tile_shape": [16, 32]}),
         "tt.tile_shape|32x32",
     )
-
-
-@pytest.mark.parametrize("operand", ["a_scope", "b_scope", "c_scope"])
-def test_tiles02_parallel_rejects_rank3_fragment_operands(operand):
-    mod = _parallel_module(_module((2, 32, 32), **{operand: "local.fragment"}))
-    _reject(mod, "fragment.*rank-2")
 
 
 @pytest.mark.parametrize("metadata", [{"tt.tile_shape": [32, 32]}, {"tt.dfb_block_count": 2}, {"tt.tensor_backed": 1}])
@@ -1306,11 +1385,7 @@ def test_tiles02_fragment_broadcast_preserves_compact_valid_region(kind, b_shape
     transform.VerifyTTComputeBlocks()(mod)
     (block,) = _blocks(mod)
     operand = next(region for region in block.reads if region.buffer.name == "B")
-    access = next(
-        entry
-        for entry in block.annotations["tl.tt.access_table"]
-        if entry.buffer.name == "B"
-    )
+    access = next(entry for entry in block.annotations["tl.tt.access_table"] if entry.buffer.name == "B")
     assert _integers([dim.extent for dim in access.logical_region.region]) == logical
     assert _integers(operand.buffer.shape) == list(b_shape)
     assert str(block.annotations["tl.tt.value_kinds"][operand.buffer.data]) == "compute_fragment"

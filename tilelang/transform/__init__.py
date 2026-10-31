@@ -17,7 +17,7 @@ def get_pass_context():
 
 
 def CanonicalizeTTElementwise():
-    """Capture Tenstorrent Tiles and supported Parallel elementwise scopes."""
+    """Capture Tenstorrent rank-2 Tiles elementwise scopes."""
     from tilelang.tenstorrent.transform import CanonicalizeTTElementwise as create_pass
 
     return create_pass()

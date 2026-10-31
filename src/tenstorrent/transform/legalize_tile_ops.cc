@@ -54,8 +54,7 @@ bool IsElementwiseBlock(const SBlock &block) {
          Downcast<ffi::String>(kind.value()) == "elementwise";
 }
 
-std::map<int64_t, TTAccessDescriptor>
-AccessTable(const SBlock &block) {
+std::map<int64_t, TTAccessDescriptor> AccessTable(const SBlock &block) {
   auto table = block->annotations.Get("tl.tt.access_table");
   if (!table.has_value())
     return {};
@@ -77,8 +76,9 @@ ExpressionAccess(const PrimExpr &expression,
       call->args.size() != 1 || !as_const_int(call->args[0]))
     return std::nullopt;
   auto found = table.find(*as_const_int(call->args[0]));
-  return found == table.end() ? ffi::Optional<TTAccessDescriptor>()
-                              : ffi::Optional<TTAccessDescriptor>(found->second);
+  return found == table.end()
+             ? ffi::Optional<TTAccessDescriptor>()
+             : ffi::Optional<TTAccessDescriptor>(found->second);
 }
 
 bool IsDeviceAdd(const SBlock &block,
@@ -121,8 +121,7 @@ bool IsDeviceAdd(const SBlock &block,
   }
   for (const TTAccessDescriptor &access :
        {lhs_access.value(), rhs_access.value(), output_access}) {
-    if (access->access_map.size() != 2 ||
-        access->access_map[0]->value != 0 ||
+    if (access->access_map.size() != 2 || access->access_map[0]->value != 0 ||
         access->access_map[1]->value != 1) {
       return false;
     }
@@ -911,12 +910,11 @@ private:
     ComputeDTypeVerifier dtype_verifier;
     dtype_verifier(store->value);
     auto access_table = AccessTable(block);
-    auto output_id = Downcast<Integer>(
-        block->annotations.at("tl.tt.output_access_id"));
+    auto output_id =
+        Downcast<Integer>(block->annotations.at("tl.tt.output_access_id"));
     Require(access_table.count(output_id->value),
             "structured output access is missing");
-    const TTAccessDescriptor &output_access =
-        access_table.at(output_id->value);
+    const TTAccessDescriptor &output_access = access_table.at(output_id->value);
     ffi::Array<BufferRegion> inputs;
     ffi::Array<ffi::Array<Integer>> maps;
     ffi::Array<Integer> access_ids;
@@ -1169,13 +1167,13 @@ private:
 
   Stmt VisitStmt_(const ForNode *op) final {
     Require(op->kind != ForKind::kParallel,
-            "T.Parallel must first pass through CanonicalizeTTElementwise");
+            "Tenstorrent elementwise compute requires T.Tiles; T.Parallel is "
+            "unsupported");
     return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
-    Reject("BufferStore compute requires a structured T.Parallel or T.Tiles "
-           "operation");
+    Reject("BufferStore compute requires a structured T.Tiles operation");
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
@@ -1230,7 +1228,7 @@ tvm::transform::Pass LegalizeTenstorrentTileOps() {
     return func;
   };
   return tvm::transform::Sequential(
-      {VerifyTTComputeBlocks(), VerifyTTGemmAccumulators(),
+      {VerifyTTGemmAccumulators(),
        tirx::transform::CreatePrimFuncPass(
            pass_func, 0, "tl.tenstorrent.LegalizeTenstorrentTileOps", {})},
       "tl.tenstorrent.LegalizeTenstorrentTileOps");

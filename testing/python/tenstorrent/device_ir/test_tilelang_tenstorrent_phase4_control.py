@@ -14,7 +14,6 @@ from testing.python.tenstorrent.semantics.test_tilelang_tenstorrent_phase4_seman
 from testing.python.tenstorrent._support.reference import _calls, _core_statements, _with_core_statements
 from testing.python.tenstorrent.legacy.test_tilelang_tenstorrent_phase2_device_ir import (
     _replace_dfb,
-    _replace_slot_body,
     _slots,
 )
 
@@ -39,7 +38,7 @@ def repeated_inout(A: T.Tensor((64, 64), "float32")):
         a = shared((64, 64))
         for _repeat in T.serial(2, 5):
             T.copy(A, a)
-            for i, j in T.Parallel(64, 64):
+            for i, j in T.Tiles(a):
                 a[i, j] = a[i, j] + T.float32(2)
             T.copy(a, A)
 
@@ -51,10 +50,10 @@ def index_condition(A: T.Tensor((64, 64), "float32")):
         for repeat in T.serial(3):
             T.copy(A, a)
             if repeat % 2 == 0:
-                for i, j in T.Parallel(64, 64):
+                for i, j in T.Tiles(a):
                     a[i, j] = a[i, j] + T.float32(2)
             else:
-                for i, j in T.Parallel(64, 64):
+                for i, j in T.Tiles(a):
                     a[i, j] = a[i, j] * T.float32(3)
             T.copy(a, A)
 
@@ -65,9 +64,7 @@ def test_independent_iteration_stays_structured_and_preserves_tensor_inout():
     for slot in ("trisc", "ncrisc"):
         loop = core_loop(slots[slot])
         assert (int(loop.min), int(loop.extent)) == (2, 3)
-    assert not core_loop(slots["trisc"]).loop_var.same_as(
-        core_loop(slots["ncrisc"]).loop_var
-    )
+    assert not core_loop(slots["trisc"]).loop_var.same_as(core_loop(slots["ncrisc"]).loop_var)
     assert all(int(d.transaction_count_or_loop_relation) == 3 for d in mod.attrs["tt.dfb_table"])
     a = np.arange(4096, dtype=np.float32).reshape(64, 64)
     np.testing.assert_array_equal(run_device(mod, [a])[0], a + 6)
@@ -83,10 +80,7 @@ def test_index_dependent_conditions_normalize_without_semantic_loss():
     target = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
     mod = lower_tenstorrent_ir(tvm.IRModule({"main": index_condition}), target)
     assert str(mod.attrs["tt.ir_stage"]) == "structured"
-    assert any(
-        "data-dependent control flow" in str(reason)
-        for reason in mod.attrs["tt.deferred_reasons"]
-    )
+    assert any("data-dependent control flow" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])
 
 
 @pytest.mark.parametrize("mutation", ["trip_count", "relation", "unwrapped", "step"])
@@ -118,11 +112,7 @@ def test_structured_iteration_malformed_schedule_is_rejected(mutation):
 
 def test_unsupported_device_expression_dtype_is_rejected():
     mod = lower(elementwise_program())
-    call = next(
-        call
-        for call in _calls(_slots(mod)["trisc"].body)
-        if call.op.name == "tl.tt.dfb_compute"
-    )
+    call = next(call for call in _calls(_slots(mod)["trisc"].body) if call.op.name == "tl.tt.dfb_compute")
     expression = call.annotations["tt.expression"]
     expression = tirx.Cast("float32", tirx.Cast("float16", expression))
     replace_compute_annotation(mod, "tt.expression", expression)

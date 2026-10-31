@@ -11,9 +11,7 @@ from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from tvm import ir, tirx
 
 
-pytestmark = pytest.mark.skip(
-    reason="legacy Device IR v4 PipeNet/per-Core schema replaced by shared-grid v04 communication lowering"
-)
+pytestmark = pytest.mark.skip(reason="legacy Device IR v4 PipeNet/per-Core schema replaced by shared-grid v04 communication lowering")
 
 
 def shared():
@@ -307,9 +305,9 @@ def test_topology_normalization_is_idempotent():
     mod = tvm.IRModule({"main": make_scatter(True)})
     for compiler_pass in (
         tirx.transform.BindTarget(target),
+        transform.ValidateTenstorrentFrontendIR(),
         transform.CanonicalizeTTElementwise(),
         transform.VerifyTTComputeBlocks(),
-        transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
         transform.NormalizeTenstorrentTopology(),

@@ -15,26 +15,20 @@ from testing.python.tenstorrent.semantics.test_tilelang_tenstorrent_compute_valu
 )
 from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute import (
     cast_program,
-    batch_elementwise,
     elementwise_program,
     fill_program,
     gemm_program,
     reduction_program,
     transpose_program,
 )
-from testing.python.tenstorrent.device_ir.test_tilelang_tenstorrent_phase4_control import index_condition
 from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_lower_composition import (
     full_k_pipeline,
     multicore_gemm_epilogue,
     multicore_values,
-    pipe_values,
     pipeline_values,
-    pipeline_pipe_values,
-    pipeline_summa,
     transpose_fragment,
 )
 from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase5_pipeline import make_pipeline
-from testing.python.tenstorrent.legacy.test_tilelang_tenstorrent_phase6_lower import make_point_to_point
 from testing.python.tenstorrent.legacy.test_tilelang_tenstorrent_summa_lower import make_summa
 
 
@@ -135,7 +129,6 @@ def multicore_shared_pipeline():
     [
         ("copy", tensor_slice_program, {}),
         ("elementwise", elementwise_program, {}),
-        ("elementwise", lambda: batch_elementwise, {"rank": 3}),
         ("fill", lambda: fill_program, {}),
         ("typecast", lambda: cast_program, {"input_dtype": "bfloat16", "output_dtype": "float32"}),
         ("transpose", lambda: transpose_program, {}),
@@ -242,6 +235,7 @@ def test_deferred_combinations_are_not_reported_as_device_lower(operation, query
         ("elementwise", {"input_dtype": "float16"}, "BF16/FP32"),
         ("elementwise", {"output_dtype": "float16"}, "BF16/FP32"),
         ("elementwise", {"rank": 0}, "positive rank"),
+        ("elementwise", {"rank": 3}, "rank-2 T.Tiles"),
         ("elementwise", {"tile_shape": (16, 32)}, "32x32"),
         ("elementwise", {"shape_class": "dynamic"}, "static tile-aligned"),
         ("elementwise", {"shape_class": "padded"}, "padding/masks"),
@@ -250,7 +244,7 @@ def test_deferred_combinations_are_not_reported_as_device_lower(operation, query
         ("elementwise", {"compact": False}, "compact"),
         ("elementwise", {"aliased": True}, "aliases"),
         ("elementwise", {"materialization": "implicit_bf16"}, "exact-dtype"),
-        ("elementwise", {"rank": 3, "input_value_kind": "fragment"}, "rank-2"),
+        ("elementwise", {"rank": 3, "input_value_kind": "fragment"}, "rank-2 T.Tiles"),
         ("elementwise", {"output_value_kind": "accumulator"}, "reserved for GEMM"),
         ("gemm", {"rank": 3}, "batched GEMM"),
         ("gemm", {"input_dtype": "float32", "output_dtype": "bfloat16", "accumulation_dtype": "bfloat16"}, "Dtype triple"),
