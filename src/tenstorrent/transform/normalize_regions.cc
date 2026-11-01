@@ -94,8 +94,7 @@ NormalizedRegion NormalizeRegion(const BufferRegion &region,
       // Static pipeline binders will be substituted by formation. Prove the
       // complete range now so delayed specialization cannot hide an invalid
       // iteration or turn a dynamic/runtime index into an accepted transfer.
-      arith::ConstIntBound bound =
-          loop_analyzer->const_int_bound(minimum_expr);
+      arith::ConstIntBound bound = loop_analyzer->const_int_bound(minimum_expr);
       if (SideEffect(minimum_expr) > CallEffectKind::kPure ||
           bound->min_value < 0 || bound->max_value > shape - extent) {
         ThrowMalformed(endpoint +
@@ -413,12 +412,12 @@ private:
       PrimExpr members = analyzer.Simplify((call->args[4] - call->args[2]) *
                                            (call->args[5] - call->args[3]));
       for (size_t i = 0; i < source->buffer->shape.size(); ++i) {
-        PrimExpr expected = source->buffer->shape[i] *
-                            (i == static_cast<size_t>(axis->value)
-                                 ? members
-                                 : Integer(1));
+        PrimExpr expected =
+            source->buffer->shape[i] *
+            (i == static_cast<size_t>(axis->value) ? members : Integer(1));
         if (!analyzer.CanProveEqual(destination->buffer->shape[i], expected))
-          ThrowMalformed("all_gather destination shape disagrees with group rank coverage");
+          ThrowMalformed("all_gather destination shape disagrees with group "
+                         "rank coverage");
       }
     }
     if (!normalized_source.changed && !normalized_destination.changed)
@@ -426,9 +425,9 @@ private:
     auto args = call->args;
     args.Set(0, normalized_source.region->ToPrimExpr());
     args.Set(1, normalized_destination.region->ToPrimExpr());
-    return Evaluate(Call(call->dtype, call->op, args, call->annotations,
-                         call->span),
-                    evaluate->span);
+    return Evaluate(
+        Call(call->dtype, call->op, args, call->annotations, call->span),
+        evaluate->span);
   }
 
   Stmt NormalizeCopy(const Evaluate &evaluate, const Call &call) {
@@ -451,23 +450,6 @@ private:
         ClassifyTransfer(source->buffer, destination->buffer);
 
     ffi::Map<ffi::String, ffi::ObjectRef> annotations = call->annotations;
-    bool annotation_matches = false;
-    if (auto existing = annotations.Get(kTransferKind)) {
-      const auto *existing_kind = existing.value().as<StringImmNode>();
-      if (existing_kind == nullptr) {
-        ThrowMalformed("'tt.transfer_kind' must be a string");
-      }
-      if (existing_kind->value != transfer_kind) {
-        ThrowMalformed("'tt.transfer_kind' conflicts with source and "
-                       "destination buffer scopes");
-      }
-      annotation_matches = true;
-    }
-    if (!normalized_source.changed && !normalized_destination.changed &&
-        annotation_matches && call.same_as(evaluate->value)) {
-      return evaluate;
-    }
-
     ffi::Array<PrimExpr> args = call->args;
     args.Set(0, normalized_source.region->ToPrimExpr());
     args.Set(1, normalized_destination.region->ToPrimExpr());

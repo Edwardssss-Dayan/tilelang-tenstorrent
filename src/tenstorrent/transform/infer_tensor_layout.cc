@@ -9,7 +9,6 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/function.h>
 #include <tvm/ir/transform.h>
-#include <tvm/target/target.h>
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/transform.h>
 
@@ -51,21 +50,6 @@ int64_t RequireStaticExtent(const PrimExpr &extent,
 bool IsSupportedDType(DataType dtype) {
   return dtype.lanes() == 1 &&
          (dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32));
-}
-
-void ValidateTarget(const PrimFunc &func) {
-  ffi::Optional<Target> target = func->GetAttr<Target>(tvm::attr::kTarget);
-  if (!target.defined() || target.value()->kind->name != "tenstorrent") {
-    ThrowMalformed("InferTenstorrentTensorLayout requires a bound "
-                   "Tenstorrent target");
-  }
-  auto arch = target.value()->GetAttr<ffi::String>("arch");
-  if (!arch.has_value()) {
-    ThrowMalformed("the Tenstorrent target is missing 'arch'");
-  }
-  if (arch.value() != "wormhole_b0" && arch.value() != "blackhole") {
-    ThrowUnsupported("target architecture '" + std::string(arch.value()) + "'");
-  }
 }
 
 TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
@@ -173,34 +157,9 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
         IntImm(metadata->buffer->shape[axis].dtype(),
                (element_extent + tile_extent - 1) / tile_extent));
   }
-  if (metadata->tile_grid_shape.empty()) {
-    *changed = true;
-  } else {
-    if (metadata->tile_grid_shape.size() != rank) {
-      ThrowMalformed("buffer '" + buffer_id +
-                     "' tile-grid rank must match its logical shape");
-    }
-    for (size_t axis = 0; axis < rank; ++axis) {
-      const auto *existing = metadata->tile_grid_shape[axis].as<IntImmNode>();
-      const auto *inferred = tile_grid_shape[axis].as<IntImmNode>();
-      if (existing == nullptr || existing->value != inferred->value) {
-        ThrowMalformed("buffer '" + buffer_id +
-                       "' tile-grid shape conflicts with its element shape");
-      }
-    }
-    tile_grid_shape = metadata->tile_grid_shape;
-  }
-
-  ffi::String memory_layout = metadata->memory_layout;
-  ffi::String layout_origin = metadata->layout_origin;
-  if (memory_layout.empty()) {
-    memory_layout = "interleaved";
-    layout_origin = "inferred";
-    *changed = true;
-  } else if (memory_layout != "interleaved") {
-    ThrowUnsupported("buffer '" + buffer_id + "' requests memory layout '" +
-                     std::string(memory_layout) + "'");
-  }
+  *changed = true;
+  ffi::String memory_layout = "interleaved";
+  ffi::String layout_origin = "inferred";
 
   ffi::Optional<PrimExpr> block_count = metadata->dfb_block_count;
   ffi::String block_count_origin = metadata->block_count_origin;
@@ -221,13 +180,8 @@ TTBufferMetadata InferOne(const TTBufferMetadata &metadata, bool *changed) {
 }
 
 PrimFunc InferLayout(PrimFunc func) {
-  ValidateTarget(func);
   auto table =
       func->GetAttr<ffi::Array<TTBufferMetadata>>(kBufferMetadataTableAttr);
-  if (!table.has_value()) {
-    ThrowMalformed("'tt.buffer_metadata_table' is missing; "
-                   "NormalizeTenstorrentBufferMetadata must run first");
-  }
 
   bool changed = false;
   ffi::Array<TTBufferMetadata> inferred;

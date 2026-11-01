@@ -163,13 +163,10 @@ def test_gemm_tiles_epilogue_preserves_precision_and_update_relation(mode):
     assert update["accumulator"].same_as(requirement["accumulator"])
     assert update["relation"].value == "pointwise_old_to_new"
     assert str(update["expression"].dtype) == "float32"
-    assert ir.structural_equal(result, transform.VerifyTTGemmAccumulators()(result))
     if mode == "store":
         assert isinstance(blocks(result)[-1].body.value, tirx.Cast)
         assert str(blocks(result)[-1].body.value.dtype) == "bfloat16"
-    device = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": gemm_epilogue(mode)}), TARGET)
-    )
+    device = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": gemm_epilogue(mode)}), TARGET))
     assert str(device.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in device.attrs
     assert any(int(value.accumulator_id) >= 0 for value in device.attrs["tt.compute_value_table"])

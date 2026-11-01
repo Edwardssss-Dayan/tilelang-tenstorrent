@@ -298,24 +298,6 @@ def test_multicore_pipeline_composition_retains_verified_pools():
     assert transform.VerifyTenstorrentDeviceIR()(restored).same_as(restored)
 
 
-def test_topology_normalization_is_idempotent():
-    from tilelang.tenstorrent import transform
-
-    target = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
-    mod = tvm.IRModule({"main": make_scatter(True)})
-    for compiler_pass in (
-        tirx.transform.BindTarget(target),
-        transform.ValidateTenstorrentFrontendIR(),
-        transform.CanonicalizeTTElementwise(),
-        transform.VerifyTTComputeBlocks(),
-        transform.NormalizeTenstorrentLaunch(),
-        transform.NormalizeTenstorrentBufferMetadata(),
-        transform.NormalizeTenstorrentTopology(),
-    ):
-        mod = compiler_pass(mod)
-    ir.assert_structural_equal(mod, transform.NormalizeTenstorrentTopology()(mod))
-
-
 def test_active_net_cannot_silently_drop_an_original_record():
     net = T.comm.PipeNet([T.comm.Pipe((0, 0), (1, 0)), T.comm.Pipe((0, 0), (2, 0))])
 

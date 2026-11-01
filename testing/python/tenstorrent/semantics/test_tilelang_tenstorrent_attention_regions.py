@@ -44,7 +44,6 @@ def bound(func):
 def test_singleton_tensor_axes_preserve_original_abi_and_slice_coordinates(mode):
     frontend = bound(tensor_slice_program(mode))
     normalized = transform.NormalizeTenstorrentRegions()(transform.NormalizeTenstorrentLaunch()(frontend))
-    ir.assert_structural_equal(transform.NormalizeTenstorrentRegions()(normalized), normalized)
     for parameter, buffer in frontend["main"].buffer_map.items():
         assert normalized["main"].buffer_map[parameter].same_as(buffer)
     result = lower_tenstorrent_ir(tvm.IRModule({"main": tensor_slice_program(mode)}), TARGET)

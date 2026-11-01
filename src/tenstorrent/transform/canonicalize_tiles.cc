@@ -81,21 +81,6 @@ bool HasStructuredComputeAnnotations(const Entries &annotations) {
          annotations.count(kTTValueKinds);
 }
 
-class RawFrontendStageChecker : public StmtVisitor {
-public:
-  static void Check(const Stmt &body) {
-    RawFrontendStageChecker checker;
-    checker.VisitStmt(body);
-  }
-
-  void VisitStmt_(const SBlockNode *op) final {
-    Require(!HasStructuredComputeAnnotations(op->annotations),
-            "CanonicalizeTTElementwise accepts only raw Frontend IR; "
-            "structured compute annotations are wrong-stage input");
-    StmtVisitor::VisitStmt_(op);
-  }
-};
-
 class AllocationCollector : public StmtVisitor {
 public:
   void Collect(const Stmt &body) { VisitStmt(body); }
@@ -1029,7 +1014,6 @@ private:
 tvm::transform::Pass CanonicalizeTTElementwise() {
   auto pass_func = [](PrimFunc func, const IRModule &,
                       const tvm::transform::PassContext &) {
-    RawFrontendStageChecker::Check(func->body);
     Canonicalizer rewriter(func);
     Stmt body = rewriter(func->body);
     if (!body.same_as(func->body))

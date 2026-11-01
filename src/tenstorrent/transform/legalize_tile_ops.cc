@@ -42,10 +42,6 @@ namespace tenstorrent {
 
 using namespace tirx;
 
-// The verifier owns the structured-operation contract. Device instruction
-// selection must not reconstruct that contract from zero-coordinate stores.
-tvm::transform::Pass VerifyTTComputeBlocks();
-
 namespace {
 
 bool IsElementwiseBlock(const SBlock &block) {
@@ -801,9 +797,9 @@ Stmt MakeCompute(const BufferRegion &output,
 class ComputeDTypeVerifier : public ExprVisitor {
 public:
   void VisitExpr(const PrimExpr &expr) final {
-    // VerifyTTComputeBlocks has already proved every remaining Var is an
-    // enclosing static loop's scalar parameter. Form replaces it by an
-    // integer constant; storage and arithmetic nodes still require FP dtypes.
+    // CanonicalizeTTElementwise only preserves Vars from enclosing static
+    // scalar loops. Form replaces them by integer constants; storage and
+    // arithmetic nodes still require FP dtypes.
     if (!expr.as<IntImmNode>() && !expr.as<VarNode>() &&
         !expr.dtype().is_bool())
       ValidateDType(expr.dtype());
@@ -1210,11 +1206,8 @@ tvm::transform::Pass VerifyTTGemmAccumulators() {
                       const tvm::transform::PassContext &context) {
     return GemmAccumulatorVerifier::Verify(std::move(func));
   };
-  return tvm::transform::Sequential(
-      {VerifyTTComputeBlocks(),
-       tirx::transform::CreatePrimFuncPass(
-           pass_func, 0, "tl.tenstorrent.VerifyTTGemmAccumulators", {})},
-      "tl.tenstorrent.VerifyTTGemmAccumulators");
+  return tirx::transform::CreatePrimFuncPass(
+      pass_func, 0, "tl.tenstorrent.VerifyTTGemmAccumulators", {});
 }
 
 tvm::transform::Pass LegalizeTenstorrentTileOps() {
@@ -1227,11 +1220,8 @@ tvm::transform::Pass LegalizeTenstorrentTileOps() {
     }
     return func;
   };
-  return tvm::transform::Sequential(
-      {VerifyTTGemmAccumulators(),
-       tirx::transform::CreatePrimFuncPass(
-           pass_func, 0, "tl.tenstorrent.LegalizeTenstorrentTileOps", {})},
-      "tl.tenstorrent.LegalizeTenstorrentTileOps");
+  return tirx::transform::CreatePrimFuncPass(
+      pass_func, 0, "tl.tenstorrent.LegalizeTenstorrentTileOps", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

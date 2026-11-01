@@ -7,9 +7,9 @@
  * \brief Specialize bounded logical Core and ordered PipeNet domains.
  */
 
-#include "../op/builtin.h"
-#include "../ir/device_ir.h"
 #include "../../op/utils.h"
+#include "../ir/device_ir.h"
+#include "../op/builtin.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
@@ -244,8 +244,7 @@ public:
     PostOrderVisit(op->body, [&](const ffi::ObjectRef &object) {
       const auto *call = object.as<CallNode>();
       const auto *operator_node = call ? call->op.as<OpNode>() : nullptr;
-      std::string name =
-          operator_node ? std::string(operator_node->name) : "";
+      std::string name = operator_node ? std::string(operator_node->name) : "";
       contains_communication |= name == "tl.tt.transfer" ||
                                 name == "tl.tt.all_gather" ||
                                 name == "tl.tt.all_reduce";
@@ -260,9 +259,9 @@ public:
     const auto *extent = op->extent.as<IntImmNode>();
     if (!minimum || !extent || extent->value <= 0 ||
         (op->step.has_value() && !is_one(op->step.value())))
-      Reject("communication occurrence loops require positive static unit-step bounds");
-    analyzer_.Bind(op->loop_var,
-                   Range::FromMinExtent(op->min, op->extent));
+      Reject("communication occurrence loops require positive static unit-step "
+             "bounds");
+    analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
     occurrence_extents_.push_back(op->extent);
     VisitStmt(op->body);
     occurrence_extents_.pop_back();
@@ -270,18 +269,16 @@ public:
 
   void VisitStmt_(const IfThenElseNode *op) final {
     bool contains_communication = false;
-    PostOrderVisit(ffi::GetRef<IfThenElse>(op),
-                   [&](const ffi::ObjectRef &object) {
-                     const auto *call = object.as<CallNode>();
-                     const auto *operator_node =
-                         call ? call->op.as<OpNode>() : nullptr;
-                     std::string name =
-                         operator_node ? std::string(operator_node->name) : "";
-                     contains_communication |=
-                         name == "tl.tt.transfer" ||
-                         name == "tl.tt.all_gather" ||
-                         name == "tl.tt.all_reduce";
-                   });
+    PostOrderVisit(
+        ffi::GetRef<IfThenElse>(op), [&](const ffi::ObjectRef &object) {
+          const auto *call = object.as<CallNode>();
+          const auto *operator_node = call ? call->op.as<OpNode>() : nullptr;
+          std::string name =
+              operator_node ? std::string(operator_node->name) : "";
+          contains_communication |= name == "tl.tt.transfer" ||
+                                    name == "tl.tt.all_gather" ||
+                                    name == "tl.tt.all_reduce";
+        });
     if (!contains_communication) {
       StmtExprVisitor::VisitStmt_(op);
       return;
@@ -300,7 +297,8 @@ public:
 
   void VisitExpr_(const CallNode *op) final {
     const auto *operator_node = op->op.as<OpNode>();
-    const std::string name = operator_node ? std::string(operator_node->name) : "";
+    const std::string name =
+        operator_node ? std::string(operator_node->name) : "";
     if (name != "tl.tt.transfer" && name != "tl.tt.all_gather" &&
         name != "tl.tt.all_reduce") {
       StmtExprVisitor::VisitExpr_(op);
@@ -310,7 +308,8 @@ public:
     const bool transfer_call = name == "tl.tt.transfer";
     const size_t expected_arity = transfer_call ? 10 : 8;
     if (call->args.size() != expected_arity)
-      Reject("high-level communication arity changed after frontend validation");
+      Reject(
+          "high-level communication arity changed after frontend validation");
     BufferRegion source =
         NormalizeToAccessRegion(call->args[0], kAccessRead).region;
     BufferRegion destination =
@@ -337,10 +336,10 @@ public:
       if (!analyzer_.CanProve(begin[axis] >= 0) ||
           !analyzer_.CanProve(begin[axis] < end[axis]) ||
           !analyzer_.CanProve(end[axis] <= limit))
-        Reject("communication group/endpoints are not statically in the launch grid");
-      if (transfer_call &&
-          (!analyzer_.CanProve(source_coord[axis] >= 0) ||
-           !analyzer_.CanProve(source_coord[axis] < limit)))
+        Reject("communication group/endpoints are not statically in the launch "
+               "grid");
+      if (transfer_call && (!analyzer_.CanProve(source_coord[axis] >= 0) ||
+                            !analyzer_.CanProve(source_coord[axis] < limit)))
         Reject("communication source is not statically in the launch grid");
     }
     if (transfer_call) {
@@ -353,8 +352,8 @@ public:
     int64_t site_id = *as_const_int(call->args[expected_arity - 1]);
     if (!sites_.insert(site_id).second)
       Reject("duplicate communication site ID");
-    ffi::String kind = transfer_call ? ffi::String("transfer")
-                                     : ffi::String(name.substr(6));
+    ffi::String kind =
+        transfer_call ? ffi::String("transfer") : ffi::String(name.substr(6));
     entries_.push_back(NormalizedTopologyDescriptor(
         site_id, kind, source, destination, source_coord, begin, end, parameter,
         contract, guard_, occurrence_extents_, call->span));
@@ -371,8 +370,6 @@ private:
 };
 
 PrimFunc NormalizeTopology(PrimFunc func) {
-  if (func->GetAttr<Integer>("tt.topology_normalized").has_value())
-    return func;
   auto grid = func->GetAttr<ffi::Array<PrimExpr>>("tt.launch_grid");
   if (!grid.has_value() || grid.value().size() != 2)
     Reject("normalized launch grid is missing");
@@ -389,7 +386,8 @@ PrimFunc NormalizeTopology(PrimFunc func) {
     Reject("normalized launch must retain the logical Core x/y loop prefix");
   For xloop = Downcast<For>(func->body);
   For yloop = Downcast<For>(xloop->body);
-  HighLevelTopologyCollector collector(xloop->loop_var, yloop->loop_var, gx, gy);
+  HighLevelTopologyCollector collector(xloop->loop_var, yloop->loop_var, gx,
+                                       gy);
   auto topology = collector.Collect(yloop->body);
   func = WithAttr(std::move(func), "tt.normalized_topology", topology);
   return WithAttr(std::move(func), "tt.topology_normalized", Integer(1));

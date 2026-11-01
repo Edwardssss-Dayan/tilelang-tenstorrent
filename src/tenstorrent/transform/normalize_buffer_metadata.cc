@@ -33,7 +33,6 @@ constexpr const char *kTensorBacked = "tt.tensor_backed";
 
 using BufferSet =
     std::unordered_set<Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
-using VarSet = std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 using VarMetadataMap =
     std::unordered_map<Var, ffi::Map<ffi::String, ffi::Any>, ffi::ObjectPtrHash,
                        ffi::ObjectPtrEqual>;
@@ -181,51 +180,7 @@ ParseAnnotations(const Buffer &buffer,
   return result;
 }
 
-void ValidateExistingTable(const PrimFunc &func,
-                           const ffi::Array<TTBufferMetadata> &table) {
-  std::unordered_set<std::string> ids;
-  BufferSet buffers;
-  VarSet allocation_data;
-  for (const TTBufferMetadata &metadata : table) {
-    if (!metadata.defined() || !metadata->buffer.defined()) {
-      ThrowMalformed("'tt.buffer_metadata_table' contains an undefined entry");
-    }
-    if (!ids.insert(metadata->buffer_id).second) {
-      ThrowMalformed("duplicate buffer_id '" +
-                     std::string(metadata->buffer_id) + "'");
-    }
-    if (!buffers.insert(metadata->buffer).second) {
-      ThrowMalformed("'tt.buffer_metadata_table' contains a Buffer more than "
-                     "once");
-    }
-    allocation_data.insert(metadata->buffer->data);
-  }
-
-  for (const auto &[parameter, buffer] : func->buffer_map) {
-    if (!buffers.count(buffer)) {
-      ThrowMalformed("'tt.buffer_metadata_table' omits parameter Buffer '" +
-                     std::string(buffer->name) + "'");
-    }
-  }
-  for (const AllocationRecord &allocation :
-       AllocationCollector::Collect(func->body)) {
-    // LowerOpaqueBlock retains the logical Buffer in DeclBuffer but creates
-    // a physical allocation Buffer sharing its data Var. Allocation metadata
-    // is attached to that storage identity, not to a particular wrapper.
-    if (!allocation_data.count(allocation.buffer->data)) {
-      ThrowMalformed("'tt.buffer_metadata_table' omits allocated Buffer '" +
-                     std::string(allocation.buffer->name) + "'");
-    }
-  }
-}
-
 PrimFunc NormalizeBufferMetadata(PrimFunc func) {
-  if (auto table = func->GetAttr<ffi::Array<TTBufferMetadata>>(
-          kBufferMetadataTableAttr)) {
-    ValidateExistingTable(func, table.value());
-    return func;
-  }
-
   ffi::Array<TTBufferMetadata> table;
   BufferSet seen_buffers;
   VarStringMap first_id_by_data;

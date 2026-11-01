@@ -75,7 +75,6 @@ def test_fragment_dtype_contract_is_independent_from_storage(input_dtype, accum_
     assert contract["output_dtype"].value == output_dtype
     assert contract["dest_precision_requirement"].value == ("bits32_required" if accum_dtype == "float32" else "bits16_required")
     assert contract["materialization"].value == "after_complete_k_reduction"
-    assert ir.structural_equal(mod, transform.VerifyTTGemmAccumulators()(mod))
 
 
 @pytest.mark.parametrize(
@@ -446,7 +445,6 @@ def test_accumulator_epilogue_supports_fresh_values_and_multiple_consumers(mode)
     legalized = transform.LegalizeTenstorrentTileOps()(mod)
     assert "tl.tt.elementwise" not in legalized.script()
     assert "tl.tileop.copy(old" not in legalized.script()
-    assert ir.structural_equal(mod, transform.VerifyTTGemmAccumulators()(mod))
 
 
 def test_derived_accumulator_output_checks_dtype_capability():

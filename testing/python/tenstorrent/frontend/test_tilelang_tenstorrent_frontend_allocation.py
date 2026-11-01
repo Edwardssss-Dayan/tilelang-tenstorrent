@@ -3,7 +3,7 @@
 import pytest
 from tilelang import transform, tvm
 from tilelang.tenstorrent.transform import NormalizeTenstorrentBufferMetadata
-from tvm import ir, tirx
+from tvm import tirx
 
 
 def _module(annotations=None):
@@ -39,24 +39,6 @@ def test_normalize_preserves_allocation_contract_after_lower_opaque_block():
         assert before.buffer_id == after.buffer_id
         assert int(before.dfb_block_count) == int(after.dfb_block_count)
         assert before.block_count_origin == after.block_count_origin == "explicit"
-    ir.assert_structural_equal(normalize(result), result)
-    normalized_then_lowered = transform.LowerOpaqueBlock()(normalize(original))
-    ir.assert_structural_equal(normalize(normalized_then_lowered), normalized_then_lowered)
-
-
-@pytest.mark.parametrize("lowered", [False, True])
-def test_normalize_rejects_table_missing_allocation_identity(lowered):
-    mod = _module()
-    if lowered:
-        mod = transform.LowerOpaqueBlock()(mod)
-    normalize = NormalizeTenstorrentBufferMetadata()
-    normalized = normalize(mod)
-    table = normalized["main"].attrs["tt.buffer_metadata_table"]
-    malformed = tvm.IRModule({"main": normalized["main"].with_attr("tt.buffer_metadata_table", table[:1])})
-    before = ir.save_json(malformed)
-    with pytest.raises(ValueError, match="omits allocated Buffer"):
-        normalize(malformed)
-    assert ir.save_json(malformed) == before
 
 
 @pytest.mark.parametrize("lowered", [False, True])

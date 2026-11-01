@@ -96,7 +96,8 @@ def test_supported_computation_still_returns_device_ir():
     result = lower_tenstorrent_ir(tvm.IRModule({"main": program("float32")}), TARGET)
     assert str(result.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in result.attrs
-    assert lower_tenstorrent_ir(result, TARGET).same_as(result)
+    with pytest.raises(ValueError, match="original frontend module"):
+        lower_tenstorrent_ir(result, TARGET)
 
 
 @pytest.mark.parametrize(
@@ -124,7 +125,7 @@ def test_unconsumed_compute_is_rejected_before_host_device_filtering():
 
 def test_stage_marker_cannot_bypass_frontend_verification():
     malformed = tvm.IRModule({"main": program(initialize=False)}).with_attr("tt.ir_stage", "structured")
-    with pytest.raises(ValueError, match="Cannot re-lower normalized structured IR"):
+    with pytest.raises(ValueError, match="original frontend module"):
         lower_tenstorrent_ir(malformed, TARGET)
 
 

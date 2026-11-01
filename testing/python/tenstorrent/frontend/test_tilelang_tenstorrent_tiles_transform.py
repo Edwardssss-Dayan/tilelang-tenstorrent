@@ -631,7 +631,6 @@ def test_orphan_frontend_annotations_cannot_bypass_capture_or_verification():
 
 def test_structured_annotations_require_compute_kind():
     mod = _change_compute_block(_canonicalize(_module()), lambda fields: fields["annotations"].pop("tl.tt.compute_kind"))
-    _reject(mod, "raw Frontend IR.*wrong-stage")
     with pytest.raises(ValueError, match="missing metadata tl.tt.compute_kind"):
         transform.VerifyTTComputeBlocks()(mod)
 
@@ -861,11 +860,6 @@ def test_verifier_rejects_rank3_existing_structured_block(round_trip):
     assert ir.save_json(mod) == before
 
 
-def test_canonicalizer_rejects_structured_input_as_wrong_stage():
-    mod = _canonicalize(_module())
-    _reject(mod, "raw Frontend IR.*wrong-stage")
-
-
 @pytest.mark.parametrize("outer_frontend", ["tiles", "parallel"])
 def test_reject_mixed_frontends_within_one_loop_nest(outer_frontend):
     mod = _module()
@@ -992,31 +986,8 @@ def test_pipeline_accepts_static_original_tiles_extents(size):
     assert "tt.device_ir_version" not in lowered.attrs
 
 
-def _partially_canonicalized_two_scope_module():
-    raw = tirx.transform.BindTarget(tvm.target.Target(TARGET))(tvm.IRModule({"main": _io_function(size=64, twice=True)}))
-    fully_canonical = _canonicalize(raw)
-    first = _blocks(fully_canonical)[0]
-    replacement = tirx.SBlockRealize([], True, first)
-    replaced = False
-
-    def replace_first_scope(node):
-        nonlocal replaced
-        if not replaced and isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
-            replaced = True
-            return replacement
-        return None
-
-    body = tirx.stmt_functor.ir_transform(raw["main"].body, None, replace_first_scope)
-    assert replaced
-    return tvm.IRModule({"main": raw["main"].with_body(body)})
-
-
-def test_canonicalizer_rejects_partial_structured_input_without_mutation():
-    _reject(_partially_canonicalized_two_scope_module(), "raw Frontend IR.*wrong-stage")
-
-
 @pytest.mark.parametrize("size", [32, 64])
-def test_pipeline_executes_elementwise_once_before_verification_and_consumption(monkeypatch, size):
+def test_pipeline_executes_each_fixed_stage_once(monkeypatch, size):
     from tilelang.tenstorrent.pipeline import TENSTORRENT_LOWER_PASS_ORDER
 
     @tvm.instrument.pass_instrument
@@ -1041,14 +1012,16 @@ def test_pipeline_executes_elementwise_once_before_verification_and_consumption(
     recorder = RecordPasses()
     with tvm.transform.PassContext(instruments=[recorder]):
         lowered = context.lower(tvm.IRModule({"main": _io_function(size=size)}))
-    # Legalization internally verifies and runs a nested PrimFunc pass; record
-    # backend pipeline stages separately from those implementation details.
     names = [name for name in recorder.top_level_names if name in TENSTORRENT_LOWER_PASS_ORDER]
     expected = list(TENSTORRENT_LOWER_PASS_ORDER)
     assert str(lowered.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in lowered.attrs
     assert names == expected
     assert recorder.names.count("CanonicalizeTTElementwise") == 1
+    assert recorder.names.count("VerifyTTComputeBlocks") == 0
+    assert recorder.names.count("VerifyTTGemmAccumulators") == 1
+    assert recorder.names.count("VerifyTTStructuredDataflow") == 1
+    assert recorder.names.count("VerifyTenstorrentDeviceIR") == 1
 
 
 @pytest.mark.parametrize("size,compound,twice", [(64, False, False), (32, True, False), (64, True, False), (32, False, True)])

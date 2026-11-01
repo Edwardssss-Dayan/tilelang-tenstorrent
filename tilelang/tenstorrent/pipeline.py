@@ -72,22 +72,10 @@ def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
         raise ValueError("Tenstorrent lowering requires a tenstorrent target")
 
     stage = "" if mod.attrs is None else str(mod.attrs.get("tt.ir_stage", ""))
-    if stage == "device":
-        verified = transform.VerifyTenstorrentDeviceIR()(mod)
-        if str(verified.attrs["tt.target_arch"]) != str(target.attrs["arch"]):
-            raise ValueError("Tenstorrent Device IR architecture disagrees with lowering target")
-        return verified
-
-    if mod.attrs is not None and "tt.device_ir_version" in mod.attrs:
-        raise ValueError(
-            "lower_tenstorrent_ir accepts only the stage-marked current contract; "
-            "verify legacy versioned artifacts explicitly with VerifyTenstorrentDeviceIR"
-        )
-
-    # The normalized launch no longer has the frontend's thread-binding nest.
-    # Do not skip frontend validation based on an untrusted stage annotation.
     if stage:
-        raise ValueError("Cannot re-lower normalized structured IR; pass the original frontend module instead")
+        raise ValueError("lower_tenstorrent_ir accepts only the original frontend module")
+    if mod.attrs is not None and "tt.device_ir_version" in mod.attrs:
+        raise ValueError("lower_tenstorrent_ir does not accept versioned Device IR")
     _reject_prebound_frontend_targets(mod)
     if mod.attrs is not None and "tt.deferred_reasons" in mod.attrs:
         mod = mod.without_attr("tt.deferred_reasons")
@@ -128,15 +116,13 @@ def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
     if reasons:
         # Return the whole original module, including supported siblings. Never
         # leak a mixture of selected Device instructions and expression templates.
-        normalized = transform.VerifyTTStructuredDataflow()(normalized)
         return normalized.with_attrs({"tt.ir_stage": "structured", "tt.deferred_reasons": sorted(reasons)})
 
     try:
         mod = transform.InferTenstorrentTensorLayout()(mod)
         mod = transform.FormTenstorrentDeviceProgram()(mod)
     except NotImplementedError as exc:
-        verified = transform.VerifyTTStructuredDataflow()(normalized)
-        return verified.with_attrs(
+        return normalized.with_attrs(
             {
                 "tt.ir_stage": "structured",
                 "tt.deferred_reasons": [str(exc)],
@@ -145,8 +131,7 @@ def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
     try:
         mod = transform.InferTenstorrentComputeRequirements()(mod)
     except NotImplementedError as exc:
-        verified = transform.VerifyTTStructuredDataflow()(normalized)
-        return verified.with_attrs(
+        return normalized.with_attrs(
             {
                 "tt.ir_stage": "structured",
                 "tt.deferred_reasons": [str(exc)],

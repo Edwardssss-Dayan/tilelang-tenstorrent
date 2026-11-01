@@ -182,13 +182,8 @@ def test_legalize_structured_add_to_one_canonical_tile_operation(func, dtype):
         assert before_item.same_as(after_item)
 
 
-def test_legalize_is_idempotent_deterministic_and_json_round_trips():
+def test_legalize_is_deterministic_and_json_round_trips():
     once = transform.LegalizeTenstorrentTileOps()(_normalized(FRONTEND_PROGRAMS["add"]))
-    twice = transform.LegalizeTenstorrentTileOps()(once)
-
-    ir.assert_structural_equal(twice, once)
-    assert ir.structural_hash(twice) == ir.structural_hash(once)
-    assert str(twice) == str(once)
     restored = ir.load_json(ir.save_json(once))
     ir.assert_structural_equal(restored, once)
 

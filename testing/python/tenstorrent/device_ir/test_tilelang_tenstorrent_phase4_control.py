@@ -68,10 +68,7 @@ def test_independent_iteration_stays_structured_and_preserves_tensor_inout():
     assert all(int(d.transaction_count_or_loop_relation) == 3 for d in mod.attrs["tt.dfb_table"])
     a = np.arange(4096, dtype=np.float32).reshape(64, 64)
     np.testing.assert_array_equal(run_device(mod, [a])[0], a + 6)
-    from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
-
-    target = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
-    assert TenstorrentPassPipelineBody(mod, target).same_as(mod)
+    assert VerifyTenstorrentDeviceIR()(mod).same_as(mod)
 
 
 def test_index_dependent_conditions_normalize_without_semantic_loss():

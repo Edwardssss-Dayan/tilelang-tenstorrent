@@ -827,8 +827,8 @@ public:
       ThrowMalformed("resource identity index is out of range");
     const ResourceVersion &resource = resources_[id];
     return resource.metadata->buffer_id + ".generation" +
-           std::to_string(resource.generation) + "." + resource.producer +
-           "." + resource.consumer;
+           std::to_string(resource.generation) + "." + resource.producer + "." +
+           resource.consumer;
   }
   std::string ResourceStorageIdentity(int64_t id) const {
     if (id < 0 || id >= static_cast<int64_t>(resources_.size()))
@@ -2037,14 +2037,16 @@ private:
                      [&](const ffi::ObjectRef &node) {
                        const auto *access = node.as<CallNode>();
                        has_access_leaf |=
-                           access && access->op.same_as(tenstorrent::compute_access());
+                           access &&
+                           access->op.same_as(tenstorrent::compute_access());
                      });
       if (has_access_leaf && access_ids.empty()) {
         std::string keys;
         for (const auto &[key, value] : call->annotations)
           keys += (keys.empty() ? "" : ",") + std::string(key);
-        ThrowMalformed("compute_access expression lost tt.access_ids (annotations: " +
-                       keys + ")");
+        ThrowMalformed(
+            "compute_access expression lost tt.access_ids (annotations: " +
+            keys + ")");
       }
       DeviceExpressionRewriter rewriter(dfb_inputs, local_inputs,
                                         std::move(dfb_accesses),
@@ -2496,23 +2498,28 @@ private:
     if (!contract)
       ThrowMalformed("high-level transfer contract is not a string");
     bool source = core_x_ == sx && core_y_ == sy;
-    bool destination = bx <= core_x_ && core_x_ < ex && by <= core_y_ &&
-                       core_y_ < ey;
+    bool destination =
+        bx <= core_x_ && core_x_ < ex && by <= core_y_ && core_y_ < ey;
     if (!source && !destination)
       return;
     if (source && destination)
       ThrowMalformed("source-exclusive transfer includes the source Core");
-    ffi::Array<Integer> record{
-        Integer(site), Integer(sy * grid_x_ + sx),
-        Integer(contract->value == "collective" ? 1 : 0), Integer(sx),
-        Integer(sy),   Integer(bx), Integer(by), Integer(ex), Integer(ey)};
-    ffi::Map<ffi::String, ffi::ObjectRef> annotations{{"tt.pipe_record", record}};
-    Call endpoint(
-        DataType::Void(),
-        source ? tenstorrent::pipe_send() : tenstorrent::pipe_recv(),
-        source ? ffi::Array<PrimExpr>{call->args[0], Integer(0)}
-               : ffi::Array<PrimExpr>{Integer(0), call->args[1]},
-        annotations, call->span);
+    ffi::Array<Integer> record{Integer(site),
+                               Integer(sy * grid_x_ + sx),
+                               Integer(contract->value == "collective" ? 1 : 0),
+                               Integer(sx),
+                               Integer(sy),
+                               Integer(bx),
+                               Integer(by),
+                               Integer(ex),
+                               Integer(ey)};
+    ffi::Map<ffi::String, ffi::ObjectRef> annotations{
+        {"tt.pipe_record", record}};
+    Call endpoint(DataType::Void(),
+                  source ? tenstorrent::pipe_send() : tenstorrent::pipe_recv(),
+                  source ? ffi::Array<PrimExpr>{call->args[0], Integer(0)}
+                         : ffi::Array<PrimExpr>{Integer(0), call->args[1]},
+                  annotations, call->span);
     PlanPipe(endpoint);
   }
 
@@ -2524,37 +2531,34 @@ private:
   ffi::Array<Integer> DirectRecord(int64_t site, int64_t record_index,
                                    int64_t sx, int64_t sy, int64_t dx,
                                    int64_t dy) const {
-    return {Integer(site), Integer(record_index), Integer(0), Integer(sx),
-            Integer(sy),   Integer(dx),           Integer(dy), Integer(dx + 1),
-            Integer(dy + 1)};
+    return {Integer(site), Integer(record_index), Integer(0),
+            Integer(sx),   Integer(sy),           Integer(dx),
+            Integer(dy),   Integer(dx + 1),       Integer(dy + 1)};
   }
 
   void PlanDirectEndpoint(bool send, const BufferRegion &region,
-                          const ffi::Array<Integer> &record,
-                          const Span &span) {
-    ffi::Map<ffi::String, ffi::ObjectRef> annotations{{"tt.pipe_record", record}};
-    Call endpoint(
-        DataType::Void(),
-        send ? tenstorrent::pipe_send() : tenstorrent::pipe_recv(),
-        send ? ffi::Array<PrimExpr>{region->ToPrimExpr(), Integer(0)}
-             : ffi::Array<PrimExpr>{Integer(0), region->ToPrimExpr()},
-        annotations, span);
+                          const ffi::Array<Integer> &record, const Span &span) {
+    ffi::Map<ffi::String, ffi::ObjectRef> annotations{
+        {"tt.pipe_record", record}};
+    Call endpoint(DataType::Void(),
+                  send ? tenstorrent::pipe_send() : tenstorrent::pipe_recv(),
+                  send ? ffi::Array<PrimExpr>{region->ToPrimExpr(), Integer(0)}
+                       : ffi::Array<PrimExpr>{Integer(0), region->ToPrimExpr()},
+                  annotations, span);
     PlanPipe(endpoint);
   }
 
   Stmt MakeCollectiveStepCall(const Op &op, ffi::Array<PrimExpr> args,
                               int64_t site, int64_t occurrence,
-                              const ffi::String &kind,
-                              const Span &span) const {
+                              const ffi::String &kind, const Span &span) const {
     ffi::Map<ffi::String, ffi::ObjectRef> annotations{
         {"tt.communication_site", Integer(site)},
         {"tt.communication_occurrence", Integer(occurrence)},
         {"tt.communication_step_kind", StringImm(kind)},
         {"tt.core_x", Integer(core_x_)},
         {"tt.core_y", Integer(core_y_)}};
-    return Evaluate(Call(DataType::Void(), op, std::move(args), annotations,
-                         span),
-                    span);
+    return Evaluate(
+        Call(DataType::Void(), op, std::move(args), annotations, span), span);
   }
 
   Buffer MakeCollectiveTemporary(const BufferRegion &payload, int64_t site,
@@ -2609,10 +2613,10 @@ private:
         if (destination_rank == local_rank)
           continue;
         int64_t record_index = local_rank * group_size + destination_rank;
-        PlanDirectEndpoint(true, source,
-                           DirectRecord(site, record_index, core_x_, core_y_, dx,
-                                        dy),
-                           call->span);
+        PlanDirectEndpoint(
+            true, source,
+            DirectRecord(site, record_index, core_x_, core_y_, dx, dy),
+            call->span);
       }
 
     int64_t output = Write(destination->buffer, "trisc");
@@ -2625,14 +2629,14 @@ private:
         if (source_rank == local_rank) {
           input = Read(source->buffer, "trisc");
         } else {
-          Buffer temporary = MakeCollectiveTemporary(
-              source, site, occurrence, source_rank, call->span);
+          Buffer temporary = MakeCollectiveTemporary(source, site, occurrence,
+                                                     source_rank, call->span);
           BufferRegion temporary_region = BufferRegion::FullRegion(temporary);
           int64_t record_index = source_rank * group_size + local_rank;
-          PlanDirectEndpoint(false, temporary_region,
-                             DirectRecord(site, record_index, sx, sy, core_x_,
-                                          core_y_),
-                             call->span);
+          PlanDirectEndpoint(
+              false, temporary_region,
+              DirectRecord(site, record_index, sx, sy, core_x_, core_y_),
+              call->span);
           input = Read(temporary, "trisc");
         }
         Wait(&compute_, input, call->span);
@@ -2673,11 +2677,10 @@ private:
           true, source,
           DirectRecord(site, local_rank, core_x_, core_y_, root_x, root_y),
           call->span);
-      PlanDirectEndpoint(
-          false, destination,
-          DirectRecord(site, group_size + local_rank, root_x, root_y, core_x_,
-                       core_y_),
-          call->span);
+      PlanDirectEndpoint(false, destination,
+                         DirectRecord(site, group_size + local_rank, root_x,
+                                      root_y, core_x_, core_y_),
+                         call->span);
       return;
     }
 
@@ -2687,19 +2690,20 @@ private:
     int64_t local = Read(source->buffer, "trisc");
     Wait(&compute_, local, call->span);
     compute_.push_back(MakeCollectiveStepCall(
-        tenstorrent::dfb_local_copy(), {Integer(local), Integer(output)},
-        site, occurrence, "local_copy", call->span));
+        tenstorrent::dfb_local_copy(), {Integer(local), Integer(output)}, site,
+        occurrence, "local_copy", call->span));
     for (int64_t sy = by; sy < ey; ++sy)
       for (int64_t sx = bx; sx < ex; ++sx) {
         int64_t source_rank = GroupRank(sx, sy, bx, by, ex);
         if (source_rank == 0)
           continue;
-        Buffer temporary = MakeCollectiveTemporary(
-            source, site, occurrence, source_rank, call->span);
+        Buffer temporary = MakeCollectiveTemporary(source, site, occurrence,
+                                                   source_rank, call->span);
         BufferRegion temporary_region = BufferRegion::FullRegion(temporary);
         PlanDirectEndpoint(
             false, temporary_region,
-            DirectRecord(site, source_rank, sx, sy, root_x, root_y), call->span);
+            DirectRecord(site, source_rank, sx, sy, root_x, root_y),
+            call->span);
         int64_t input = Read(temporary, "trisc");
         Wait(&compute_, input, call->span);
         compute_.push_back(MakeCollectiveStepCall(
@@ -2712,11 +2716,10 @@ private:
         int64_t destination_rank = GroupRank(dx, dy, bx, by, ex);
         if (destination_rank == 0)
           continue;
-        PlanDirectEndpoint(
-            true, destination,
-            DirectRecord(site, group_size + destination_rank, root_x, root_y,
-                         dx, dy),
-            call->span);
+        PlanDirectEndpoint(true, destination,
+                           DirectRecord(site, group_size + destination_rank,
+                                        root_x, root_y, dx, dy),
+                           call->span);
       }
   }
 
@@ -2797,9 +2800,9 @@ private:
             record_index >= 1024 || occurrence < 0 || occurrence >= 1024)
           ThrowUnsupported("communication family index exceeds the supported "
                            "site/record/occurrence domain: site=" +
-                           std::to_string(site) + ", record=" +
-                           std::to_string(record_index) + ", occurrence=" +
-                           std::to_string(occurrence));
+                           std::to_string(site) +
+                           ", record=" + std::to_string(record_index) +
+                           ", occurrence=" + std::to_string(occurrence));
         int64_t destination_rank = x * grid_y_ + y;
         int64_t grid_size = grid_x_ * grid_y_;
         __int128 identity =
@@ -2813,9 +2816,8 @@ private:
         if (found != transfers_->end() && found->second != transfer)
           ThrowMalformed("communication transfer identity is not stable");
         (*transfers_)[key] = transfer;
-        endpoints_.push_back(
-            {transfer, occurrence, record, x, y, id, send,
-             send && forward, call->span});
+        endpoints_.push_back({transfer, occurrence, record, x, y, id, send,
+                              send && forward, call->span});
         auto *body = send && !forward ? &pipe_ : &transfer_;
         body->push_back(MakeDeviceCall(
             send ? tenstorrent::dfb_pipe_send() : tenstorrent::dfb_pipe_recv(),
@@ -3096,8 +3098,8 @@ private:
 
 using TransferStepKey =
     std::tuple<int64_t, std::string, int64_t, int64_t, std::string>;
-using LocalStepKey = std::tuple<int64_t, int64_t, std::string, int64_t,
-                                int64_t, int64_t, int64_t>;
+using LocalStepKey = std::tuple<int64_t, int64_t, std::string, int64_t, int64_t,
+                                int64_t, int64_t>;
 
 class CommunicationStepRefAttacher : public StmtExprMutator {
 public:
@@ -3124,16 +3126,15 @@ public:
           const CommunicationStepDescriptor &dependency =
               steps[step->dependencies[0]->value];
           coord = dependency->kind == "send" ? step->source_core.value()
-                                              : step->destination_core.value();
+                                             : step->destination_core.value();
         }
-        TransferStepKey key{*parameter, std::string(step->owner_slot),
-                            coord->x, coord->y, kind};
+        TransferStepKey key{*parameter, std::string(step->owner_slot), coord->x,
+                            coord->y, kind};
         if (!transfer_steps_.emplace(key, step->step_id).second)
           ThrowMalformed("duplicate transport step identity");
         continue;
       }
-      if (!step->source_core.has_value() ||
-          !step->destination_core.has_value())
+      if (!step->source_core.has_value() || !step->destination_core.has_value())
         ThrowMalformed("local communication step requires Core coordinates");
       LocalStepKey key{
           step->communication_id,
@@ -3155,7 +3156,7 @@ public:
     auto static_arg = [&](size_t index, const char *label) {
       if (index >= call->args.size() || !as_const_int(call->args[index]))
         ThrowMalformed(std::string(label) + " must be a static integer before "
-                       "shared-body parameterization");
+                                            "shared-body parameterization");
       return *as_const_int(call->args[index]);
     };
     auto transfer_ref = [&](int64_t transfer, const char *kind) {
@@ -3323,9 +3324,9 @@ struct StorageSchedule {
   std::set<int64_t> repeated_resources;
 };
 
-StorageSchedule BuildStorageSchedule(
-    const std::array<std::vector<DeviceCoreBody>, 3> &bodies,
-    const ffi::Array<DFBDescriptor> &dfbs) {
+StorageSchedule
+BuildStorageSchedule(const std::array<std::vector<DeviceCoreBody>, 3> &bodies,
+                     const ffi::Array<DFBDescriptor> &dfbs) {
   StorageSchedule result;
   std::map<int64_t, DFBDescriptor> descriptors;
   for (const DFBDescriptor &dfb : dfbs)
@@ -3364,9 +3365,10 @@ StorageSchedule BuildStorageSchedule(
           add_edge(previous, event);
         previous = event;
         for (size_t position : StorageDFBOperandPositions(call))
-          if (position < call->args.size() && as_const_int(call->args[position]) &&
-              scheduled.repeated)
-            result.repeated_resources.insert(*as_const_int(call->args[position]));
+          if (position < call->args.size() &&
+              as_const_int(call->args[position]) && scheduled.repeated)
+            result.repeated_resources.insert(
+                *as_const_int(call->args[position]));
 
         auto key = [&](int64_t resource) {
           return StorageLocalKey{core_body.x, core_body.y, resource};
@@ -3403,7 +3405,8 @@ StorageSchedule BuildStorageSchedule(
                    call->op.same_as(tenstorrent::dfb_pipe_recv())) {
           int64_t transfer = static_arg(call, 0);
           int64_t resource = static_arg(call, 1);
-          TransferKey transfer_key{core_body.x, core_body.y, transfer, resource};
+          TransferKey transfer_key{core_body.x, core_body.y, transfer,
+                                   resource};
           if (call->op.same_as(tenstorrent::dfb_pipe_send())) {
             const DFBDescriptor &descriptor = descriptors.at(resource);
             bool forwarding = slot == descriptor->producer_slot &&
@@ -3415,7 +3418,8 @@ StorageSchedule BuildStorageSchedule(
         } else if (call->op.same_as(tenstorrent::dfb_pipe_wait())) {
           int64_t transfer = static_arg(call, 0);
           int64_t resource = static_arg(call, 1);
-          TransferKey transfer_key{core_body.x, core_body.y, transfer, resource};
+          TransferKey transfer_key{core_body.x, core_body.y, transfer,
+                                   resource};
           auto sent = sends.find(transfer_key);
           if (sent != sends.end() && sent->second)
             forwarding_completions[key(resource)].push_back(event);
@@ -3458,8 +3462,8 @@ StorageSchedule BuildStorageSchedule(
   return result;
 }
 
-std::map<int64_t, std::map<StorageCoreKey, int64_t>> IndexStorageEvents(
-    const std::map<StorageLocalKey, int64_t> &events) {
+std::map<int64_t, std::map<StorageCoreKey, int64_t>>
+IndexStorageEvents(const std::map<StorageLocalKey, int64_t> &events) {
   std::map<int64_t, std::map<StorageCoreKey, int64_t>> result;
   for (const auto &[key, event] : events)
     result[std::get<2>(key)][{std::get<0>(key), std::get<1>(key)}] = event;
@@ -3495,8 +3499,7 @@ ffi::Map<ffi::String, Integer> PlanNonPipelineStorageGroups(
   };
   auto fifo_ordered = [&](int64_t before, int64_t after) {
     return ordered(reserves, before, after) &&
-           ordered(producers, before, after) &&
-           ordered(waits, before, after) &&
+           ordered(producers, before, after) && ordered(waits, before, after) &&
            ordered(releases, before, after);
   };
 
@@ -3519,9 +3522,11 @@ ffi::Map<ffi::String, Integer> PlanNonPipelineStorageGroups(
           Group &group = groups[group_index];
           if (group.capacity != capacity)
             continue;
-          bool valid_order = std::all_of(
-              group.resources.begin(), group.resources.end(),
-              [&](int64_t previous) { return fifo_ordered(previous, resource); });
+          bool valid_order =
+              std::all_of(group.resources.begin(), group.resources.end(),
+                          [&](int64_t previous) {
+                            return fifo_ordered(previous, resource);
+                          });
           if (!valid_order)
             continue;
           std::vector<std::pair<int64_t, int64_t>> added_edges;
@@ -3530,7 +3535,8 @@ ffi::Map<ffi::String, Integer> PlanNonPipelineStorageGroups(
                 group.resources[group.resources.size() - capacity];
             auto old_releases = releases.find(previous);
             auto next_reserves = reserves.find(resource);
-            if (old_releases == releases.end() || next_reserves == reserves.end())
+            if (old_releases == releases.end() ||
+                next_reserves == reserves.end())
               continue;
             for (const auto &[core, release] : old_releases->second) {
               auto reserve = next_reserves->second.find(core);
@@ -3540,7 +3546,8 @@ ffi::Map<ffi::String, Integer> PlanNonPipelineStorageGroups(
               }
             }
             if (!IsAcyclic(schedule.successors)) {
-              for (auto it = added_edges.rbegin(); it != added_edges.rend(); ++it)
+              for (auto it = added_edges.rbegin(); it != added_edges.rend();
+                   ++it)
                 schedule.successors[it->first].pop_back();
               continue;
             }
@@ -3602,10 +3609,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     StaticIterationSubstituter specialize_y(core_y_var, Integer(y));
     specialized = specialize_y(specialized);
     GeneralDataflowPlanner planner(frontend, metadata, &transfer_keys, x, y);
-    std::vector<For> independent_loops =
-        FindIndependentLoops(specialized);
-    planner.Plan(
-        IndependentLoopBody(independent_loops, specialized));
+    std::vector<For> independent_loops = FindIndependentLoops(specialized);
+    planner.Plan(IndependentLoopBody(independent_loops, specialized));
     planner.EliminateDeadWrites();
     planner.FinalizeMulticore();
     if (planner.IsPipeline()) {
@@ -3642,9 +3647,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
             dfb->block_shape_in_tiles, dfb->block_count, dfb->tensor_backing,
             dfb->producer_slot, shared_domain, dfb->consumer_slot,
             shared_domain,
-            independent_loops.empty()
-                ? dfb->transaction_count_or_loop_relation
-                : transaction_relation,
+            independent_loops.empty() ? dfb->transaction_count_or_loop_relation
+                                      : transaction_relation,
             dfb->source_span));
       } else if (resource_storage_keys.at(global_id) != storage_key) {
         ThrowMalformed("one logical DFB has inconsistent storage identity");
@@ -3684,15 +3688,13 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     for (const AccumulatorDescriptor &accumulator : planner.Accumulators()) {
       accumulators.push_back(AccumulatorDescriptor(
           accumulator->accumulator_id + accumulator_offset,
-          accumulator->accumulator_region,
-          accumulator->input_dtype, accumulator->accumulation_dtype,
-          accumulator->output_dtype, accumulator->full_k_tiles,
-          domain, accumulator->source_span));
+          accumulator->accumulator_region, accumulator->input_dtype,
+          accumulator->accumulation_dtype, accumulator->output_dtype,
+          accumulator->full_k_tiles, domain, accumulator->source_span));
     }
     for (const ComputeValueDescriptor &value : planner.ComputeValues()) {
       compute_values.push_back(ComputeValueDescriptor(
-          value->value_id + value_offset, value->buffer,
-          value->version,
+          value->value_id + value_offset, value->buffer, value->version,
           value->previous_value_id < 0
               ? -1
               : value->previous_value_id + value_offset,
@@ -3700,8 +3702,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
               ? -1
               : value->accumulator_id + accumulator_offset,
           value->value_kind, value->logical_shape, value->compute_tile_shape,
-          value->dtype, value->owner_slot, domain,
-          value->materialization_refs, value->source_span));
+          value->dtype, value->owner_slot, domain, value->materialization_refs,
+          value->source_span));
     }
     for (PipeEndpoint endpoint : planner.Endpoints()) {
       if (endpoint.dfb_id < 0 ||
@@ -3726,8 +3728,7 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       Stmt slot_body = compute            ? planner.ComputeBody()
                        : slot == "ncrisc" ? planner.TransferBody()
                                           : planner.PipeBody();
-      slot_body =
-          WrapIndependentLoops(std::move(slot_body), independent_loops);
+      slot_body = WrapIndependentLoops(std::move(slot_body), independent_loops);
       Stmt local = remap(slot_body);
       if (!(local.as<EvaluateNode>() &&
             is_zero(local.as<EvaluateNode>()->value))) {
@@ -3742,8 +3743,8 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     value_offset += planner.ComputeValues().size();
   }
   if (!pipeline_extent)
-    storage_groups = PlanNonPipelineStorageGroups(
-        dfbs, shared_bodies, resource_storage_keys);
+    storage_groups = PlanNonPipelineStorageGroups(dfbs, shared_bodies,
+                                                  resource_storage_keys);
   std::map<int64_t, PipeEndpoint> senders, receivers;
   std::unordered_map<int64_t, bool> forwarding_transfers;
   std::map<std::pair<int64_t, int64_t>, int64_t> record_payloads;
@@ -3796,8 +3797,9 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     forwarding_transfers.emplace(id, sender.producer_forwarding);
   }
   ffi::Array<CommunicationDescriptor> communications;
-  auto normalized_topology = frontend->GetAttr<
-      ffi::Array<NormalizedTopologyDescriptor>>("tt.normalized_topology");
+  auto normalized_topology =
+      frontend->GetAttr<ffi::Array<NormalizedTopologyDescriptor>>(
+          "tt.normalized_topology");
   if (normalized_topology.has_value()) {
     For logical_x = Downcast<For>(frontend->body);
     For logical_y = Downcast<For>(logical_x->body);
@@ -3819,19 +3821,17 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     for (const NormalizedTopologyDescriptor &entry :
          normalized_topology.value()) {
       ffi::String algorithm =
-          entry->kind == "all_gather"
-              ? ffi::String("direct_all_to_all")
+          entry->kind == "all_gather" ? ffi::String("direct_all_to_all")
           : entry->kind == "all_reduce"
               ? ffi::String("root0_left_fold_broadcast")
           : entry->contract == "collective" ? ffi::String("direct_broadcast")
-                                              : ffi::String("direct_p2p");
+                                            : ffi::String("direct_p2p");
       communications.push_back(CommunicationDescriptor(
           entry->site_id, entry->kind, algorithm, entry->source_region,
           entry->destination_region, parameterize_array(entry->source_coord),
           parameterize_array(entry->group_begin),
           parameterize_array(entry->group_end), parameterize(entry->parameter),
-          entry->contract,
-          entry->occurrence_extents, entry->source_span));
+          entry->contract, entry->occurrence_extents, entry->source_span));
     }
   }
   ffi::Array<CommunicationStepDescriptor> communication_steps;
@@ -3864,11 +3864,9 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
         transfer->destination_dfb_id, "ncrisc", {},
         Integer(transfer->transfer_id), transfer->source_span);
     add_step(transfer->pipe_net_id, transfer->occurrence, "completion",
-             transfer->src_coord, transfer->dst_coord,
-             transfer->source_dfb_id, transfer->destination_dfb_id,
-             source_owner,
-             {Integer(send)}, Integer(transfer->transfer_id),
-             transfer->source_span);
+             transfer->src_coord, transfer->dst_coord, transfer->source_dfb_id,
+             transfer->destination_dfb_id, source_owner, {Integer(send)},
+             Integer(transfer->transfer_id), transfer->source_span);
     int64_t completed = add_step(
         transfer->pipe_net_id, transfer->occurrence, "completion",
         transfer->src_coord, transfer->dst_coord, transfer->source_dfb_id,
@@ -3893,13 +3891,11 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
         return;
       int64_t site = Downcast<Integer>(site_attr.value())->value;
       int64_t occurrence =
-          Downcast<Integer>(
-              call->annotations.at("tt.communication_occurrence"))
+          Downcast<Integer>(call->annotations.at("tt.communication_occurrence"))
               ->value;
-      ffi::String kind =
-          Downcast<StringImm>(
-              call->annotations.at("tt.communication_step_kind"))
-              ->value;
+      ffi::String kind = Downcast<StringImm>(
+                             call->annotations.at("tt.communication_step_kind"))
+                             ->value;
       CoreCoord core(
           Downcast<Integer>(call->annotations.at("tt.core_x"))->value,
           Downcast<Integer>(call->annotations.at("tt.core_y"))->value);
@@ -3926,9 +3922,9 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
       auto previous = last_output_step.find(destination);
       if (previous != last_output_step.end())
         dependencies.push_back(Integer(previous->second));
-      int64_t step = add_step(site, occurrence, kind, core, core, source,
-                              destination, "trisc", dependencies, parameter,
-                              call->span);
+      int64_t step =
+          add_step(site, occurrence, kind, core, core, source, destination,
+                   "trisc", dependencies, parameter, call->span);
       last_output_step[destination] = step;
     });
   }
@@ -3952,20 +3948,20 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     auto coordinate = [](const ffi::Optional<CoreCoord> &coord, bool x) {
       return coord.has_value() ? (x ? coord.value()->x : coord.value()->y) : -1;
     };
-    return std::make_tuple(
-               a->communication_id, step_phase(a), a->kind, a->owner_slot,
-               dependency_kind(a), a->dependencies.size(), a->occurrence,
-               coordinate(a->source_core, true),
-               coordinate(a->source_core, false),
-               coordinate(a->destination_core, true),
-               coordinate(a->destination_core, false), a->step_id) <
-           std::make_tuple(
-               b->communication_id, step_phase(b), b->kind, b->owner_slot,
-               dependency_kind(b), b->dependencies.size(), b->occurrence,
-               coordinate(b->source_core, true),
-               coordinate(b->source_core, false),
-               coordinate(b->destination_core, true),
-               coordinate(b->destination_core, false), b->step_id);
+    return std::make_tuple(a->communication_id, step_phase(a), a->kind,
+                           a->owner_slot, dependency_kind(a),
+                           a->dependencies.size(), a->occurrence,
+                           coordinate(a->source_core, true),
+                           coordinate(a->source_core, false),
+                           coordinate(a->destination_core, true),
+                           coordinate(a->destination_core, false), a->step_id) <
+           std::make_tuple(b->communication_id, step_phase(b), b->kind,
+                           b->owner_slot, dependency_kind(b),
+                           b->dependencies.size(), b->occurrence,
+                           coordinate(b->source_core, true),
+                           coordinate(b->source_core, false),
+                           coordinate(b->destination_core, true),
+                           coordinate(b->destination_core, false), b->step_id);
   };
   std::vector<int64_t> indegree(communication_steps.size(), 0);
   std::vector<std::vector<size_t>> successors(communication_steps.size());
@@ -4019,15 +4015,15 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
     const ffi::String &slot = slots[index];
     for (DeviceCoreBody &core_body : shared_bodies[index]) {
       CommunicationStepRefAttacher attach(communication_steps, slot,
-                                           core_body.x, core_body.y);
+                                          core_body.x, core_body.y);
       core_body.body = attach(core_body.body);
     }
     bool compute = slot == "trisc";
     ffi::Array<Integer> tensor_indices;
     for (int64_t tensor : shared_tensor_indices[index])
       tensor_indices.push_back(Integer(tensor));
-    Stmt slot_body = ParameterizeDeviceCoreStatements(
-        shared_bodies[index], gx, gy, slot, frontend->span);
+    Stmt slot_body = ParameterizeDeviceCoreStatements(shared_bodies[index], gx,
+                                                      gy, slot, frontend->span);
     PrimFunc func = MakeSlotFunction(
         frontend, target, shared_domain, operation, slot,
         compute ? "compute" : "datamovement",
@@ -4083,17 +4079,6 @@ IRModule FormMulticoreProgram(const IRModule &input, const PrimFunc &frontend,
 }
 
 IRModule FormProgram(const IRModule &input) {
-  auto stage = input->GetAttr<ffi::String>("tt.ir_stage");
-  if (stage.has_value()) {
-    if (stage.value() == "device")
-      return VerifyTenstorrentDeviceIR()(input);
-    ThrowMalformed("formation requires original/structured input, not stage '" +
-                   std::string(stage.value()) + "'");
-  }
-  if (input->GetAttr<Integer>(kDeviceIRVersionAttr).has_value()) {
-    return VerifyTenstorrentDeviceIR()(input);
-  }
-
   ffi::Optional<GlobalVar> frontend_global;
   ffi::Optional<PrimFunc> frontend_func;
   for (const auto &[global_var, base_func] : input->functions) {
@@ -4153,8 +4138,7 @@ IRModule FormProgram(const IRModule &input) {
     return FormMulticoreProgram(
         input, frontend, target.value(), frontend_global.value()->name_hint,
         target_arch.value(), grid_x, grid_y, kernel_body, xloop->loop_var,
-        yloop->loop_var,
-        buffer_table.value());
+        yloop->loop_var, buffer_table.value());
   }
   if (grid_x != 1 || grid_y != 1)
     ThrowMalformed("multi-Core input requires NormalizeTenstorrentTopology");
