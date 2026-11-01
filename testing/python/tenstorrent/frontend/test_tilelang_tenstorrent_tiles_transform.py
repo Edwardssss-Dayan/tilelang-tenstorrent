@@ -249,10 +249,9 @@ def test_independent_scopes_preserve_enclosing_serial_loop(outer_loop, twice):
 
 
 @pytest.mark.parametrize("broadcast", [False, True])
-def test_idempotency_and_json_roundtrip_preserve_buffer_identity(broadcast):
+def test_json_roundtrip_and_verifier_preserve_buffer_identity(broadcast):
     source = _module((64, 256), b_shape=(32, 256), expression=lambda a, b, c, ij: a[tuple(ij)] + b[0, ij[1]]) if broadcast else _module()
     mod = _canonicalize(source)
-    ir.assert_structural_equal(mod, _canonicalize(mod))
     restored = ir.load_json(ir.save_json(mod))
     ir.assert_structural_equal(restored, mod)
     transform.VerifyTTComputeBlocks()(restored)
@@ -632,6 +631,7 @@ def test_orphan_frontend_annotations_cannot_bypass_capture_or_verification():
 
 def test_structured_annotations_require_compute_kind():
     mod = _change_compute_block(_canonicalize(_module()), lambda fields: fields["annotations"].pop("tl.tt.compute_kind"))
+    _reject(mod, "raw Frontend IR.*wrong-stage")
     with pytest.raises(ValueError, match="missing metadata tl.tt.compute_kind"):
         transform.VerifyTTComputeBlocks()(mod)
 
@@ -850,16 +850,20 @@ def _rank3_structured_module():
     return tvm.IRModule({"main": func.with_body(tirx.stmt_functor.ir_transform(func.body, None, replace_scope))})
 
 
-@pytest.mark.parametrize("pass_factory", [transform.VerifyTTComputeBlocks, transform.CanonicalizeTTElementwise])
 @pytest.mark.parametrize("round_trip", [False, True])
-def test_reject_rank3_existing_structured_block(pass_factory, round_trip):
+def test_verifier_rejects_rank3_existing_structured_block(round_trip):
     mod = _rank3_structured_module()
     if round_trip:
         mod = ir.load_json(ir.save_json(mod))
     before = ir.save_json(mod)
     with pytest.raises(ValueError, match="structured elementwise logical domain must have rank 2"):
-        pass_factory()(mod)
+        transform.VerifyTTComputeBlocks()(mod)
     assert ir.save_json(mod) == before
+
+
+def test_canonicalizer_rejects_structured_input_as_wrong_stage():
+    mod = _canonicalize(_module())
+    _reject(mod, "raw Frontend IR.*wrong-stage")
 
 
 @pytest.mark.parametrize("outer_frontend", ["tiles", "parallel"])
@@ -988,24 +992,10 @@ def test_pipeline_accepts_static_original_tiles_extents(size):
     assert "tt.device_ir_version" not in lowered.attrs
 
 
-def _partially_canonicalized_two_scope_module(*, malformed=False):
+def _partially_canonicalized_two_scope_module():
     raw = tirx.transform.BindTarget(tvm.target.Target(TARGET))(tvm.IRModule({"main": _io_function(size=64, twice=True)}))
     fully_canonical = _canonicalize(raw)
     first = _blocks(fully_canonical)[0]
-    if malformed:
-        annotations = dict(first.annotations)
-        del annotations["tl.tt.access_table"]
-        first = tirx.SBlock(
-            first.iter_vars,
-            first.reads,
-            first.writes,
-            first.name_hint,
-            first.body,
-            init=first.init,
-            alloc_buffers=first.alloc_buffers,
-            match_buffers=first.match_buffers,
-            annotations=annotations,
-        )
     replacement = tirx.SBlockRealize([], True, first)
     replaced = False
 
@@ -1018,43 +1008,11 @@ def _partially_canonicalized_two_scope_module(*, malformed=False):
 
     body = tirx.stmt_functor.ir_transform(raw["main"].body, None, replace_first_scope)
     assert replaced
-    if malformed:
-        corrupted_raw = False
-
-        def corrupt_remaining_raw_scope(node):
-            nonlocal corrupted_raw
-            if not corrupted_raw and isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
-                corrupted_raw = True
-                return tirx.For(
-                    node.loop_var,
-                    node.min,
-                    48,
-                    node.kind,
-                    node.body,
-                    node.thread_binding,
-                    node.annotations,
-                    node.step,
-                )
-            return None
-
-        body = tirx.stmt_functor.ir_transform(body, None, corrupt_remaining_raw_scope)
-        assert corrupted_raw
-    return tvm.IRModule({"main": raw["main"].with_body(body)}), fully_canonical
+    return tvm.IRModule({"main": raw["main"].with_body(body)})
 
 
-def test_partial_canonical_input_converges_with_fully_raw_input():
-    partial, fully_canonical = _partially_canonicalized_two_scope_module()
-    result = _canonicalize(partial)
-    ir.assert_structural_equal(result, fully_canonical)
-    ir.assert_structural_equal(result, _canonicalize(result))
-
-
-def test_malformed_partial_canonical_input_fails_without_mutation():
-    partial, _ = _partially_canonicalized_two_scope_module(malformed=True)
-    before = ir.save_json(partial)
-    with pytest.raises(ValueError, match="structured block missing metadata.*access_table"):
-        _canonicalize(partial)
-    assert ir.save_json(partial) == before
+def test_canonicalizer_rejects_partial_structured_input_without_mutation():
+    _reject(_partially_canonicalized_two_scope_module(), "raw Frontend IR.*wrong-stage")
 
 
 @pytest.mark.parametrize("size", [32, 64])
@@ -1261,7 +1219,6 @@ def test_deferred_compute_cannot_bypass_topology_validation(monkeypatch):
 def test_tiles02_scope_combinations_preserve_value_kinds(a_scope, b_scope, c_scope, flat_allocations):
     source = _module(a_scope=a_scope, b_scope=b_scope, c_scope=c_scope, flat_allocations=flat_allocations)
     mod = _canonicalize(source)
-    ir.assert_structural_equal(mod, _canonicalize(mod))
     restored = ir.load_json(ir.save_json(mod))
     ir.assert_structural_equal(restored, mod)
     before_verify = ir.save_json(restored)

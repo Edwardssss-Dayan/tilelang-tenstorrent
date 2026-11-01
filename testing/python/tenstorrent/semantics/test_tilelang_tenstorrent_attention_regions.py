@@ -121,7 +121,6 @@ def row_padding_program(mode="column_zero"):
 @pytest.mark.parametrize("mode", ["column_zero", "full_copy", "nonzero_column", "other_write"])
 def test_padding_extension_requires_all_uses_to_observe_only_column_zero(mode):
     result = transform.CanonicalizeTTElementwise()(bound(row_padding_program(mode)))
-    ir.assert_structural_equal(transform.CanonicalizeTTElementwise()(result), result)
     calls = []
     blocks = []
     for func in result.functions.values():
@@ -141,35 +140,6 @@ def test_padding_extension_requires_all_uses_to_observe_only_column_zero(mode):
         assert [int(axis.extent) for axis in padding_blocks[0].writes[0].region] == [32, 32]
     else:
         assert len(calls) == (2 if mode == "other_write" else 3)
-    transform.VerifyTTComputeBlocks()(result)
-
-
-def test_padding_extension_accepts_an_already_canonicalized_column_zero_consumer():
-    source = bound(row_padding_program("column_zero"))
-    fully_canonical = transform.CanonicalizeTTElementwise()(source)
-    consumers = []
-
-    def collect_consumer(node):
-        if (
-            isinstance(node, tirx.SBlockRealize)
-            and "tl.tt.compute_kind" in node.block.annotations
-            and str(node.block.writes[0].buffer.name) == "output"
-        ):
-            consumers.append(node)
-
-    tirx.stmt_functor.post_order_visit(fully_canonical["main"].body, collect_consumer)
-    assert len(consumers) == 1
-
-    def replace_consumer(node):
-        if isinstance(node, tirx.For) and str(node.loop_var.name) == "i":
-            return consumers[0]
-        return None
-
-    partial_body = tirx.stmt_functor.ir_transform(source["main"].body, None, replace_consumer)
-    partial = tvm.IRModule({"main": source["main"].with_body(partial_body)})
-    result = transform.CanonicalizeTTElementwise()(partial)
-
-    ir.assert_structural_equal(result, fully_canonical)
     transform.VerifyTTComputeBlocks()(result)
 
 

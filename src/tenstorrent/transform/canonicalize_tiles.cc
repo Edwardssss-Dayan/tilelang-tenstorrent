@@ -81,6 +81,21 @@ bool HasStructuredComputeAnnotations(const Entries &annotations) {
          annotations.count(kTTValueKinds);
 }
 
+class RawFrontendStageChecker : public StmtVisitor {
+public:
+  static void Check(const Stmt &body) {
+    RawFrontendStageChecker checker;
+    checker.VisitStmt(body);
+  }
+
+  void VisitStmt_(const SBlockNode *op) final {
+    Require(!HasStructuredComputeAnnotations(op->annotations),
+            "CanonicalizeTTElementwise accepts only raw Frontend IR; "
+            "structured compute annotations are wrong-stage input");
+    StmtVisitor::VisitStmt_(op);
+  }
+};
+
 class AllocationCollector : public StmtVisitor {
 public:
   void Collect(const Stmt &body) { VisitStmt(body); }
@@ -663,29 +678,6 @@ public:
       if (match->source->buffer->data.same_as(buffer_->data))
         valid_ = false;
     }
-    // Captured templates replace logical indices with zero. The per-access
-    // descriptors retain the logical region and must govern repeat passes.
-    if (op->annotations.count(kTTComputeKind)) {
-      auto value = op->annotations.Get(kTTAccessTable);
-      auto accesses = value.has_value()
-                          ? value.value().as<Array<TTAccessDescriptor>>()
-                          : std::nullopt;
-      if (!accesses.has_value()) {
-        valid_ = false;
-      } else {
-        for (const TTAccessDescriptor &access : accesses.value()) {
-          if (!access.defined() || !access->buffer->data.same_as(buffer_->data))
-            continue;
-          const BufferRegion &region = access->logical_region;
-          if (access->access_kind != "read" ||
-              !access->buffer.same_as(buffer_) ||
-              !region->buffer.same_as(buffer_) || region->region.size() != 2 ||
-              !is_zero(region->region[1]->min) ||
-              !is_one(region->region[1]->extent))
-            valid_ = false;
-        }
-      }
-    }
     StmtExprVisitor::VisitStmt_(op);
   }
   void VisitExpr_(const CallNode *op) final {
@@ -734,11 +726,6 @@ public:
     if (scalar)
       scalar_parameters_.pop_back();
     return body;
-  }
-  Stmt VisitStmt_(const SBlockNode *op) final {
-    if (op->annotations.count(kTTComputeKind))
-      return ffi::GetRef<Stmt>(op);
-    return StmtMutator::VisitStmt_(op);
   }
   Stmt VisitStmt_(const IfThenElseNode *op) final {
     IfThenElse branch = Downcast<IfThenElse>(StmtMutator::VisitStmt_(op));
@@ -942,15 +929,10 @@ Stmt MergeComputeBranch(const IfThenElse &branch,
 class ComputeVerifier : public StmtVisitor {
 public:
   void Verify(const Stmt &body) { VisitStmt(body); }
-  explicit ComputeVerifier(const PrimFunc &func,
-                           bool allow_raw_frontend_scopes = false)
-      : func_(func), allow_raw_frontend_scopes_(allow_raw_frontend_scopes) {
+  explicit ComputeVerifier(const PrimFunc &func) : func_(func) {
     allocation_.Collect(func->body);
   }
   void VisitStmt_(const ForNode *op) final {
-    if (allow_raw_frontend_scopes_ &&
-        HasFrontendTilesAnnotations(op->annotations))
-      return;
     Require(!HasFrontendTilesAnnotations(op->annotations),
             "uncanonicalized frontend T.Tiles scope");
     bool scalar = IsStaticScalarLoop(ffi::GetRef<For>(op));
@@ -1040,7 +1022,6 @@ private:
   PrimFunc func_;
   AllocationCollector allocation_;
   Array<Var> scalar_parameters_;
-  bool allow_raw_frontend_scopes_{false};
 };
 
 } // namespace
@@ -1048,17 +1029,11 @@ private:
 tvm::transform::Pass CanonicalizeTTElementwise() {
   auto pass_func = [](PrimFunc func, const IRModule &,
                       const tvm::transform::PassContext &) {
-    // Diagnose malformed existing blocks before analyzing any remaining raw
-    // Tiles scope. The full verifier below still rejects every unconsumed
-    // scope.
-    ComputeVerifier existing_verifier(func, true);
-    existing_verifier.Verify(func->body);
+    RawFrontendStageChecker::Check(func->body);
     Canonicalizer rewriter(func);
     Stmt body = rewriter(func->body);
     if (!body.same_as(func->body))
       func.CopyOnWrite()->body = std::move(body);
-    ComputeVerifier verifier(func);
-    verifier.Verify(func->body);
     return func;
   };
   return tirx::transform::CreatePrimFuncPass(

@@ -30,18 +30,12 @@ def multicore_values(mixed_precision=False):
                     f[i, j] = f[i, j] + 1
                 T.copy(f, C[x * 32 : (x + 1) * 32, :])
 
-    return D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
-    )
+    return D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET))
 
 
 def test_value_precision_is_scoped_to_owning_core():
     mod = multicore_values(mixed_precision=True)
-    trisc = [
-        func
-        for func in mod.functions.values()
-        if func.attrs["tt.kernel_slot"] == "trisc"
-    ]
+    trisc = [func for func in mod.functions.values() if func.attrs["tt.kernel_slot"] == "trisc"]
     assert len(trisc) == 1
     assert int(trisc[0].attrs["tt.core_domain"].begin.x) == 0
     assert int(trisc[0].attrs["tt.core_domain"].end.x) == 2
@@ -51,10 +45,7 @@ def test_value_precision_is_scoped_to_owning_core():
 
 def test_cross_core_value_operand_is_rejected_without_mutation():
     mod = multicore_values()
-    owners = {
-        int(value.value_id): int(value.core_domain.begin.x)
-        for value in mod.attrs["tt.compute_value_table"]
-    }
+    owners = {int(value.value_id): int(value.core_domain.begin.x) for value in mod.attrs["tt.compute_value_table"]}
     changed = False
 
     def edit(call):
@@ -166,15 +157,11 @@ def test_value_cannot_borrow_foreign_core_dfb():
                 f[i, j] = a[i, j] * 2
             T.copy(f, C[x * 32 : (x + 1) * 32, :])
 
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET))
     for global_var, function in list(mod.functions.items()):
         if str(function.attrs["tt.kernel_slot"]) == "trisc":
             concrete = [tirx.Evaluate(call) for call in _calls(function.body)]
-            mod.update_func(
-                global_var, _with_core_statements(function, concrete)
-            )
+            mod.update_func(global_var, _with_core_statements(function, concrete))
     dfbs = {int(dfb.dfb_id): dfb for dfb in mod.attrs["tt.dfb_table"]}
     changed = False
 
@@ -220,15 +207,11 @@ def test_pipeline_value_cannot_resurrect_released_previous_epoch():
                     f[i, j] = f[i, j] + 1
                 T.copy(f, C)
 
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET))
     for global_var, function in list(mod.functions.items()):
         if str(function.attrs["tt.kernel_slot"]) == "trisc":
             concrete = [tirx.Evaluate(call) for call in _calls(function.body)]
-            mod.update_func(
-                global_var, _with_core_statements(function, concrete)
-            )
+            mod.update_func(global_var, _with_core_statements(function, concrete))
     first = None
     changed = False
 
@@ -314,7 +297,7 @@ def test_pipeline_pool_cannot_reuse_another_cores_storage():
 
 
 @pytest.mark.parametrize("hidden_state", ["init", "allocation"])
-def test_branch_merge_does_not_erase_malformed_structured_block_state(hidden_state):
+def test_compute_verifier_rejects_hidden_structured_block_state(hidden_state):
     from testing.python.tenstorrent.frontend.test_tilelang_tenstorrent_frontend02 import fragment_program
 
     source = tvm.IRModule({"main": fragment_program().with_attr("target", TARGET)})
@@ -347,4 +330,4 @@ def test_branch_merge_does_not_erase_malformed_structured_block_state(hidden_sta
     malformed = tvm.IRModule({"main": func.with_body(tirx.stmt_functor.ir_transform(func.body, None, inject, ["tirx.SBlockRealize"]))})
     assert changed
     with pytest.raises(ValueError, match="opaque with no local allocations"):
-        transform.CanonicalizeTTElementwise()(malformed)
+        transform.VerifyTTComputeBlocks()(malformed)
