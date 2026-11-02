@@ -76,6 +76,10 @@ def reference_device(mod, inputs):
         if isinstance(expression, tirx.Call):
             if expression.op.name == "tl.tt.dfb_load":
                 return values[int(expression.args[0])]
+            if expression.op.name == "tl.tt.compute_broadcast":
+                source = scalar(expression.args[0], values)
+                axes = {int(axis) for axis in expression.args[1:]}
+                return source[tuple(slice(0, 1) if axis in axes else slice(None) for axis in range(source.ndim))]
             unary = {"tirx.sqrt": np.sqrt, "tirx.exp": np.exp, "tirx.log": np.log, "tirx.fabs": np.abs}
             return unary[expression.op.name](scalar(expression.args[0], values))
         binary = {
@@ -115,17 +119,20 @@ def reference_device(mod, inputs):
                 incoming = [resources[index] for index in args[1:]]
                 if kind in ("elementwise", "fill", "typecast"):
                     values = {}
-                    for index, value, axes in zip(args[1:], incoming, attrs["tt.access_maps"]):
-                        mapping = [int(axis) for axis in axes]
-                        slices = tuple(0 if axis < 0 else slice(None) for axis in mapping)
-                        value = value[slices]
-                        kept = [axis for axis in mapping if axis >= 0]
-                        if kept:
-                            value = np.transpose(value, np.argsort(kept))
-                        expanded = [1] * len(shape)
-                        for axis in kept:
-                            expanded[axis] = shape[axis]
-                        values[index] = value.reshape(expanded)
+                    maps = attrs.get("tt.access_maps", [])
+                    for position, (index, value) in enumerate(zip(args[1:], incoming)):
+                        if position < len(maps):
+                            mapping = [int(axis) for axis in maps[position]]
+                            slices = tuple(0 if axis < 0 else slice(None) for axis in mapping)
+                            value = value[slices]
+                            kept = [axis for axis in mapping if axis >= 0]
+                            if kept:
+                                value = np.transpose(value, np.argsort(kept))
+                            expanded = [1] * len(shape)
+                            for axis in kept:
+                                expanded[axis] = shape[axis]
+                            value = value.reshape(expanded)
+                        values[index] = value
                     result = np.broadcast_to(scalar(attrs["tt.expression"], values), shape).copy()
                 elif kind == "copy":
                     result = incoming[0].copy()
@@ -293,8 +300,6 @@ def replace_compute_annotation(mod, key, value, *, kind=None):
     [
         ("tt.compute_dtype", tirx.StringImm("bfloat16"), "dtype annotation"),
         ("tt.logical_domain", [32, 64], "tile-grid metadata"),
-        ("tt.access_maps", [[0, 2], [0, 1]], "access maps must cover every input operand"),
-        ("tt.access_maps", [[0, 0], [0, 1]], "access maps must cover every input operand"),
         ("tt.compute_kind", tirx.StringImm("unknown"), "unknown compute kind"),
     ],
 )
@@ -350,8 +355,8 @@ def test_dead_pure_write_eliminated(monkeypatch):
 
 def test_padded_input_shape_matches_producer(monkeypatch):
     mod = lower(monkeypatch, elementwise_program(broadcast=True))
-    replace_compute_annotation(mod, "tt.input_shapes", ir_metadata([[64, 64], [64, 64], [1, 64]]))
-    with pytest.raises(ValueError, match="input logical shape disagrees with its Tensor producer"):
+    replace_compute_annotation(mod, "tt.input_shapes", ir_metadata([[64, 64], [64, 64]]))
+    with pytest.raises(ValueError, match="logical shape|tile-grid"):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 

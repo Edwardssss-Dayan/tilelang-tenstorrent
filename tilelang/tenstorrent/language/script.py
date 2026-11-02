@@ -19,7 +19,7 @@ _FIXED_DTYPES = {
 
 _DYNAMIC_DTYPE = {
     "dfb_load",
-    "compute_access",
+    "compute_broadcast",
     "compute_value_load",
 }
 

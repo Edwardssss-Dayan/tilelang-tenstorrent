@@ -6,7 +6,6 @@ from tilelang import transform, tvm
 from tilelang.backend import create_backend_context
 from tilelang.tenstorrent import execution_backend
 from tilelang.tenstorrent import language as T
-from tilelang.tenstorrent.device_ir import TTAccessDescriptor
 from tvm import ir, tirx
 
 
@@ -147,9 +146,8 @@ def test_identity_captures_full_regions_and_tile_geometry(shape, block_shape):
     assert _effects_by_name(block.writes) == {"C": list(shape)}
     for region in [*block.reads, *block.writes]:
         assert _integers([dim.min for dim in region.region]) == [0, 0]
-    assert all(_integers(access.access_map) == [0, 1] for access in block.annotations["tl.tt.access_table"])
-    assert "tl.tt.access_maps" not in block.annotations
-    assert "tl.tt.broadcast_recipes" not in block.annotations
+    assert "tl.tt.access_table" not in block.annotations
+    assert "tl.tt.output_access_id" not in block.annotations
     assert isinstance(block.body, tirx.BufferStore)
     assert _integers(block.body.indices) == [0, 0]
     assert isinstance(block.body.value, tirx.Add)
@@ -197,44 +195,33 @@ def test_pure_expression_templates(kind):
 
 
 @pytest.mark.parametrize(
-    "kind,b_shape,axes,logical,broadcast_axes,block_shape",
+    "b_shape,axes,logical,block_shape",
     [
-        ("row", (32, 256), [-1, 1], [1, 256], [0], [1, 8]),
-        ("column", (64, 32), [0, -1], [64, 1], [1], [2, 1]),
-        ("scalar", (32, 32), [-1, -1], [1, 1], [0, 1], [1, 1]),
+        ((32, 256), [-1, 1], [1, 256], [1, 8]),
+        ((64, 32), [0, -1], [64, 1], [2, 1]),
+        ((32, 32), [-1, -1], [1, 1], [1, 1]),
     ],
 )
-def test_padded_broadcast_preserves_compact_operand_recipe(kind, b_shape, axes, logical, broadcast_axes, block_shape):
+def test_padded_broadcast_preserves_precise_logical_region(b_shape, axes, logical, block_shape):
     def expression(a, b, c, ij):
         indices = [ij[axis] if axis >= 0 else 0 for axis in axes]
         return a[tuple(ij)] + b[tuple(indices)]
 
     (block,) = _blocks(_canonicalize(_module((64, 256), b_shape=b_shape, expression=expression)))
     operand = next(region for region in block.reads if region.buffer.name == "B")
-    access = next(entry for entry in block.annotations["tl.tt.access_table"] if entry.buffer.name == "B")
-    assert _integers([dim.extent for dim in access.logical_region.region]) == logical
+    assert _integers([dim.extent for dim in operand.region]) == logical
     assert _integers(operand.buffer.shape) == list(b_shape)
-    assert _integers(access.access_map) == axes
-    assert str(access.broadcast_kind) == kind
-    assert _integers(access.broadcast_axes) == broadcast_axes
-    assert _integers(access.buffer.shape) == list(b_shape)
     assert [(int(extent) + 31) // 32 for extent in b_shape] == block_shape
     assert _integers(block.annotations["tl.tt.block_shape"]) == [2, 8]
+    loads = [load for load in _nodes(tirx.PrimFunc([], block.body), tirx.BufferLoad) if load.buffer.name == "B"]
+    assert len(loads) == 1 and _integers(loads[0].indices) == [0, 0]
 
 
-def test_different_access_maps_for_one_buffer_keep_distinct_access_ids():
-    mod = _canonicalize(
-        _module(
-            (32, 32),
-            expression=lambda a, b, c, ij: a[tuple(ij)] + a[0, ij[1]],
-        )
+def test_reject_same_buffer_with_different_logical_regions():
+    _reject(
+        _module((32, 32), expression=lambda a, b, c, ij: a[tuple(ij)] + a[0, ij[1]]),
+        "same|different logical regions|different",
     )
-    reads = [access for access in _blocks(mod)[0].annotations["tl.tt.access_table"] if str(access.access_kind) == "read"]
-    assert [int(access.access_id) for access in reads] == [0, 1]
-    assert [_integers(access.access_map) for access in reads] == [[0, 1], [-1, 1]]
-    assert reads[0].buffer.same_as(reads[1].buffer)
-    assert "tl.tt.access_maps" not in _blocks(mod)[0].annotations
-    assert "tl.tt.broadcast_recipes" not in _blocks(mod)[0].annotations
 
 
 @pytest.mark.parametrize("outer_loop,twice", [(False, True), (True, False)])
@@ -257,7 +244,7 @@ def test_json_roundtrip_and_verifier_preserve_buffer_identity(broadcast):
     transform.VerifyTTComputeBlocks()(restored)
     (block,) = _blocks(restored)
     for effect in [*block.reads, *block.writes]:
-        assert any(access.buffer.data.same_as(effect.buffer.data) for access in block.annotations["tl.tt.access_table"])
+        assert str(block.annotations["tl.tt.value_kinds"][effect.buffer.data]) in ("shared_dfb", "compute_fragment")
 
 
 @pytest.mark.parametrize("flat_allocations", [False, True])
@@ -432,8 +419,6 @@ def _change_compute_block(mod, change):
         "tl.tt.physical_tile_shape",
         "tl.tt.block_shape",
         "tl.tt.iterator_types",
-        "tl.tt.access_table",
-        "tl.tt.output_access_id",
         "tl.tt.value_kinds",
     ],
 )
@@ -568,40 +553,24 @@ def test_reject_malformed_frontend_loop_chain(kind):
     _reject(mod, "stage|domain|extent|zero|step|chain|loop|Loop|Phase 1")
 
 
-@pytest.mark.parametrize("kind", ["missing_access", "broadcast_kind", "broadcast_axes", "logical_region", "access_map"])
-def test_verifier_rejects_corrupted_access_descriptor(kind):
+@pytest.mark.parametrize("kind", ["missing_read", "wrong_read_extent", "nonzero_min", "body_buffer"])
+def test_verifier_rejects_corrupted_precise_regions(kind):
     mod = _canonicalize(_module((64, 256), b_shape=(32, 256), expression=lambda a, b, c, ij: a[tuple(ij)] + b[0, ij[1]]))
 
     def change(fields):
-        accesses = list(fields["annotations"]["tl.tt.access_table"])
-        index = next(i for i, access in enumerate(accesses) if access.buffer.name == "B")
-        access = accesses[index]
-        if kind == "missing_access":
-            del accesses[index]
+        reads = list(fields["reads"])
+        index = next(i for i, region in enumerate(reads) if region.buffer.name == "B")
+        region = reads[index]
+        if kind == "missing_read":
+            del reads[index]
+        elif kind == "wrong_read_extent":
+            reads[index] = tirx.BufferRegion(region.buffer, [ir.Range(0, 32), ir.Range(0, 256)])
+        elif kind == "nonzero_min":
+            reads[index] = tirx.BufferRegion(region.buffer, [ir.Range(1, 1), ir.Range(0, 256)])
         else:
-            logical_region = access.logical_region
-            access_map = access.access_map
-            broadcast_kind = access.broadcast_kind
-            broadcast_axes = access.broadcast_axes
-            if kind == "logical_region":
-                logical_region = tirx.BufferRegion(access.buffer, [ir.Range(0, 64), ir.Range(0, 256)])
-            elif kind == "access_map":
-                access_map = [1, 0]
-            elif kind == "broadcast_kind":
-                broadcast_kind = "identity"
-            else:
-                broadcast_axes = [1]
-            accesses[index] = TTAccessDescriptor(
-                access.access_id,
-                access.buffer,
-                access.access_kind,
-                logical_region,
-                access_map,
-                broadcast_kind,
-                broadcast_axes,
-                access.source_span,
-            )
-        fields["annotations"]["tl.tt.access_table"] = accesses
+            store = fields["body"]
+            fields["body"] = tirx.BufferStore(store.buffer, store.value.a + store.value.a, store.indices)
+        fields["reads"] = reads
 
     malformed = _change_compute_block(mod, change)
     with pytest.raises((tvm.error.TVMError, ValueError), match="T.Tiles|TT|tl.tt|structured|elementwise"):
@@ -648,34 +617,6 @@ def test_storage_descriptors_cannot_retain_removed_coordinate_binders(field):
     )
     func = tirx.PrimFunc([], tirx.SBlockRealize([], True, root)).with_attr("target", tvm.target.Target(TARGET))
     _reject(tvm.IRModule({"main": func}), "storage.*loop variables")
-
-
-@pytest.mark.parametrize("field", ["elem_offset", "strides"])
-def test_verifier_rejects_free_variables_in_storage_descriptors(field):
-    def change(fields):
-        from tilelang.tenstorrent.device_ir import TTAccessDescriptor
-
-        accesses = list(fields["annotations"]["tl.tt.access_table"])
-        load = accesses[0]
-        variable = tirx.Var("removed_coordinate", "int32")
-        canceled = tirx.Sub(variable, variable)
-        options = {"elem_offset": canceled} if field == "elem_offset" else {"strides": [tirx.Add(64, canceled), 1]}
-        buffer = tirx.decl_buffer(load.buffer.shape, load.buffer.dtype, scope="shared", data=load.buffer.data, **options)
-        accesses[0] = TTAccessDescriptor(
-            load.access_id,
-            buffer,
-            str(load.access_kind),
-            tirx.BufferRegion(buffer, load.logical_region.region),
-            load.access_map,
-            str(load.broadcast_kind),
-            load.broadcast_axes,
-            load.source_span,
-        )
-        fields["annotations"]["tl.tt.access_table"] = accesses
-
-    malformed = _change_compute_block(_canonicalize(_module()), change)
-    with pytest.raises(ValueError, match="storage.*loop variables"):
-        transform.VerifyTTComputeBlocks()(malformed)
 
 
 @pytest.mark.parametrize("kind", ["call", "cast"])
@@ -816,12 +757,7 @@ def _rank3_structured_module():
     def region(buffer):
         return tirx.BufferRegion(buffer, [ir.Range.from_min_extent(0, extent) for extent in domain])
 
-    accesses = [
-        TTAccessDescriptor(index, buffer, "write" if index == 2 else "read", region(buffer), [0, 1, 2], "identity", [])
-        for index, buffer in enumerate(buffers)
-    ]
-    compute_access = ir.Op.get("tl.tt.compute_access")
-    value = tirx.Call("float32", compute_access, [0]) + tirx.Call("float32", compute_access, [1])
+    value = tirx.BufferLoad(buffers[0], [0, 0, 0]) + tirx.BufferLoad(buffers[1], [0, 0, 0])
     body = tirx.BufferStore(store.buffer, value, [0, 0, 0])
     annotations = _annotation_value(
         {
@@ -831,8 +767,6 @@ def _rank3_structured_module():
             "tl.tt.physical_tile_shape": [32, 32],
             "tl.tt.block_shape": [2, 1, 1],
             "tl.tt.iterator_types": ["parallel", "parallel", "parallel"],
-            "tl.tt.access_table": accesses,
-            "tl.tt.output_access_id": 2,
             "tl.tt.value_kinds": {buffer.data: "shared_dfb" for buffer in buffers},
         }
     )
@@ -875,7 +809,7 @@ def test_reject_mixed_frontends_within_one_loop_nest(outer_frontend):
 
 
 @pytest.mark.parametrize("kind", ["identity", "compound", "row", "column", "scalar", "inplace"])
-def test_structured_expression_and_access_maps_match_numpy(kind):
+def test_structured_expression_and_precise_regions_match_numpy(kind):
     import numpy as np
 
     shape = (64, 64)
@@ -904,14 +838,13 @@ def test_structured_expression_and_access_maps_match_numpy(kind):
         for region in [*block.reads, *block.writes]
     }
     coordinates = np.indices(shape)
-    accesses = {int(access.access_id): access for access in block.annotations["tl.tt.access_table"]}
+    regions = {region.buffer.data: region for region in block.reads}
 
     def evaluate(expr):
-        if isinstance(expr, tirx.Call) and expr.op.name == "tl.tt.compute_access":
-            access = accesses[int(expr.args[0])]
-            axes = _integers(access.access_map)
-            indices = tuple(0 if axis == -1 else coordinates[axis] for axis in axes)
-            return arrays[access.buffer.name][indices]
+        if isinstance(expr, tirx.BufferLoad):
+            region = regions[expr.buffer.data]
+            indices = tuple(0 if int(axis.extent) == 1 else coordinates[index] for index, axis in enumerate(region.region))
+            return arrays[expr.buffer.name][indices]
         if isinstance(expr, tirx.Add):
             return evaluate(expr.a) + evaluate(expr.b)
         if isinstance(expr, tirx.Mul):
@@ -1148,8 +1081,14 @@ def test_pipeline_preserves_padded_broadcast_recipe(monkeypatch, size):
         and str(call.annotations["tt.compute_kind"].value) == "elementwise"
     ]
     assert len(computes) == 1
-    assert [-1, 1] in [_integers(axes) for axes in computes[0].annotations["tt.access_maps"]]
     assert _integers(computes[0].annotations["tt.logical_domain"]) == [size, size]
+    broadcasts = [
+        call
+        for call in _nodes(tirx.PrimFunc([], tirx.Evaluate(computes[0].annotations["tt.expression"])), tirx.Call)
+        if call.op.name == "tl.tt.compute_broadcast"
+    ]
+    assert len(broadcasts) == 1
+    assert _integers(broadcasts[0].args[1:]) == [0]
     from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
 
     VerifyTenstorrentDeviceIR()(lowered)
@@ -1212,11 +1151,6 @@ def test_tiles02_scope_combinations_preserve_value_kinds(a_scope, b_scope, c_sco
         buffer = effect.buffer
         assert buffer.same_as(by_name[buffer.name])
         assert str(kinds[buffer.data]) == ("compute_fragment" if buffer.scope() == "local.fragment" else "shared_dfb")
-        assert all(
-            _integers(access.access_map) == [0, 1]
-            for access in block.annotations["tl.tt.access_table"]
-            if access.buffer.data.same_as(buffer.data)
-        )
         assert buffer.dtype == "float32"
     assert _integers(block.annotations["tl.tt.block_shape"]) == [2, 2]
     assert not _nodes(restored["main"], tirx.For)
@@ -1303,11 +1237,11 @@ def test_tiles02_fragment_to_shared_preserves_explicit_precision_conversion():
 
 
 @pytest.mark.parametrize(
-    "kind,b_shape,axes,logical",
-    [("row", (32, 128), [-1, 1], [1, 128]), ("column", (64, 32), [0, -1], [64, 1]), ("scalar", (32, 32), [-1, -1], [1, 1])],
+    "b_shape,axes,logical",
+    [((32, 128), [-1, 1], [1, 128]), ((64, 32), [0, -1], [64, 1]), ((32, 32), [-1, -1], [1, 1])],
 )
 @pytest.mark.parametrize("c_scope", ["shared", "local.fragment"])
-def test_tiles02_fragment_broadcast_preserves_compact_valid_region(kind, b_shape, axes, logical, c_scope):
+def test_tiles02_fragment_broadcast_preserves_compact_valid_region(b_shape, axes, logical, c_scope):
     def expression(a, b, c, ij):
         return a[tuple(ij)] + b[tuple(ij[axis] if axis >= 0 else 0 for axis in axes)]
 
@@ -1315,12 +1249,9 @@ def test_tiles02_fragment_broadcast_preserves_compact_valid_region(kind, b_shape
     transform.VerifyTTComputeBlocks()(mod)
     (block,) = _blocks(mod)
     operand = next(region for region in block.reads if region.buffer.name == "B")
-    access = next(entry for entry in block.annotations["tl.tt.access_table"] if entry.buffer.name == "B")
-    assert _integers([dim.extent for dim in access.logical_region.region]) == logical
+    assert _integers([dim.extent for dim in operand.region]) == logical
     assert _integers(operand.buffer.shape) == list(b_shape)
     assert str(block.annotations["tl.tt.value_kinds"][operand.buffer.data]) == "compute_fragment"
-    assert _integers(access.access_map) == axes
-    assert str(access.broadcast_kind) == kind
 
 
 @pytest.mark.parametrize("corruption", ["missing_operand", "extra_operand", "wrong_kind", "wrong_schema", "wrong_identity"])

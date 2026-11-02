@@ -50,31 +50,28 @@ bool IsElementwiseBlock(const SBlock &block) {
          Downcast<ffi::String>(kind.value()) == "elementwise";
 }
 
-std::map<int64_t, TTAccessDescriptor> AccessTable(const SBlock &block) {
-  auto table = block->annotations.Get("tl.tt.access_table");
-  if (!table.has_value())
-    return {};
-  std::map<int64_t, TTAccessDescriptor> result;
-  for (const TTAccessDescriptor &access :
-       Downcast<ffi::Array<TTAccessDescriptor>>(table.value())) {
-    if (!access.defined() || access->access_id < 0 ||
-        !result.emplace(access->access_id, access).second)
-      return {};
+ffi::Optional<BufferRegion> FindRegion(const Array<BufferRegion> &regions,
+                                       const Buffer &buffer) {
+  ffi::Optional<BufferRegion> result;
+  for (const BufferRegion &region : regions) {
+    if (!region->buffer->data.same_as(buffer->data))
+      continue;
+    if (result.has_value())
+      return std::nullopt;
+    result = region;
   }
   return result;
 }
 
-ffi::Optional<TTAccessDescriptor>
-ExpressionAccess(const PrimExpr &expression,
-                 const std::map<int64_t, TTAccessDescriptor> &table) {
-  const auto *call = expression.as<CallNode>();
-  if (!call || !call->op.same_as(tenstorrent::compute_access()) ||
-      call->args.size() != 1 || !as_const_int(call->args[0]))
-    return std::nullopt;
-  auto found = table.find(*as_const_int(call->args[0]));
-  return found == table.end()
-             ? ffi::Optional<TTAccessDescriptor>()
-             : ffi::Optional<TTAccessDescriptor>(found->second);
+bool IsIdentityRegion(const BufferRegion &region,
+                      const Array<PrimExpr> &domain) {
+  if (region->region.size() != domain.size())
+    return false;
+  for (size_t axis = 0; axis < domain.size(); ++axis)
+    if (!is_zero(region->region[axis]->min) ||
+        !ffi::StructuralEqual()(region->region[axis]->extent, domain[axis]))
+      return false;
+  return true;
 }
 
 bool IsDeviceAdd(const SBlock &block,
@@ -84,27 +81,25 @@ bool IsDeviceAdd(const SBlock &block,
   }
   const auto *store = block->body.as<BufferStoreNode>();
   const auto *add = store == nullptr ? nullptr : store->value.as<AddNode>();
-  auto table = AccessTable(block);
-  auto lhs_access = add ? ExpressionAccess(add->a, table)
-                        : ffi::Optional<TTAccessDescriptor>();
-  auto rhs_access = add ? ExpressionAccess(add->b, table)
-                        : ffi::Optional<TTAccessDescriptor>();
-  auto output_id = block->annotations.Get("tl.tt.output_access_id");
-  auto output_integer =
-      output_id.has_value() ? output_id.value().as<Integer>() : std::nullopt;
-  if (add == nullptr || !lhs_access.has_value() || !rhs_access.has_value() ||
-      !output_integer.has_value() ||
-      !table.count(output_integer.value()->value)) {
+  const auto *lhs_load = add == nullptr ? nullptr : add->a.as<BufferLoadNode>();
+  const auto *rhs_load = add == nullptr ? nullptr : add->b.as<BufferLoadNode>();
+  if (lhs_load == nullptr || rhs_load == nullptr || block->writes.size() != 1)
     return false;
-  }
-  const TTAccessDescriptor &output_access =
-      table.at(output_integer.value()->value);
-  const Buffer &output = output_access->buffer;
-  const Buffer &lhs = lhs_access.value()->buffer;
-  const Buffer &rhs = rhs_access.value()->buffer;
+  const Buffer &output = store->buffer;
+  const Buffer &lhs = lhs_load->buffer;
+  const Buffer &rhs = rhs_load->buffer;
   if (lhs.same_as(rhs) || lhs.same_as(output) || rhs.same_as(output)) {
     return false;
   }
+  auto shape = Downcast<ffi::Array<PrimExpr>>(
+      block->annotations.at("tl.tt.logical_domain"));
+  auto lhs_region = FindRegion(block->reads, lhs);
+  auto rhs_region = FindRegion(block->reads, rhs);
+  if (!lhs_region.has_value() || !rhs_region.has_value() ||
+      !IsIdentityRegion(lhs_region.value(), shape) ||
+      !IsIdentityRegion(rhs_region.value(), shape) ||
+      !IsIdentityRegion(block->writes[0], shape))
+    return false;
   const DataType dtype = output->dtype;
   if (dtype.lanes() != 1 ||
       !(dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32))) {
@@ -115,15 +110,6 @@ bool IsDeviceAdd(const SBlock &block,
       return false;
     }
   }
-  for (const TTAccessDescriptor &access :
-       {lhs_access.value(), rhs_access.value(), output_access}) {
-    if (access->access_map.size() != 2 || access->access_map[0]->value != 0 ||
-        access->access_map[1]->value != 1) {
-      return false;
-    }
-  }
-  auto shape = Downcast<ffi::Array<PrimExpr>>(
-      block->annotations.at("tl.tt.logical_domain"));
   return shape.size() == 2 && is_const_int(shape[0], 32) &&
          is_const_int(shape[1], 32);
 }
@@ -152,7 +138,7 @@ void ValidateDType(DataType dtype) {
 }
 
 void ValidateRegion(const BufferRegion &region, const std::string &owner,
-                    bool allow_fragment = false) {
+                    bool allow_fragment = false, bool require_full = true) {
   const Buffer &buffer = region->buffer;
   Require(buffer.scope() == "shared" || buffer.scope() == "shared.dyn" ||
               (allow_fragment && buffer.scope() == "local.fragment"),
@@ -186,19 +172,18 @@ void ValidateRegion(const BufferRegion &region, const std::string &owner,
                   extent->value == 1)),
             owner + " requires static positive batch dimensions and "
                     "tile-aligned final axes");
-    Require(is_zero(region->region[axis]->min) &&
-                ffi::StructuralEqual()(region->region[axis]->extent,
-                                       buffer->shape[axis]),
-            owner + " currently requires a full BufferRegion; partial compute "
-                    "is unsupported");
+    Require(is_zero(region->region[axis]->min),
+            owner + " region must start at zero");
+    if (require_full)
+      Require(ffi::StructuralEqual()(region->region[axis]->extent,
+                                     buffer->shape[axis]),
+              owner + " requires a full BufferRegion");
+    else
+      Require(analyzer.CanProve(region->region[axis]->extent > 0) &&
+                  analyzer.CanProve(region->region[axis]->extent <=
+                                    buffer->shape[axis]),
+              owner + " region extent must be positive and in bounds");
   }
-}
-
-ffi::Array<Integer> IdentityAxes(const Buffer &buffer) {
-  ffi::Array<Integer> axes;
-  for (size_t axis = 0; axis < buffer->shape.size(); ++axis)
-    axes.push_back(Integer(axis));
-  return axes;
 }
 
 using Annotations = ffi::Map<ffi::String, ffi::ObjectRef>;
@@ -778,21 +763,64 @@ Stmt MakeCompute(const BufferRegion &output,
   else
     ValidateRegion(output, "compute output", true);
   ffi::Array<PrimExpr> arguments{output->ToPrimExpr()};
-  ffi::Array<ffi::Array<Integer>> maps;
   ffi::Array<ffi::Array<PrimExpr>> input_shapes;
   for (const BufferRegion &input : inputs) {
-    ValidateRegion(input, "compute input", true);
+    ValidateRegion(input, "compute input", true, false);
     arguments.push_back(input->ToPrimExpr());
-    maps.push_back(IdentityAxes(input->buffer));
-    input_shapes.push_back(input->buffer->shape);
+    ffi::Array<PrimExpr> shape;
+    for (const Range &range : input->region)
+      shape.push_back(range->extent);
+    input_shapes.push_back(shape);
   }
   annotations.Set("tt.input_shapes", input_shapes);
-  if (!annotations.count("tt.access_maps"))
-    annotations.Set("tt.access_maps", maps);
   return Evaluate(Call(DataType::Handle(), tile_compute(), arguments,
                        std::move(annotations), span),
                   span);
 }
+
+class ExplicitBroadcastBuilder : public ExprMutator {
+public:
+  ExplicitBroadcastBuilder(const Array<BufferRegion> &reads,
+                           Array<PrimExpr> domain)
+      : domain_(std::move(domain)) {
+    for (const BufferRegion &region : reads)
+      Require(regions_.emplace(region->buffer->data, region).second,
+              "elementwise reads contain duplicate Buffer identities");
+  }
+
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    auto found = regions_.find(op->buffer->data);
+    Require(found != regions_.end() &&
+                found->second->buffer.same_as(op->buffer),
+            "elementwise expression reads a Buffer missing from block reads");
+    const BufferRegion &region = found->second;
+    Require(region->region.size() == domain_.size(),
+            "elementwise read rank must match logical domain");
+    ffi::Array<PrimExpr> axes;
+    for (size_t axis = 0; axis < domain_.size(); ++axis) {
+      Require(is_zero(region->region[axis]->min),
+              "elementwise read region must start at zero");
+      if (ffi::StructuralEqual()(region->region[axis]->extent, domain_[axis]))
+        continue;
+      Require(is_one(region->region[axis]->extent),
+              "elementwise read extent must match the domain or be one");
+      axes.push_back(Integer(axis));
+    }
+    PrimExpr load = ffi::GetRef<BufferLoad>(op);
+    if (axes.empty())
+      return load;
+    ffi::Array<PrimExpr> args{load};
+    for (const PrimExpr &axis : axes)
+      args.push_back(axis);
+    return Call(op->dtype, tenstorrent::compute_broadcast(), args, {},
+                op->span);
+  }
+
+private:
+  std::unordered_map<Var, BufferRegion, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      regions_;
+  Array<PrimExpr> domain_;
+};
 
 class ComputeDTypeVerifier : public ExprVisitor {
 public:
@@ -889,9 +917,8 @@ private:
     Span span = block->span.defined() ? block->span : op->span;
     if (IsDeviceAdd(block, metadata_)) {
       const auto *add = store->value.as<AddNode>();
-      auto table = AccessTable(block);
-      const Buffer &lhs = ExpressionAccess(add->a, table).value()->buffer;
-      const Buffer &rhs = ExpressionAccess(add->b, table).value()->buffer;
+      const Buffer &lhs = Downcast<BufferLoad>(add->a)->buffer;
+      const Buffer &rhs = Downcast<BufferLoad>(add->b)->buffer;
       Annotations annotations{
           {"tt.compute_dtype", StringImm(DTypeName(output->dtype))},
           {"tt.compute_tile_shape",
@@ -905,32 +932,19 @@ private:
     }
     ComputeDTypeVerifier dtype_verifier;
     dtype_verifier(store->value);
-    auto access_table = AccessTable(block);
-    auto output_id =
-        Downcast<Integer>(block->annotations.at("tl.tt.output_access_id"));
-    Require(access_table.count(output_id->value),
-            "structured output access is missing");
-    const TTAccessDescriptor &output_access = access_table.at(output_id->value);
-    ffi::Array<BufferRegion> inputs;
-    ffi::Array<ffi::Array<Integer>> maps;
-    ffi::Array<Integer> access_ids;
-    for (const auto &[id, access] : access_table) {
-      if (access->access_kind != "read")
-        continue;
-      inputs.push_back(BufferRegion::FullRegion(access->buffer));
-      maps.push_back(access->access_map);
-      access_ids.push_back(Integer(id));
-    }
+    Require(block->writes.size() == 1 &&
+                block->writes[0]->buffer.same_as(output),
+            "structured elementwise block requires one matching output region");
+    ffi::Array<BufferRegion> inputs = block->reads;
     const char *kind = inputs.empty()                ? "fill"
                        : store->value.as<CastNode>() ? "typecast"
                                                      : "elementwise";
     Annotations annotations = BaseAnnotations(output, kind);
-    annotations.Set("tt.expression", store->value);
-    annotations.Set("tt.access_maps", maps);
-    annotations.Set("tt.access_ids", access_ids);
-    annotations.Set("tt.output_access_id", output_id);
-    return MakeCompute(BufferRegion::FullRegion(output_access->buffer), inputs,
-                       annotations, span);
+    auto domain = Downcast<ffi::Array<PrimExpr>>(
+        block->annotations.at("tl.tt.logical_domain"));
+    ExplicitBroadcastBuilder broadcasts(inputs, domain);
+    annotations.Set("tt.expression", broadcasts(store->value));
+    return MakeCompute(block->writes[0], inputs, annotations, span);
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {

@@ -607,16 +607,6 @@ public:
       const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
                                ffi::ObjectPtrEqual> &values)
       : inputs_(inputs), values_(&values) {}
-  DeviceExpressionRewriter(
-      const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
-                               ffi::ObjectPtrEqual> &inputs,
-      const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
-                               ffi::ObjectPtrEqual> &values,
-      std::unordered_map<int64_t, int64_t> dfb_accesses,
-      std::unordered_map<int64_t, int64_t> value_accesses)
-      : inputs_(inputs), values_(&values),
-        dfb_accesses_(std::move(dfb_accesses)),
-        value_accesses_(std::move(value_accesses)) {}
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     if (values_) {
       auto value = values_->find(op->buffer);
@@ -631,38 +621,12 @@ public:
     return Call(op->dtype, tenstorrent::dfb_load(), {Integer(found->second)},
                 {}, op->span);
   }
-  PrimExpr VisitExpr_(const CallNode *op) final {
-    Call call = ffi::GetRef<Call>(op);
-    if (!call->op.same_as(tenstorrent::compute_access()))
-      return StmtExprMutator::VisitExpr_(op);
-    if (call->args.size() != 1 || !as_const_int(call->args[0]))
-      ThrowMalformed("compute_access requires one static access_id");
-    int64_t access_id = *as_const_int(call->args[0]);
-    auto value = value_accesses_.find(access_id);
-    if (value != value_accesses_.end())
-      return Call(op->dtype, tenstorrent::compute_value_load(),
-                  {Integer(value->second)}, {}, op->span);
-    auto dfb = dfb_accesses_.find(access_id);
-    if (dfb == dfb_accesses_.end()) {
-      std::string known;
-      for (const auto &[id, resource] : dfb_accesses_)
-        known += (known.empty() ? "" : ",") + std::to_string(id);
-      for (const auto &[id, resource] : value_accesses_)
-        known += (known.empty() ? "" : ",") + std::to_string(id);
-      ThrowMalformed("compute expression references undeclared access_id " +
-                     std::to_string(access_id) + " (known: " + known + ")");
-    }
-    return Call(op->dtype, tenstorrent::dfb_load(), {Integer(dfb->second)}, {},
-                op->span);
-  }
 
 private:
   const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
                            ffi::ObjectPtrEqual> &inputs_;
   const std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
                            ffi::ObjectPtrEqual> *values_{nullptr};
-  std::unordered_map<int64_t, int64_t> dfb_accesses_;
-  std::unordered_map<int64_t, int64_t> value_accesses_;
 };
 
 // TVM's generic expression mutator substitutes PrimExpr call annotations, but
@@ -1283,14 +1247,9 @@ public:
       BufferRegion c =
           NormalizeToAccessRegion(call->args[2], kAccessWrite).region;
       ffi::Array<PrimExpr> zero(a->buffer->shape.size(), Integer(0));
-      ffi::Array<Integer> identity;
-      for (size_t i = 0; i < zero.size(); ++i)
-        identity.push_back(Integer(i));
       auto attrs = call->annotations;
       attrs.Set("tt.compute_kind", StringImm("elementwise"));
       attrs.Set("tt.logical_domain", c->buffer->shape);
-      attrs.Set("tt.access_maps",
-                ffi::Array<ffi::Array<Integer>>{identity, identity});
       attrs.Set("tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>{
                                        a->buffer->shape, b->buffer->shape});
       attrs.Set("tt.expression",
@@ -1696,13 +1655,6 @@ private:
     return id;
   }
 
-  static ffi::Array<Integer> IdentityMap(size_t rank) {
-    ffi::Array<Integer> map;
-    for (size_t axis = 0; axis < rank; ++axis)
-      map.push_back(Integer(axis));
-    return map;
-  }
-
   int64_t
   MakeValueStorage(const Buffer &buffer, const Span &span,
                    ffi::Optional<TensorBacking> backing = std::nullopt) {
@@ -1788,10 +1740,8 @@ private:
            ffi::Array<PrimExpr>{Integer(32), Integer(32)}},
           {"tt.logical_domain", buffer->shape},
           {"tt.expression", make_zero(buffer->dtype)},
-          {"tt.access_maps", ffi::Array<ffi::Array<Integer>>()},
           {"tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>()},
           {"tt.value_inputs", ffi::Array<Integer>()},
-          {"tt.value_access_maps", ffi::Array<ffi::Array<Integer>>()},
           {"tt.value_input_shapes", ffi::Array<ffi::Array<PrimExpr>>()}};
       compute_.push_back(Evaluate(Call(DataType::Void(), compute_value(),
                                        {Integer(value)}, attrs, call->span),
@@ -1905,11 +1855,8 @@ private:
           {"tt.logical_domain", buffer->shape},
           {"tt.expression",
            Call(buffer->dtype, dfb_load(), {Integer(dfb)}, {}, call->span)},
-          {"tt.access_maps",
-           ffi::Array<ffi::Array<Integer>>{IdentityMap(buffer->shape.size())}},
           {"tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>{buffer->shape}},
           {"tt.value_inputs", ffi::Array<Integer>()},
-          {"tt.value_access_maps", ffi::Array<ffi::Array<Integer>>()},
           {"tt.value_input_shapes", ffi::Array<ffi::Array<PrimExpr>>()}};
       Wait(&compute_, dfb, call->span);
       compute_.push_back(
@@ -1964,51 +1911,30 @@ private:
     }
     ffi::Array<PrimExpr> dfb_args;
     ffi::Array<Integer> value_inputs;
-    ffi::Array<ffi::Array<Integer>> dfb_maps, value_maps;
     ffi::Array<ffi::Array<PrimExpr>> dfb_shapes, value_shapes;
     std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
         dfb_inputs, local_inputs;
-    std::unordered_map<int64_t, int64_t> dfb_accesses, value_accesses;
-    auto original_maps = call->annotations.Get("tt.access_maps");
-    ffi::Array<ffi::Array<Integer>> maps =
-        original_maps.has_value()
-            ? Downcast<ffi::Array<ffi::Array<Integer>>>(original_maps.value())
-            : ffi::Array<ffi::Array<Integer>>();
-    auto original_access_ids = call->annotations.Get("tt.access_ids");
-    ffi::Array<Integer> access_ids =
-        original_access_ids.has_value()
-            ? Downcast<ffi::Array<Integer>>(original_access_ids.value())
-            : ffi::Array<Integer>();
-    if (original_access_ids.has_value() && access_ids.empty())
-      ThrowMalformed("compute access_ids annotation is present but empty");
-    if (!access_ids.empty() && access_ids.size() + 1 != call->args.size())
-      ThrowMalformed("compute access_ids must match input operands");
     bool dfb_only = kind == "gemm" || kind == "transpose" || kind == "reduce";
     std::unordered_set<int64_t> roots;
     for (size_t index = 1; index < call->args.size(); ++index) {
       BufferRegion input =
           NormalizeToAccessRegion(call->args[index], kAccessRead).region;
-      FullRegion(input);
-      ffi::Array<Integer> map = index <= maps.size()
-                                    ? maps[index - 1]
-                                    : IdentityMap(input->buffer->shape.size());
+      if (dfb_only)
+        FullRegion(input);
+      ffi::Array<PrimExpr> input_shape;
+      for (const Range &range : input->region)
+        input_shape.push_back(range->extent);
       if (input->buffer.scope() == "local.fragment" && !dfb_only) {
         int64_t value = ReadValue(input->buffer);
         local_inputs.emplace(input->buffer, value);
         value_inputs.push_back(Integer(value));
-        value_maps.push_back(map);
-        value_shapes.push_back(input->buffer->shape);
-        if (!access_ids.empty())
-          value_accesses.emplace(access_ids[index - 1]->value, value);
+        value_shapes.push_back(input_shape);
         roots.insert(value_roots_[value].begin(), value_roots_[value].end());
       } else {
         int64_t id = ReadDFBOperand(input->buffer, call->span);
         dfb_inputs.emplace(input->buffer, id);
         dfb_args.push_back(Integer(id));
-        dfb_maps.push_back(map);
-        dfb_shapes.push_back(input->buffer->shape);
-        if (!access_ids.empty())
-          dfb_accesses.emplace(access_ids[index - 1]->value, id);
+        dfb_shapes.push_back(input_shape);
         const auto &input_roots = dfb_roots_[id];
         roots.insert(input_roots.begin(), input_roots.end());
         Wait(&compute_, id, call->span);
@@ -2025,32 +1951,12 @@ private:
     if (kind == "copy")
       attrs.Set("tt.compute_kind", StringImm("elementwise"));
     attrs.Set("tt.logical_domain", domain);
-    attrs.Set("tt.access_maps", dfb_maps);
     attrs.Set("tt.input_shapes", dfb_shapes);
     attrs.Set("tt.value_inputs", value_inputs);
-    attrs.Set("tt.value_access_maps", value_maps);
     attrs.Set("tt.value_input_shapes", value_shapes);
     auto expression = attrs.Get("tt.expression");
     if (expression.has_value()) {
-      bool has_access_leaf = false;
-      PostOrderVisit(Downcast<PrimExpr>(expression.value()),
-                     [&](const ffi::ObjectRef &node) {
-                       const auto *access = node.as<CallNode>();
-                       has_access_leaf |=
-                           access &&
-                           access->op.same_as(tenstorrent::compute_access());
-                     });
-      if (has_access_leaf && access_ids.empty()) {
-        std::string keys;
-        for (const auto &[key, value] : call->annotations)
-          keys += (keys.empty() ? "" : ",") + std::string(key);
-        ThrowMalformed(
-            "compute_access expression lost tt.access_ids (annotations: " +
-            keys + ")");
-      }
-      DeviceExpressionRewriter rewriter(dfb_inputs, local_inputs,
-                                        std::move(dfb_accesses),
-                                        std::move(value_accesses));
+      DeviceExpressionRewriter rewriter(dfb_inputs, local_inputs);
       attrs.Set("tt.expression",
                 rewriter(Downcast<PrimExpr>(expression.value())));
     }
@@ -2081,11 +1987,8 @@ private:
             {"tt.logical_domain", domain},
             {"tt.expression", Call(output->buffer->dtype, dfb_load(),
                                    {Integer(storage)}, {}, call->span)},
-            {"tt.access_maps",
-             ffi::Array<ffi::Array<Integer>>{IdentityMap(domain.size())}},
             {"tt.input_shapes", ffi::Array<ffi::Array<PrimExpr>>{domain}},
             {"tt.value_inputs", ffi::Array<Integer>()},
-            {"tt.value_access_maps", ffi::Array<ffi::Array<Integer>>()},
             {"tt.value_input_shapes", ffi::Array<ffi::Array<PrimExpr>>()}};
         compute_.push_back(Evaluate(Call(DataType::Void(), compute_value(),
                                          {Integer(value), Integer(storage)},
@@ -2219,22 +2122,11 @@ private:
     ffi::Array<PrimExpr> args;
     std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
         inputs;
-    std::unordered_map<int64_t, int64_t> access_resources;
-    auto access_attr = call->annotations.Get("tt.access_ids");
-    ffi::Array<Integer> access_ids =
-        access_attr.has_value()
-            ? Downcast<ffi::Array<Integer>>(access_attr.value())
-            : ffi::Array<Integer>();
-    if (!access_ids.empty() && access_ids.size() + 1 != call->args.size())
-      ThrowMalformed("compute access_ids must match input operands");
     for (size_t i = 1; i < call->args.size(); ++i) {
       BufferRegion input =
           NormalizeToAccessRegion(call->args[i], kAccessRead).region;
-      FullRegion(input);
       int64_t id = Read(input->buffer, "trisc");
       inputs.emplace(input->buffer, id);
-      if (!access_ids.empty())
-        access_resources.emplace(access_ids[i - 1]->value, id);
       args.push_back(Integer(id));
       Wait(&compute_, id, call->span);
     }
@@ -2249,8 +2141,7 @@ private:
       std::unordered_map<Buffer, int64_t, ffi::ObjectPtrHash,
                          ffi::ObjectPtrEqual>
           no_values;
-      DeviceExpressionRewriter rewriter(inputs, no_values,
-                                        std::move(access_resources), {});
+      DeviceExpressionRewriter rewriter(inputs, no_values);
       annotations.Set("tt.expression",
                       rewriter(Downcast<PrimExpr>(expression.value())));
     }
@@ -2449,9 +2340,6 @@ private:
       resources_[output].consumer = "ncrisc";
       Wait(&compute_, input, call->span);
       Reserve(&compute_, output, call->span);
-      ffi::Array<Integer> identity;
-      for (size_t axis = 0; axis < copy->src->shape.size(); ++axis)
-        identity.push_back(Integer(axis));
       ffi::Map<ffi::String, ffi::ObjectRef> annotations{
           {"tt.compute_kind", StringImm("copy")},
           {"tt.compute_dtype",
@@ -2460,8 +2348,7 @@ private:
           {"tt.compute_tile_shape", src->tile_shape},
           {"tt.logical_domain", copy->src->shape},
           {"tt.input_shapes",
-           ffi::Array<ffi::Array<PrimExpr>>{copy->src->shape}},
-          {"tt.access_maps", ffi::Array<ffi::Array<Integer>>{identity}}};
+           ffi::Array<ffi::Array<PrimExpr>>{copy->src->shape}}};
       compute_.push_back(Evaluate(
           Call(DataType::Void(), tenstorrent::dfb_compute(),
                {Integer(output), Integer(input)}, annotations, call->span),
@@ -2757,9 +2644,6 @@ private:
         Wait(&compute_, input, call->span);
         Reserve(&compute_, id, call->span);
         const auto &metadata = resources_[id].metadata;
-        ffi::Array<Integer> identity;
-        for (size_t axis = 0; axis < region->buffer->shape.size(); ++axis)
-          identity.push_back(Integer(axis));
         ffi::Map<ffi::String, ffi::ObjectRef> annotations{
             {"tt.compute_kind", StringImm("copy")},
             {"tt.compute_dtype",
@@ -2769,8 +2653,7 @@ private:
             {"tt.compute_tile_shape", metadata->tile_shape},
             {"tt.logical_domain", region->buffer->shape},
             {"tt.input_shapes",
-             ffi::Array<ffi::Array<PrimExpr>>{region->buffer->shape}},
-            {"tt.access_maps", ffi::Array<ffi::Array<Integer>>{identity}}};
+             ffi::Array<ffi::Array<PrimExpr>>{region->buffer->shape}}};
         compute_.push_back(Evaluate(
             Call(DataType::Void(), tenstorrent::dfb_compute(),
                  {Integer(id), Integer(input)}, annotations, call->span),

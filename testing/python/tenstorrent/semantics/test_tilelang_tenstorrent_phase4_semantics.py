@@ -58,9 +58,16 @@ def expression(expr, values, maps, domain):
     elif isinstance(expr, tirx.Call):
         if expr.op.name == "tl.tt.dfb_load":
             resource = int(expr.args[0])
-            coordinates = np.indices(domain, sparse=True)
-            indices = tuple(0 if axis == -1 else coordinates[axis] for axis in maps[resource])
-            result = values[resource][indices]
+            if resource in maps:
+                coordinates = np.indices(domain, sparse=True)
+                indices = tuple(0 if axis == -1 else coordinates[axis] for axis in maps[resource])
+                result = values[resource][indices]
+            else:
+                result = values[resource]
+        elif expr.op.name == "tl.tt.compute_broadcast":
+            source = expression(expr.args[0], values, maps, domain)
+            axes = {int(axis) for axis in expr.args[1:]}
+            result = source[tuple(slice(0, 1) if axis in axes else slice(None) for axis in range(source.ndim))]
         else:
             unary = {
                 "tirx.sqrt": np.sqrt,
@@ -153,7 +160,7 @@ def run_device(mod, inputs):
                 output, *operands = args
                 kind = attrs["tt.compute_kind"].value
                 domain = tuple(int(x) for x in attrs["tt.logical_domain"])
-                maps = {resource: [int(x) for x in axes] for resource, axes in zip(operands, attrs["tt.access_maps"])}
+                maps = {resource: [int(x) for x in axes] for resource, axes in zip(operands, attrs.get("tt.access_maps", []))}
                 if kind in ("elementwise", "typecast", "fill"):
                     result = np.broadcast_to(expression(attrs["tt.expression"], values, maps, domain), domain)
                 elif kind == "copy":

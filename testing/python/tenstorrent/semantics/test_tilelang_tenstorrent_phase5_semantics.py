@@ -105,7 +105,7 @@ def run_pipeline_device(mod, inputs, *, seed=0):
                 attrs = call.annotations
                 kind = str(attrs["tt.compute_kind"].value)
                 domain = tuple(int(x) for x in attrs["tt.logical_domain"])
-                maps = {i: [int(x) for x in axes] for i, axes in zip(operands, attrs["tt.access_maps"])}
+                maps = {i: [int(x) for x in axes] for i, axes in zip(operands, attrs.get("tt.access_maps", []))}
                 if kind in ("elementwise", "typecast", "fill"):
                     result = np.broadcast_to(expression(attrs["tt.expression"], values, maps, domain), domain)
                 elif kind == "copy":

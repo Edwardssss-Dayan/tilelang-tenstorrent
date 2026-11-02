@@ -131,15 +131,18 @@ def calls(mod, name="tl.tt.tile_compute"):
     return found
 
 
-def test_tiles_consumes_expression_and_maps():
+def test_tiles_consumes_expression_with_explicit_broadcast():
     mod = legalize(elementwise_program(broadcast=True))
     selected = calls(mod)[0]
     assert str(selected.annotations["tt.compute_kind"].value) == "elementwise"
-    assert [[int(axis) for axis in axes] for axes in selected.annotations["tt.access_maps"]] == [
-        [0, 1],
-        [0, 1],
-        [-1, 1],
-    ]
+    broadcasts = []
+    tirx.stmt_functor.post_order_visit(
+        selected.annotations["tt.expression"],
+        lambda node: broadcasts.append(node) if isinstance(node, tirx.Call) and node.op.name == "tl.tt.compute_broadcast" else None,
+    )
+    assert len(broadcasts) == 1
+    assert [int(axis) for axis in broadcasts[0].args[1:]] == [0]
+    assert "tt.access_maps" not in selected.annotations
     blocks = []
     tirx.stmt_functor.post_order_visit(
         mod["main"].body,
