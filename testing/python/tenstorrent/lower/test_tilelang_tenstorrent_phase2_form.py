@@ -41,7 +41,7 @@ def add_fp32(
         )
         T.copy(A, a)
         T.copy(B, b)
-        for i, j in T.Parallel(32, 32):
+        for i, j in T.Tiles(c):
             c[i, j] = a[i, j] + b[i, j]
         T.copy(c, C)
 
@@ -181,9 +181,9 @@ def test_form_add_rejects_incomplete_dataflow_without_mutating_input(monkeypatch
     context = _context(monkeypatch)
     malformed = tirx.transform.BindTarget(context.target)(tvm.IRModule({"add": FRONTEND_PROGRAMS["add"]}))
     for compiler_pass in (
+        transform.ValidateTenstorrentFrontendIR(),
         transform.CanonicalizeTTElementwise(),
         transform.VerifyTTComputeBlocks(),
-        transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
         transform.NormalizeTenstorrentRegions(),

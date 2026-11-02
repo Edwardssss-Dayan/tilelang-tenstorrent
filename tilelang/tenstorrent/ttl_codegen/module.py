@@ -42,14 +42,12 @@ def _zero_fill(call):
 def _check_broadcast_requirements(call, requirements, dfbs, values):
     if requirements is None or str(requirements.destination_width) != "bits32_required":
         return
-    sources = [
-        (str(dfbs[int(index)].element_dtype), axes) for index, axes in zip(call.args[1:], call.annotations.get("tt.access_maps", []))
-    ]
-    sources.extend(
-        (str(values[int(index)].buffer.dtype), axes)
-        for index, axes in zip(call.annotations.get("tt.value_inputs", []), call.annotations.get("tt.value_access_maps", []))
+    broadcasts = []
+    tirx.stmt_functor.post_order_visit(
+        call.annotations["tt.expression"],
+        lambda node: broadcasts.append(node) if isinstance(node, tirx.Call) and node.op.name == "tl.tt.compute_broadcast" else None,
     )
-    if any(dtype == "bfloat16" and any(int(axis) == -1 for axis in axes) for dtype, axes in sources):
+    if any(str(broadcast.dtype) == "bfloat16" for broadcast in broadcasts):
         raise NotImplementedError(
             "Pinned TT-Lang cannot lower BF16 row/column/scalar broadcast with the kernel's required 32-bit destination; "
             "broadcast LLKs require 16-bit destination for BF16 inputs on wormhole_b0 and blackhole"

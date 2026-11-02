@@ -14,10 +14,9 @@ def shared(shape, dtype="float32"):
     return T.alloc_shared(shape, dtype, annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 2})
 
 
-def elementwise_program(*, tiles=False, shape=(64, 64), broadcast=False, inplace=False):
-    """Build equivalent frontend spellings, also reusable by Device IR tests."""
+def elementwise_program(*, shape=(64, 64), broadcast=False, inplace=False):
+    """Build the rank-2 T.Tiles frontend used by Device IR tests."""
     rhs_shape = (32, shape[1]) if broadcast else shape
-    iterator = (lambda *extents: T.Tiles(extents)) if tiles else T.Parallel
 
     @T.prim_func
     def program(A: T.Tensor(shape, "float32"), B: T.Tensor(rhs_shape, "float32"), C: T.Tensor(shape, "float32")):
@@ -28,28 +27,15 @@ def elementwise_program(*, tiles=False, shape=(64, 64), broadcast=False, inplace
             T.copy(A, a)
             T.copy(B, b)
             if inplace:
-                for i, j in iterator(*shape):
+                for i, j in T.Tiles(a):
                     a[i, j] = T.sqrt(a[i, j] * a[i, j] + b[0 if broadcast else i, j]) / T.float32(2)
                 T.copy(a, C)
             else:
-                for i, j in iterator(*shape):
+                for i, j in T.Tiles(c):
                     c[i, j] = T.sqrt(a[i, j] * a[i, j] + b[0 if broadcast else i, j]) / T.float32(2)
                 T.copy(c, C)
 
     return program
-
-
-@T.prim_func
-def batch_elementwise(A: T.Tensor((2, 64, 64), "float32"), B: T.Tensor((1, 32, 64), "float32"), C: T.Tensor((2, 64, 64), "float32")):
-    with T.Kernel(1, 1, threads=1):
-        a = shared((2, 64, 64))
-        b = shared((1, 32, 64))
-        c = shared((2, 64, 64))
-        T.copy(A, a)
-        T.copy(B, b)
-        for k, i, j in T.Parallel(2, 64, 64):
-            c[k, i, j] = a[k, i, j] - b[0, 0, j]
-        T.copy(c, C)
 
 
 @T.prim_func
@@ -66,7 +52,7 @@ def cast_program(A: T.Tensor((64, 64), "bfloat16"), C: T.Tensor((64, 64), "float
         a = shared((64, 64), "bfloat16")
         c = shared((64, 64))
         T.copy(A, a)
-        for i, j in T.Parallel(64, 64):
+        for i, j in T.Tiles(c):
             c[i, j] = T.Cast("float32", a[i, j])
         T.copy(c, C)
 
@@ -121,9 +107,9 @@ def reduction_program(*, kind="sum", axis=1, clear=True, dtype="float32", output
 def legalize(func):
     mod = tirx.transform.BindTarget(TARGET)(tvm.IRModule({"main": func}))
     for compiler_pass in (
+        transform.ValidateTenstorrentFrontendIR(),
         transform.CanonicalizeTTElementwise(),
         transform.VerifyTTComputeBlocks(),
-        transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
         transform.NormalizeTenstorrentRegions(),
@@ -145,32 +131,27 @@ def calls(mod, name="tl.tt.tile_compute"):
     return found
 
 
-def test_tiles_parallel_same_consumed_expression_and_maps():
-    outputs = [legalize(elementwise_program(tiles=tiles, broadcast=True)) for tiles in (False, True)]
-    left, right = (calls(mod)[0] for mod in outputs)
-    assert str(left.annotations["tt.compute_kind"].value) == "elementwise"
-    assert [[int(axis) for axis in axes] for axes in left.annotations["tt.access_maps"]] == [
-        [0, 1],
-        [0, 1],
-        [-1, 1],
-    ]
-    # Structural comparison uses free-var mapping because separately parsed
-    # programs own distinct Buffer/data identities.
-    assert ir.structural_equal(left, right, map_free_vars=True)
-    for mod in outputs:
-        blocks = []
-        tirx.stmt_functor.post_order_visit(
-            mod["main"].body,
-            lambda node, blocks=blocks: (
-                blocks.append(node) if isinstance(node, tirx.SBlock) and "tl.tt.compute_kind" in node.annotations else None
-            ),
-        )
-        assert not blocks
+def test_tiles_consumes_expression_with_explicit_broadcast():
+    mod = legalize(elementwise_program(broadcast=True))
+    selected = calls(mod)[0]
+    assert str(selected.annotations["tt.compute_kind"].value) == "elementwise"
+    broadcasts = []
+    tirx.stmt_functor.post_order_visit(
+        selected.annotations["tt.expression"],
+        lambda node: broadcasts.append(node) if isinstance(node, tirx.Call) and node.op.name == "tl.tt.compute_broadcast" else None,
+    )
+    assert len(broadcasts) == 1
+    assert [int(axis) for axis in broadcasts[0].args[1:]] == [0]
+    assert "tt.access_maps" not in selected.annotations
+    blocks = []
+    tirx.stmt_functor.post_order_visit(
+        mod["main"].body,
+        lambda node: blocks.append(node) if isinstance(node, tirx.SBlock) and "tl.tt.compute_kind" in node.annotations else None,
+    )
+    assert not blocks
 
 
-@pytest.mark.parametrize(
-    "func,kind", [(batch_elementwise, "elementwise"), (fill_program, "fill"), (cast_program, "typecast"), (transpose_program, "transpose")]
-)
+@pytest.mark.parametrize("func,kind", [(fill_program, "fill"), (cast_program, "typecast"), (transpose_program, "transpose")])
 def test_builtin_compute_is_consumed(func, kind):
     selected = calls(legalize(func))
     assert len(selected) == 1
@@ -224,29 +205,6 @@ def test_gemm_bfloat16_bringup_preserves_precision_requirement():
 def test_reduction_rejects_unsupported_kind():
     with pytest.raises((NotImplementedError, tvm.error.TVMError), match="sum, max and min"):
         legalize(reduction_program(kind="abssum"))
-
-
-@T.prim_func
-def batch_nested_parallel(A: T.Tensor((2, 64, 64), "float32"), B: T.Tensor((1, 32, 64), "float32"), C: T.Tensor((2, 64, 64), "float32")):
-    with T.Kernel(1, 1, threads=1):
-        a = shared((2, 64, 64))
-        b = shared((1, 32, 64))
-        c = shared((2, 64, 64))
-        T.copy(A, a)
-        T.copy(B, b)
-        for k in T.Parallel(2):
-            for i, j in T.Parallel(64, 64):
-                c[k, i, j] = a[k, i, j] - b[0, 0, j]
-        T.copy(c, C)
-
-
-def test_batch_flat_and_nested_parallel_same_device_selection():
-    left, right = (calls(legalize(func))[0] for func in (batch_elementwise, batch_nested_parallel))
-    assert ir.structural_equal(left, right, map_free_vars=True)
-    assert [[int(axis) for axis in axes] for axes in left.annotations["tt.access_maps"]] == [
-        [0, 1, 2],
-        [-1, -1, 2],
-    ]
 
 
 @pytest.mark.parametrize("kind,accum_dtype", [("sum", "float32"), ("min", "bfloat16"), ("max", "bfloat16")])

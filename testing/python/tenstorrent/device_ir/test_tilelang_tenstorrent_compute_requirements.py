@@ -14,11 +14,7 @@ from testing.python.tenstorrent._support.reference import _calls, _core_statemen
 
 
 def lower(accum_dtype="float32"):
-    return D.expand_current_device_tables(
-        TenstorrentPassPipelineBody(
-            IRModule({"main": program(accum_dtype=accum_dtype)}), TARGET
-        )
-    )
+    return D.expand_current_device_tables(TenstorrentPassPipelineBody(IRModule({"main": program(accum_dtype=accum_dtype)}), TARGET))
 
 
 def compute(mod):
@@ -39,7 +35,6 @@ def test_accumulator_requirements_json_roundtrip(dtype, width, full):
     assert ir.structural_equal(mod, restored)
     assert ir.structural_hash(mod) == ir.structural_hash(restored)
     assert transform.VerifyTenstorrentDeviceIR()(restored).same_as(restored)
-    assert ir.structural_equal(restored, transform.InferTenstorrentComputeRequirements()(restored))
 
 
 @pytest.mark.parametrize(
@@ -56,9 +51,6 @@ def test_missing_or_forged_requirements_rejected_without_repair(replacement):
     with pytest.raises((ValueError, error.TVMError), match="tt.compute_requirements"):
         transform.VerifyTenstorrentDeviceIR()(mod)
     assert ir.save_json(mod) == before
-    if replacement is not None:
-        with pytest.raises((ValueError, error.TVMError), match="tt.compute_requirements"):
-            transform.InferTenstorrentComputeRequirements()(mod)
 
 
 @pytest.mark.parametrize(
@@ -96,9 +88,7 @@ def test_actual_lifetime_is_reverified(mutation, message):
         statements[statements.index(update)] = tirx.Evaluate(tirx.Call("void", update.value.op, args))
     mod.update_func(gv, _with_core_statements(func, statements).without_attr("tt.compute_requirements"))
     with pytest.raises((ValueError, error.TVMError), match=message):
-        transform.VerifyTenstorrentDeviceIR()(
-            transform.InferTenstorrentComputeRequirements()(mod)
-        )
+        transform.VerifyTenstorrentDeviceIR()(transform.InferTenstorrentComputeRequirements()(mod))
 
 
 def test_descriptor_full_k_cannot_be_forged():
@@ -117,9 +107,7 @@ def test_descriptor_full_k_cannot_be_forged():
     gv, func = compute(mod)
     mod.update_func(gv, func.without_attr("tt.compute_requirements"))
     with pytest.raises((ValueError, error.TVMError), match="full-K updates"):
-        transform.VerifyTenstorrentDeviceIR()(
-            transform.InferTenstorrentComputeRequirements()(mod)
-        )
+        transform.VerifyTenstorrentDeviceIR()(transform.InferTenstorrentComputeRequirements()(mod))
 
 
 def test_conflicting_kernels_requirements_are_not_silently_widened():

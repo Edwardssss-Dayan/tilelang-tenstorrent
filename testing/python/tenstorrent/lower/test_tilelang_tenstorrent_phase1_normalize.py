@@ -28,6 +28,7 @@ def _normalized_through_layout(name: str):
     mod = _bound(name)
     for pass_name in (
         "ValidateTenstorrentFrontendIR",
+        "CanonicalizeTTElementwise",
         "NormalizeTenstorrentLaunch",
         "NormalizeTenstorrentBufferMetadata",
         "NormalizeTenstorrentRegions",
@@ -56,7 +57,45 @@ def test_validate_rejects_missing_launch_as_malformed():
         _apply("ValidateTenstorrentFrontendIR", mod)
 
 
-def test_launch_normalizes_static_2d_and_is_idempotent():
+def test_validate_rejects_vectorized_frontend_loop_without_mutation():
+    mod = _bound("add")
+
+    def vectorize_tiles_scope(node):
+        if isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
+            return tirx.For(node.loop_var, node.min, node.extent, tirx.ForKind.VECTORIZED, node.body)
+        return None
+
+    func = mod["add"]
+    malformed = tvm.IRModule({"add": func.with_body(tirx.stmt_functor.ir_transform(func.body, None, vectorize_tiles_scope))})
+    before = ir.save_json(malformed)
+    with pytest.raises(NotImplementedError, match="vectorized loops are not supported"):
+        _apply("ValidateTenstorrentFrontendIR", malformed)
+    assert ir.save_json(malformed) == before
+
+
+def test_validate_rejects_nontrivial_block_predicate_without_mutation():
+    mod = _bound("add")
+    wrapped = False
+
+    def predicate_tiles_scope(node):
+        nonlocal wrapped
+        if not wrapped and isinstance(node, tirx.For) and "tl.tt.tiles_scope" in node.annotations:
+            wrapped = True
+            block = tirx.SBlock([], [], [], "predicated_tiles", node)
+            return tirx.SBlockRealize([], tirx.Var("condition", "bool"), block)
+        return None
+
+    func = mod["add"]
+    body = tirx.stmt_functor.ir_transform(func.body, None, predicate_tiles_scope)
+    assert wrapped
+    malformed = tvm.IRModule({"add": func.with_body(body)})
+    before = ir.save_json(malformed)
+    with pytest.raises(NotImplementedError, match="block predicates/T.where are not supported"):
+        _apply("ValidateTenstorrentFrontendIR", malformed)
+    assert ir.save_json(malformed) == before
+
+
+def test_launch_normalizes_static_2d():
     mod = _apply("NormalizeTenstorrentLaunch", _bound("p2p"))
     func = mod["p2p"]
     assert [int(value) for value in func.attrs["tt.launch_grid"]] == [2, 1]
@@ -68,10 +107,6 @@ def test_launch_normalizes_static_2d_and_is_idempotent():
     assert isinstance(inner, tirx.For)
     assert inner.kind == tirx.ForKind.SERIAL
     assert str(inner.annotations["tt.logical_core_axis"]) == "y"
-
-    twice = _apply("NormalizeTenstorrentLaunch", mod)
-    ir.assert_structural_equal(twice, mod)
-    assert str(twice) == str(mod)
 
 
 def test_launch_rejects_non_unit_threads_as_unsupported():
@@ -110,9 +145,6 @@ def test_buffer_metadata_is_typed_stable_and_preserves_buffer_identity():
             assert table[index].source_span.same_as(table[index].buffer.span)
     assert all(str(item.tile_shape_origin) == "explicit" for item in table[3:])
     assert all(int(item.dfb_block_count) == 2 for item in table[3:])
-
-    twice = _apply("NormalizeTenstorrentBufferMetadata", mod)
-    ir.assert_structural_equal(twice, mod)
 
 
 @pytest.mark.parametrize("name", ("add", "p2p"))

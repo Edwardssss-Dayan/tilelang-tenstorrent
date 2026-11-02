@@ -8,7 +8,7 @@ import pytest
 from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T
 from tilelang.tenstorrent.transform import VerifyTenstorrentDeviceIR
-from tvm import ir, tirx
+from tvm import ir
 
 from testing.python.tenstorrent.semantics.test_tilelang_tenstorrent_phase4_semantics import cast, expression
 from testing.python.tenstorrent._support.reference import _calls
@@ -105,7 +105,7 @@ def run_pipeline_device(mod, inputs, *, seed=0):
                 attrs = call.annotations
                 kind = str(attrs["tt.compute_kind"].value)
                 domain = tuple(int(x) for x in attrs["tt.logical_domain"])
-                maps = {i: [int(x) for x in axes] for i, axes in zip(operands, attrs["tt.access_maps"])}
+                maps = {i: [int(x) for x in axes] for i, axes in zip(operands, attrs.get("tt.access_maps", []))}
                 if kind in ("elementwise", "typecast", "fill"):
                     result = np.broadcast_to(expression(attrs["tt.expression"], values, maps, domain), domain)
                 elif kind == "copy":
@@ -198,13 +198,17 @@ def make_mixed_pipeline(stages, dtype):
         with T.Kernel(1, 1, threads=1):
             a = T.alloc_shared((32, 32), dtype)
             b = T.alloc_shared((32, 32), dtype)
-            acc = T.alloc_shared((32, 32), "float32")
+            acc = T.alloc_shared(
+                (32, 32),
+                "float32",
+                annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": max(stages, 1)},
+            )
             summed = T.alloc_shared((32,), "float32")
             for _ in T.Pipelined(4, num_stages=stages):
                 T.copy(A, a)
                 T.copy(B, b)
                 T.gemm(a, b, acc, clear_accum=True)
-                for i, j in T.Parallel(32, 32):
+                for i, j in T.Tiles(acc):
                     acc[i, j] = acc[i, j] * T.float32(2)
                 T.reduce_sum(acc, summed, dim=1)
                 T.copy(acc, C)

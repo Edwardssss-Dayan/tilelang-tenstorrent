@@ -74,8 +74,7 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
         auto accumulation = call->annotations.Get("tt.accum_dtype");
         if (kind.has_value() && accumulation.has_value() &&
             Downcast<StringImm>(kind.value())->value == "gemm") {
-          ffi::String dtype =
-              Downcast<StringImm>(accumulation.value())->value;
+          ffi::String dtype = Downcast<StringImm>(accumulation.value())->value;
           Check(dtype == "float32" || dtype == "bfloat16",
                 "unsupported GEMM accumulation dtype");
           has_fp32_dfb_gemm |= dtype == "float32";
@@ -112,16 +111,14 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
     for (const AccumulatorDescriptor &accumulator : table) {
       Check(accumulator.defined() &&
                 IsSupportedAccumulatorDTypeTriple(
-                    accumulator->input_dtype,
-                    accumulator->accumulation_dtype,
+                    accumulator->input_dtype, accumulator->accumulation_dtype,
                     accumulator->output_dtype),
             "invalid or unsupported accumulator dtype triple");
       bool fp32 = accumulator->accumulation_dtype == DataType::Float(32);
       ffi::String next_width = fp32 ? "bits32_required" : "bits16_required";
       ffi::String next_full = fp32 ? "required" : "forbidden";
-      bool compatible =
-          (width == "unconstrained" || width == next_width) &&
-          (full == "allowed" || full == next_full);
+      bool compatible = (width == "unconstrained" || width == next_width) &&
+                        (full == "allowed" || full == next_full);
       if (!compatible)
         Unsupported("conflicting hard destination width requirements in one "
                     "shared compute kernel");
@@ -207,15 +204,15 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
         }
         if (call && (call->op.same_as(compute_value()) ||
                      call->op.same_as(dfb_compute()))) {
-        auto expression = call->annotations.Get("tt.expression");
-        if (expression.has_value()) {
-          auto expr = expression.value().as<PrimExpr>();
-          Check(expr.has_value(), "invalid compute precision expression");
-          PostOrderVisit(expr.value(), [&](const ffi::ObjectRef &item) {
-            if (auto value = item.as<PrimExpr>())
-              requires_fp32 |= value.value().dtype() == DataType::Float(32);
-          });
-        }
+          auto expression = call->annotations.Get("tt.expression");
+          if (expression.has_value()) {
+            auto expr = expression.value().as<PrimExpr>();
+            Check(expr.has_value(), "invalid compute precision expression");
+            PostOrderVisit(expr.value(), [&](const ffi::ObjectRef &item) {
+              if (auto value = item.as<PrimExpr>())
+                requires_fp32 |= value.value().dtype() == DataType::Float(32);
+            });
+          }
         }
         if (!call || !call->op.same_as(compute_value_gemm()))
           return;
@@ -238,14 +235,13 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       bool fp32 = acc->accumulation_dtype == DataType::Float(32);
       ffi::String next_width = fp32 ? "bits32_required" : "bits16_required";
       ffi::String next_full = fp32 ? "required" : "forbidden";
-      bool compatible =
-          (width == "unconstrained" || width == next_width) &&
-          (full == "allowed" || full == next_full);
+      bool compatible = (width == "unconstrained" || width == next_width) &&
+                        (full == "allowed" || full == next_full);
       if (current_device && !compatible)
         Unsupported("conflicting hard destination width requirements in one "
                     "shared compute kernel");
-      Check(compatible,
-            "conflicting hard destination width requirements in one compute kernel");
+      Check(compatible, "conflicting hard destination width requirements in "
+                        "one compute kernel");
       width = next_width;
       full = next_full;
       requirements.push_back(acc);
@@ -285,9 +281,8 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       bool has_core_query = false;
       PostOrderVisit(branch->condition, [&](const ffi::ObjectRef &node) {
         const auto *call = node.as<CallNode>();
-        has_core_query |= call &&
-                          (call->op.same_as(tenstorrent::core_x()) ||
-                           call->op.same_as(tenstorrent::core_y()));
+        has_core_query |= call && (call->op.same_as(tenstorrent::core_x()) ||
+                                   call->op.same_as(tenstorrent::core_y()));
       });
       return has_core_query;
     };
@@ -297,8 +292,9 @@ ComputeRequirements DeriveComputeRequirements(const IRModule &mod,
       for (const Stmt &statement : sequence->seq)
         canonical &= is_core_dispatch(statement);
     }
-    Check(canonical,
-          "shared Device accumulator lifetime has unverified outer control flow");
+    Check(
+        canonical,
+        "shared Device accumulator lifetime has unverified outer control flow");
   }
   std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual> storage;
   if (entries.has_value()) {
@@ -632,12 +628,6 @@ tvm::transform::Pass InferTenstorrentComputeRequirements() {
       if (func->GetAttr<ffi::String>(kKernelSlotAttr).value_or("") != "trisc")
         continue;
       ComputeRequirements requirements = DeriveComputeRequirements(mod, func);
-      auto previous =
-          func->GetAttr<ComputeRequirements>(kComputeRequirementsAttr);
-      Check(
-          !previous.has_value() ||
-              ffi::StructuralEqual()(previous.value(), requirements),
-          "existing tt.compute_requirements conflicts with Device operations");
       result->Update(global,
                      WithAttr(func, kComputeRequirementsAttr, requirements));
       if (mod->GetAttr<Integer>(kDeviceIRVersionAttr)

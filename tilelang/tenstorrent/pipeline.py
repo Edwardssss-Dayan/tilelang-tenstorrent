@@ -12,8 +12,8 @@ from . import transform
 
 TENSTORRENT_LOWER_PASS_ORDER = (
     "BindTarget",
-    "CanonicalizeTTElementwise",
     "ValidateTenstorrentFrontendIR",
+    "CanonicalizeTTElementwise",
     "NormalizeTenstorrentLaunch",
     "NormalizeTenstorrentBufferMetadata",
     "VerifyTTGemmAccumulators",
@@ -26,6 +26,14 @@ TENSTORRENT_LOWER_PASS_ORDER = (
     "InferTenstorrentComputeRequirements",
     "VerifyTenstorrentDeviceIR",
 )
+
+
+def _reject_prebound_frontend_targets(mod: IRModule) -> None:
+    for symbol, func in mod.functions.items():
+        if not isinstance(func, tirx.PrimFunc):
+            continue
+        if func.attrs is not None and "target" in func.attrs:
+            raise ValueError(f"Tenstorrent lowering requires target-free frontend IR; function {symbol.name_hint!r} has a pre-bound target")
 
 
 def _has_compute_blocks(func: tirx.PrimFunc) -> bool:
@@ -64,31 +72,20 @@ def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
         raise ValueError("Tenstorrent lowering requires a tenstorrent target")
 
     stage = "" if mod.attrs is None else str(mod.attrs.get("tt.ir_stage", ""))
-    if stage == "device":
-        verified = transform.VerifyTenstorrentDeviceIR()(mod)
-        if str(verified.attrs["tt.target_arch"]) != str(target.attrs["arch"]):
-            raise ValueError("Tenstorrent Device IR architecture disagrees with lowering target")
-        return verified
-
-    if mod.attrs is not None and "tt.device_ir_version" in mod.attrs:
-        raise ValueError(
-            "lower_tenstorrent_ir accepts only the stage-marked current contract; "
-            "verify legacy versioned artifacts explicitly with VerifyTenstorrentDeviceIR"
-        )
-
-    # The normalized launch no longer has the frontend's thread-binding nest.
-    # Do not skip frontend validation based on an untrusted stage annotation.
     if stage:
-        raise ValueError("Cannot re-lower normalized structured IR; pass the original frontend module instead")
+        raise ValueError("lower_tenstorrent_ir accepts only the original frontend module")
+    if mod.attrs is not None and "tt.device_ir_version" in mod.attrs:
+        raise ValueError("lower_tenstorrent_ir does not accept versioned Device IR")
+    _reject_prebound_frontend_targets(mod)
     if mod.attrs is not None and "tt.deferred_reasons" in mod.attrs:
         mod = mod.without_attr("tt.deferred_reasons")
 
     passes = (
         tirx.transform.BindTarget(target),
-        # Capture both frontends while their logical loop binders and original
+        transform.ValidateTenstorrentFrontendIR(),
+        # Capture Tiles while its logical loop binders and original
         # allocation metadata are intact, before any execution lowering.
         transform.CanonicalizeTTElementwise(),
-        transform.ValidateTenstorrentFrontendIR(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
         transform.VerifyTTGemmAccumulators(),
@@ -113,27 +110,19 @@ def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
             reasons.append(f"{symbol.name_hint}: compute block has no Device consumer")
         # Pipe-only programs have a communication ABI and are verified by the
         # multicore formation path even when no Tensor parameter is present.
-        has_topology = (
-            func.attrs is not None
-            and "tt.normalized_topology" in func.attrs
-            and len(func.attrs["tt.normalized_topology"]) > 0
-        )
+        has_topology = func.attrs is not None and "tt.normalized_topology" in func.attrs and len(func.attrs["tt.normalized_topology"]) > 0
         if not func.buffer_map and not has_topology and _has_computation(func):
             reasons.append(f"{symbol.name_hint}: standalone computation has no Tensor ABI")
     if reasons:
         # Return the whole original module, including supported siblings. Never
         # leak a mixture of selected Device instructions and expression templates.
-        normalized = transform.VerifyTTStructuredDataflow()(normalized)
-        return normalized.with_attrs(
-            {"tt.ir_stage": "structured", "tt.deferred_reasons": sorted(reasons)}
-        )
+        return normalized.with_attrs({"tt.ir_stage": "structured", "tt.deferred_reasons": sorted(reasons)})
 
     try:
         mod = transform.InferTenstorrentTensorLayout()(mod)
         mod = transform.FormTenstorrentDeviceProgram()(mod)
     except NotImplementedError as exc:
-        verified = transform.VerifyTTStructuredDataflow()(normalized)
-        return verified.with_attrs(
+        return normalized.with_attrs(
             {
                 "tt.ir_stage": "structured",
                 "tt.deferred_reasons": [str(exc)],
@@ -142,8 +131,7 @@ def lower_tenstorrent_ir(mod: IRModule, target: Target) -> IRModule:
     try:
         mod = transform.InferTenstorrentComputeRequirements()(mod)
     except NotImplementedError as exc:
-        verified = transform.VerifyTTStructuredDataflow()(normalized)
-        return verified.with_attrs(
+        return normalized.with_attrs(
             {
                 "tt.ir_stage": "structured",
                 "tt.deferred_reasons": [str(exc)],

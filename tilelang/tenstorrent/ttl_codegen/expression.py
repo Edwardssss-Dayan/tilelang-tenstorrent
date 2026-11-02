@@ -36,6 +36,10 @@ def check_expression(expr):
         check_expression(expr.b)
     elif isinstance(expr, tirx.Call) and expr.op.name in _LOADS:
         return
+    elif isinstance(expr, tirx.Call) and expr.op.name == "tl.tt.compute_broadcast":
+        if len(expr.args) < 2:
+            raise ValueError("compute_broadcast requires one value and broadcast axes")
+        check_expression(expr.args[0])
     elif isinstance(expr, tirx.Call) and expr.op.name in _UNARY:
         check_expression(expr.args[0])
     else:
@@ -49,16 +53,6 @@ class ExpressionEmitter:
         self.shape = list(result_type.shape)
         self.result_type = result_type
         self.dtype = str(call.annotations["tt.compute_dtype"].value)
-        self.maps = {
-            ("tl.tt.dfb_load", int(index)): list(map(int, axes))
-            for index, axes in zip(call.args[1:], call.annotations.get("tt.access_maps", []))
-        }
-        self.maps.update(
-            {
-                ("tl.tt.compute_value_load", int(index)): list(map(int, axes))
-                for index, axes in zip(call.annotations.get("tt.value_inputs", []), call.annotations.get("tt.value_access_maps", []))
-            }
-        )
 
     def tensor_type(self, dtype):
         return self.b.ir.RankedTensorType.get(self.shape, self.e.tile_type(dtype, (32, 32)))
@@ -80,14 +74,11 @@ class ExpressionEmitter:
             return getattr(ttl, _BINARY[type(expr)])(self.emit(expr.a, expr.dtype), self.emit(expr.b, expr.dtype))
         if isinstance(expr, tirx.Call) and expr.op.name in _LOADS:
             index = int(expr.args[0])
-            value = self.e.values[index] if expr.op.name == "tl.tt.dfb_load" else self.e.compute_values[index]
-            axes = self.maps[(expr.op.name, index)]
-            dims = [axis for axis, source in enumerate(axes) if source == -1]
-            if dims:
-                dims_attr = self.b.ir.DenseI64ArrayAttr.get(dims)
-                shape_attr = self.b.ir.DenseI64ArrayAttr.get(self.shape)
-                value = ttl.block_broadcast(self.tensor_type(expr.dtype), value, dims_attr, shape_attr)
-            return value
+            return self.e.values[index] if expr.op.name == "tl.tt.dfb_load" else self.e.compute_values[index]
+        if isinstance(expr, tirx.Call) and expr.op.name == "tl.tt.compute_broadcast":
+            dims_attr = self.b.ir.DenseI64ArrayAttr.get([int(axis) for axis in expr.args[1:]])
+            shape_attr = self.b.ir.DenseI64ArrayAttr.get(self.shape)
+            return ttl.block_broadcast(self.tensor_type(expr.dtype), self.emit(expr.args[0]), dims_attr, shape_attr)
         operation = _UNARY[expr.op.name]
         value = self.emit(expr.args[0])
         if operation == "log2":

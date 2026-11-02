@@ -7,7 +7,6 @@ from tilelang import tvm
 from tilelang.backend import create_backend_context
 from tilelang.tenstorrent import execution_backend, transform
 from tilelang.tenstorrent import language as T
-from tilelang.tenstorrent.codegen import prepare_ttl_codegen
 
 from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase0_contract import (
     FRONTEND_PROGRAMS,
@@ -121,6 +120,7 @@ def test_phase1_read_only_gates_are_identity_for_supported_subset(monkeypatch):
     mod = tirx.transform.BindTarget(context.target)(tvm.IRModule({"phase1_noop": phase1_noop}))
     for compiler_pass in (
         transform.ValidateTenstorrentFrontendIR(),
+        transform.CanonicalizeTTElementwise(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
         transform.NormalizeTenstorrentRegions(),
@@ -136,7 +136,7 @@ def test_phase1_read_only_gates_are_identity_for_supported_subset(monkeypatch):
 
 def test_phase1_pipeline_rejects_uncaptured_store(monkeypatch):
     context = _context(monkeypatch)
-    with pytest.raises(ValueError, match="uncaptured BufferStore"):
+    with pytest.raises(NotImplementedError, match="BufferStore compute must be enclosed by T.Tiles"):
         context.lower(tvm.IRModule({"store": phase1_store}))
 
 

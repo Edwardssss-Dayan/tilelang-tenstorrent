@@ -11,9 +11,7 @@ from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 from tvm import ir, tirx
 
 
-pytestmark = pytest.mark.skip(
-    reason="legacy Device IR v4 PipeNet/per-Core schema replaced by shared-grid v04 communication lowering"
-)
+pytestmark = pytest.mark.skip(reason="legacy Device IR v4 PipeNet/per-Core schema replaced by shared-grid v04 communication lowering")
 
 
 def shared():
@@ -298,24 +296,6 @@ def test_multicore_pipeline_composition_retains_verified_pools():
     restored = ir.load_json(ir.save_json(mod))
     ir.assert_structural_equal(mod, restored)
     assert transform.VerifyTenstorrentDeviceIR()(restored).same_as(restored)
-
-
-def test_topology_normalization_is_idempotent():
-    from tilelang.tenstorrent import transform
-
-    target = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
-    mod = tvm.IRModule({"main": make_scatter(True)})
-    for compiler_pass in (
-        tirx.transform.BindTarget(target),
-        transform.CanonicalizeTTElementwise(),
-        transform.VerifyTTComputeBlocks(),
-        transform.ValidateTenstorrentFrontendIR(),
-        transform.NormalizeTenstorrentLaunch(),
-        transform.NormalizeTenstorrentBufferMetadata(),
-        transform.NormalizeTenstorrentTopology(),
-    ):
-        mod = compiler_pass(mod)
-    ir.assert_structural_equal(mod, transform.NormalizeTenstorrentTopology()(mod))
 
 
 def test_active_net_cannot_silently_drop_an_original_record():

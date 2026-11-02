@@ -85,21 +85,6 @@ private:
   bool found_{false};
 };
 
-class ThreadBindingFinder : public StmtVisitor {
-public:
-  bool found() const { return found_; }
-
-  void VisitStmt_(const ForNode *op) final {
-    if (op->kind == ForKind::kThreadBinding) {
-      found_ = true;
-    }
-    StmtVisitor::VisitStmt_(op);
-  }
-
-private:
-  bool found_{false};
-};
-
 std::vector<For> CollectLaunchPrefix(const Stmt &body) {
   std::vector<For> loops;
   Stmt current = body;
@@ -122,49 +107,7 @@ std::vector<For> CollectLaunchPrefix(const Stmt &body) {
   return loops;
 }
 
-void ValidateCanonicalLaunch(const PrimFunc &func,
-                             const ffi::Array<PrimExpr> &grid) {
-  if (grid.size() != 2) {
-    ThrowMalformed("'tt.launch_grid' must contain exactly x and y extents");
-  }
-  RequireStaticExtent(grid[0], "core.x");
-  RequireStaticExtent(grid[1], "core.y");
-
-  Stmt current = func->body;
-  for (const char *axis : {"x", "y"}) {
-    const auto *loop_node = current.as<ForNode>();
-    if (loop_node == nullptr || loop_node->kind != ForKind::kSerial) {
-      ThrowMalformed("canonical launch must retain serial logical Core x/y "
-                     "loops");
-    }
-    For loop = ffi::GetRef<For>(loop_node);
-    auto annotation = loop->annotations.Get(kLogicalCoreAxis);
-    if (!annotation.has_value()) {
-      ThrowMalformed("canonical logical Core loop is missing '" +
-                     std::string(kLogicalCoreAxis) + "'");
-    }
-    auto actual_axis = annotation.value().as<ffi::String>();
-    if (!actual_axis.has_value() || actual_axis.value() != axis) {
-      ThrowMalformed("canonical logical Core axes must be ordered x then y");
-    }
-    RequireZeroMinimum(loop, std::string("core.") + axis);
-    current = loop->body;
-  }
-
-  ThreadBindingFinder finder;
-  finder(func->body);
-  if (finder.found()) {
-    ThrowMalformed("canonical launch still contains a GPU thread-binding "
-                   "loop");
-  }
-}
-
 PrimFunc NormalizeLaunch(PrimFunc func) {
-  if (auto launch_grid = func->GetAttr<ffi::Array<PrimExpr>>(kLaunchGridAttr)) {
-    ValidateCanonicalLaunch(func, launch_grid.value());
-    return func;
-  }
-
   std::vector<For> loops = CollectLaunchPrefix(func->body);
   const std::vector<std::string> expected = {
       "blockIdx.x", "blockIdx.y", "threadIdx.x", "threadIdx.y", "threadIdx.z"};

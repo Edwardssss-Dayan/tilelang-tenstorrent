@@ -3,9 +3,7 @@
 import pytest
 
 
-pytestmark = pytest.mark.skip(
-    reason="legacy PipeNet/per-Core SUMMA frontend contract replaced by high-level v04 communication"
-)
+pytestmark = pytest.mark.skip(reason="legacy PipeNet/per-Core SUMMA frontend contract replaced by high-level v04 communication")
 
 from tilelang import tvm
 from tilelang.tenstorrent import language as T
@@ -34,8 +32,8 @@ def _normalize(core_grid=2):
     target = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
     mod = tirx.transform.BindTarget(target)(tvm.IRModule({"main": main}))
     for compiler_pass in (
-        transform.CanonicalizeTTElementwise(),
         transform.ValidateTenstorrentFrontendIR(),
+        transform.CanonicalizeTTElementwise(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
         transform.VerifyTTGemmAccumulators(),

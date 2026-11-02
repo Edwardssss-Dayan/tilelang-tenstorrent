@@ -24,9 +24,7 @@ def _specialize_expr(expr, bindings, core):
                 return tirx.IntImm(node.dtype, core[1])
             return None
 
-        expr = tirx.stmt_functor.ir_transform(
-            tirx.Evaluate(expr), rewrite, None, ["tirx.Call"]
-        ).value
+        expr = tirx.stmt_functor.ir_transform(tirx.Evaluate(expr), rewrite, None, ["tirx.Call"]).value
     return tvm.arith.Analyzer().simplify(expr)
 
 
@@ -34,14 +32,9 @@ def _specialize_call(call, bindings, core):
     args = [_specialize_expr(arg, bindings, core) for arg in call.args]
     annotations = {key: value for key, value in call.annotations.items()}
     if "tt.value_inputs" in annotations:
-        annotations["tt.value_inputs"] = [
-            _specialize_expr(value, bindings, core)
-            for value in annotations["tt.value_inputs"]
-        ]
+        annotations["tt.value_inputs"] = [_specialize_expr(value, bindings, core) for value in annotations["tt.value_inputs"]]
     if "tt.expression" in annotations:
-        annotations["tt.expression"] = _specialize_expr(
-            annotations["tt.expression"], bindings, core
-        )
+        annotations["tt.expression"] = _specialize_expr(annotations["tt.expression"], bindings, core)
     return tirx.Call(call.dtype, call.op, args, annotations, call.span)
 
 
@@ -150,10 +143,11 @@ def interpret_values(mod, tensors):
             name = expr.op.name
             if name in ("tl.tt.dfb_load", "tl.tt.compute_value_load"):
                 identifier = int(expr.args[0])
-                source = dfbs[identifier] if name == "tl.tt.dfb_load" else values[identifier]
-                axes = maps[(name, identifier)]
-                source = source[tuple(slice(0, 1) if axis == -1 else slice(None) for axis in axes)]
-                return source
+                return dfbs[identifier] if name == "tl.tt.dfb_load" else values[identifier]
+            if name == "tl.tt.compute_broadcast":
+                source = expression(expr.args[0], maps)
+                axes = {int(axis) for axis in expr.args[1:]}
+                return source[tuple(slice(0, 1) if axis in axes else slice(None) for axis in range(source.ndim))]
             unary = {
                 "tirx.exp": np.exp,
                 "tirx.exp2": np.exp2,
@@ -282,9 +276,11 @@ def interpret(mod, inputs, seed=0):
         if isinstance(expr, tirx.Call):
             if expr.op.name in ("tl.tt.dfb_load", "tl.tt.compute_value_load"):
                 identifier = int(expr.args[0])
-                source = dfbs[identifier] if expr.op.name == "tl.tt.dfb_load" else values[identifier]
-                axes = maps[(expr.op.name, identifier)]
-                return source[tuple(slice(0, 1) if axis == -1 else slice(None) for axis in axes)]
+                return dfbs[identifier] if expr.op.name == "tl.tt.dfb_load" else values[identifier]
+            if expr.op.name == "tl.tt.compute_broadcast":
+                source = expression(expr.args[0], maps)
+                axes = {int(axis) for axis in expr.args[1:]}
+                return source[tuple(slice(0, 1) if axis in axes else slice(None) for axis in range(source.ndim))]
             if expr.op.name == "tirx.exp2":
                 return _round(np.exp2(expression(expr.args[0], maps)), expr.dtype)
             raise AssertionError(expr.op.name)

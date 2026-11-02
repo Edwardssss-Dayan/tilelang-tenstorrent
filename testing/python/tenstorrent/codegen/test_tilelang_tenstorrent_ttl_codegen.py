@@ -5,9 +5,7 @@ import importlib.util
 import pytest
 
 
-pytestmark = pytest.mark.skip(
-    reason="TTL Codegen still targets legacy versioned Device IR; this change is intentionally Lower-only"
-)
+pytestmark = pytest.mark.skip(reason="TTL Codegen still targets legacy versioned Device IR; this change is intentionally Lower-only")
 
 from tilelang import tvm
 from tvm.target import Target
@@ -73,7 +71,7 @@ def test_ttl_shared_composite_expression_preserves_v2_capability():
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
     from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute import elementwise_program
 
-    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": elementwise_program(tiles=True, broadcast=True)}), TARGET)
+    mod = TenstorrentPassPipelineBody(tvm.IRModule({"main": elementwise_program(broadcast=True)}), TARGET)
     assert int(mod.attrs["tt.device_ir_version"]) == 2
     check_capability(mod)
 

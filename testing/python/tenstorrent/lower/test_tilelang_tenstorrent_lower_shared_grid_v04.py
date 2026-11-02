@@ -99,15 +99,8 @@ def test_high_level_communication_forms_complete_device_program(program, kind, a
     steps = list(expanded(mod).attrs["tt.communication_step_table"])
     assert steps
     assert [int(step.step_id) for step in steps] == list(range(len(steps)))
-    assert all(
-        all(int(dependency) < int(step.step_id) for dependency in step.dependencies)
-        for step in steps
-    )
-    body_names = {
-        call.op.name
-        for function in mod.functions.values()
-        for call in calls(function.body)
-    }
+    assert all(all(int(dependency) < int(step.step_id) for dependency in step.dependencies) for step in steps)
+    body_names = {call.op.name for function in mod.functions.values() for call in calls(function.body)}
     assert not {"tl.tt.transfer", "tl.tt.all_gather", "tl.tt.all_reduce"} & body_names
 
 
@@ -130,26 +123,15 @@ def mixed_access_identity(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32)
         T.copy(out, C)
 
 
-def test_same_buffer_accesses_keep_distinct_identity_and_broadcast_maps():
-    mod = lower(mixed_access_identity)
-    compute = next(
-        call
-        for function in mod.functions.values()
-        for call in calls(function.body)
-        if call.op.name == "tl.tt.dfb_compute"
-    )
-    access_ids = [int(value) for value in compute.annotations["tt.access_ids"]]
-    assert access_ids == [0, 1]
-    assert [list(map(int, mapping)) for mapping in compute.annotations["tt.access_maps"]] == [
-        [0, 1],
-        [-1, 1],
-    ]
+def test_same_buffer_identity_and_broadcast_accesses_are_rejected():
+    with pytest.raises(ValueError, match="different logical regions"):
+        lower(mixed_access_identity)
 
 
 def test_current_device_tirx_parses_and_reverifies():
     from tvm.script import from_source
 
-    mod = lower(mixed_access_identity)
+    mod = lower(single_slot_in_place)
     source = D.device_ir_to_tirx(mod)
     assert "tt__compute_kind" in source
     assert "tt.compute_kind=" not in source
@@ -258,9 +240,7 @@ def producer_forwarded_broadcast(
 def test_tensor_panel_producer_forwarding_is_a_closed_ncrisc_transaction():
     mod = lower(producer_forwarded_broadcast)
     steps = list(expanded(mod).attrs["tt.communication_step_table"])
-    source_steps = [
-        step for step in steps if str(step.kind) in ("send", "completion")
-    ]
+    source_steps = [step for step in steps if str(step.kind) in ("send", "completion")]
     assert source_steps
     assert all(str(step.owner_slot) == "ncrisc" for step in source_steps)
     sends = [
@@ -294,9 +274,11 @@ def _compact_loop_names(mod):
     for function in mod.functions.values():
         tirx.stmt_functor.post_order_visit(
             function.body,
-            lambda node: names.append(str(node.loop_var.name))
-            if isinstance(node, tirx.For) and str(node.loop_var.name).startswith("tt_compact_")
-            else None,
+            lambda node: (
+                names.append(str(node.loop_var.name))
+                if isinstance(node, tirx.For) and str(node.loop_var.name).startswith("tt_compact_")
+                else None
+            ),
         )
     return names
 
@@ -329,9 +311,7 @@ def _dynamic_dfb_operands(mod):
         elif node.op.name == "tl.tt.compute_value":
             operands = range(1, len(node.args))
         found.extend(
-            (node.op.name, node.args[index])
-            for index in operands
-            if not isinstance(analyzer.simplify(node.args[index]), tirx.IntImm)
+            (node.op.name, node.args[index]) for index in operands if not isinstance(analyzer.simplify(node.args[index]), tirx.IntImm)
         )
 
     for function in mod.functions.values():
@@ -353,9 +333,7 @@ def _column_values(column):
 
 
 def _assert_storage_group_relations(mod):
-    declared = {
-        int(group.storage_group_id) for group in mod.attrs["tt.dfb_storage_groups"]
-    }
+    declared = {int(group.storage_group_id) for group in mod.attrs["tt.dfb_storage_groups"]}
     ordinals = {}
     for relation in mod.attrs["tt.dfb_storage_group_relations"]:
         groups = _column_values(relation.storage_group_ids)
@@ -426,7 +404,7 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
         blocks = []
         tirx.stmt_functor.post_order_visit(
             functions["trisc"].body,
-            lambda node: blocks.append(node) if isinstance(node, tirx.SBlock) else None,
+            lambda node, blocks=blocks: blocks.append(node) if isinstance(node, tirx.SBlock) else None,
         )
         assert all("tt.core_domain" in block.annotations for block in blocks)
         assert all("tt.core_x" not in block.annotations for block in blocks)
@@ -449,9 +427,7 @@ def test_current_family_column_length_mismatch_is_rejected():
         list(column.values),
         int(column.period),
     )
-    families[0] = D.DeviceIRDescriptorFamily(
-        family.prototype, family.positions, fields, family.source_parts
-    )
+    families[0] = D.DeviceIRDescriptorFamily(family.prototype, family.positions, fields, family.source_parts)
     malformed = mod.with_attr("tt.communication_step_families", families)
     with pytest.raises(ValueError, match="length differs from family positions"):
         transform.VerifyTenstorrentDeviceIR()(malformed)
@@ -512,9 +488,7 @@ def test_communication_step_kind_must_match_the_referencing_body_op():
         step.parameter,
         step.source_span,
     )
-    families[0] = D.DeviceIRDescriptorFamily(
-        prototype, family.positions, family.fields, family.source_parts
-    )
+    families[0] = D.DeviceIRDescriptorFamily(prototype, family.positions, family.fields, family.source_parts)
     malformed = mod.with_attr("tt.communication_step_families", families)
     with pytest.raises(ValueError, match="disagrees with its communication step|unknown kind"):
         transform.VerifyTenstorrentDeviceIR()(malformed)
@@ -574,9 +548,7 @@ def test_core_predicate_must_match_its_typed_work_domain():
         statements = list(function.body.seq)
         branch = next(stmt for stmt in statements if isinstance(stmt, tirx.IfThenElse))
         index = statements.index(branch)
-        statements[index] = tirx.IfThenElse(
-            tirx.IntImm("bool", 1), branch.then_case, branch.else_case
-        )
+        statements[index] = tirx.IfThenElse(tirx.IntImm("bool", 1), branch.then_case, branch.else_case)
         mod.update_func(global_var, function.with_body(tirx.SeqStmt(statements)))
         break
     with pytest.raises(ValueError, match="predicate disagrees with tt.core_domain"):
@@ -624,18 +596,13 @@ def test_flash_attention_core_and_kv_repetition_remain_parameterized():
         _assert_storage_group_relations(mod)
         assert any(
             int(family.positions.count) > int(family.prototype.block_count)
-            and len(set(_column_values(relation.storage_group_ids)))
-            == int(family.positions.count)
+            and len(set(_column_values(relation.storage_group_ids))) == int(family.positions.count)
             for family, relation in zip(
                 mod.attrs["tt.dfb_families"],
                 mod.attrs["tt.dfb_storage_group_relations"],
             )
         )
-        trisc = next(
-            function
-            for function in mod.functions.values()
-            if str(function.attrs["tt.kernel_slot"]) == "trisc"
-        )
+        trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
         counts = _body_counts(trisc)
         assert counts["if"] == 0
         assert counts["block"] == 1
@@ -665,7 +632,4 @@ def test_bf16_flash_precision_conflict_returns_atomic_structured_module():
     assert len(mod.functions) == 1
     assert "tt.device_ir_version" not in mod.attrs
     assert "tt.dfb_table" not in mod.attrs
-    assert any(
-        "conflicting hard destination width requirements" in str(reason)
-        for reason in mod.attrs["tt.deferred_reasons"]
-    )
+    assert any("conflicting hard destination width requirements" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])

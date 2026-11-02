@@ -11,10 +11,6 @@ constexpr const char *kTTLogicalDomain = "tl.tt.logical_domain";
 constexpr const char *kTTPhysicalTileShape = "tl.tt.physical_tile_shape";
 constexpr const char *kTTBlockShape = "tl.tt.block_shape";
 constexpr const char *kTTIteratorTypes = "tl.tt.iterator_types";
-constexpr const char *kTTAccessTable = "tl.tt.access_table";
-constexpr const char *kTTOutputAccessID = "tl.tt.output_access_id";
-constexpr const char *kTTAccessMaps = "tl.tt.access_maps";
-constexpr const char *kTTBroadcastRecipes = "tl.tt.broadcast_recipes";
 constexpr const char *kTTValueKinds = "tl.tt.value_kinds";
 enum class TTTilesStage : int {
   kFrontend = 0,

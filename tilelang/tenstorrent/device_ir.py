@@ -126,9 +126,7 @@ class DFBStorageGroupRelation(Node):
         pipeline_iterations: DeviceIRIntColumn | None = None,
     ):
         if pipeline_iterations is None:
-            pipeline_iterations = DeviceIRIntColumn(
-                -1, 0, int(storage_group_ids.count)
-            )
+            pipeline_iterations = DeviceIRIntColumn(-1, 0, int(storage_group_ids.count))
         self.__init_handle_by_constructor__(
             _ffi_api.DFBStorageGroupRelation,
             int(dfb_family_id),
@@ -303,34 +301,6 @@ class TensorDescriptor(Node):
             shard_spec,
             effect,
             int(alias_group),
-            source_span,
-        )
-
-
-@tvm_ffi.register_object("tl.tenstorrent.TTAccessDescriptor")
-class TTAccessDescriptor(Node):
-    """One stable load/store occurrence in a structured compute expression."""
-
-    def __init__(
-        self,
-        access_id,
-        buffer,
-        access_kind,
-        logical_region,
-        access_map,
-        broadcast_kind,
-        broadcast_axes=(),
-        source_span=None,
-    ):
-        self.__init_handle_by_constructor__(
-            _ffi_api.TTAccessDescriptor,
-            int(access_id),
-            buffer,
-            access_kind,
-            logical_region,
-            list(access_map),
-            broadcast_kind,
-            list(broadcast_axes),
             source_span,
         )
 
@@ -790,7 +760,6 @@ __all__ = (
     "PIPE_TRANSFER_TABLE_ATTR",
     "ShardSpec",
     "TTBufferMetadata",
-    "TTAccessDescriptor",
     "TRANSPORT_TABLE_ATTR",
     "TensorBacking",
     "TensorStorageBacking",

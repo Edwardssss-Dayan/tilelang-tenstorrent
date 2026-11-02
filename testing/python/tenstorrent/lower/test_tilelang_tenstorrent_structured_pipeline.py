@@ -9,20 +9,21 @@ from tilelang.tenstorrent.pipeline import TENSTORRENT_PIPELINE
 from tvm import ir, tirx
 
 TARGET = tvm.target.Target({"kind": "tenstorrent", "arch": "wormhole_b0"})
+METADATA = {"tt.tile_shape": (32, 32), "tt.dfb_block_count": 2}
 
 
 def program(dtype="float16", *, initialize=True, partial=False):
     @T.prim_func
     def main(A: T.Tensor((32, 32), dtype), C: T.Tensor((32, 32), dtype)):
         with T.Kernel(1, 1, threads=1):
-            a = T.alloc_shared((32, 32), dtype)
-            c = T.alloc_shared((32, 32), dtype)
+            a = T.alloc_shared((32, 32), dtype, annotations=METADATA)
+            c = T.alloc_shared((32, 32), dtype, annotations=METADATA)
             if initialize:
                 if partial:
                     T.copy(A[0:16, 0:32], a[0:16, 0:32])
                 else:
                     T.copy(A, a)
-            for i, j in T.Parallel(32, 32):
+            for i, j in T.Tiles(c):
                 c[i, j] = a[i, j] + T.cast(1, dtype)
             T.copy(c, C)
 
@@ -95,7 +96,26 @@ def test_supported_computation_still_returns_device_ir():
     result = lower_tenstorrent_ir(tvm.IRModule({"main": program("float32")}), TARGET)
     assert str(result.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in result.attrs
-    assert lower_tenstorrent_ir(result, TARGET).same_as(result)
+    with pytest.raises(ValueError, match="original frontend module"):
+        lower_tenstorrent_ir(result, TARGET)
+
+
+@pytest.mark.parametrize(
+    "bound_target, lowering_target",
+    [
+        (TARGET, TARGET),
+        (TARGET, tvm.target.Target({"kind": "tenstorrent", "arch": "blackhole"})),
+        (tvm.target.Target("llvm"), TARGET),
+    ],
+)
+def test_frontend_prebound_target_is_rejected_without_mutation(bound_target, lowering_target):
+    frontend = tvm.IRModule({"main": program("float32").with_attr("target", bound_target)})
+    before = ir.save_json(frontend)
+
+    with pytest.raises(ValueError, match="target-free frontend IR.*pre-bound target"):
+        lower_tenstorrent_ir(frontend, lowering_target)
+
+    assert ir.save_json(frontend) == before
 
 
 def test_unconsumed_compute_is_rejected_before_host_device_filtering():
@@ -105,7 +125,7 @@ def test_unconsumed_compute_is_rejected_before_host_device_filtering():
 
 def test_stage_marker_cannot_bypass_frontend_verification():
     malformed = tvm.IRModule({"main": program(initialize=False)}).with_attr("tt.ir_stage", "structured")
-    with pytest.raises(ValueError, match="Cannot re-lower normalized structured IR"):
+    with pytest.raises(ValueError, match="original frontend module"):
         lower_tenstorrent_ir(malformed, TARGET)
 
 

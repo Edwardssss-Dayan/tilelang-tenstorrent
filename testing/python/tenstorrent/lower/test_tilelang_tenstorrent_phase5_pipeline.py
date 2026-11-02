@@ -11,26 +11,25 @@ from tvm import ir, tirx
 from testing.python.tenstorrent._support.reference import _calls
 
 
-def pipeline_shared(block_count=None):
-    annotations = {"tt.tile_shape": (32, 32)}
-    if block_count is not None:
-        annotations["tt.dfb_block_count"] = block_count
+def pipeline_shared(block_count=2):
+    annotations = {"tt.tile_shape": (32, 32), "tt.dfb_block_count": block_count}
     return T.alloc_shared((32, 32), "float32", annotations=annotations)
 
 
 def make_pipeline(stages=2, extent=5, start=0, block_count=None, inout=False, wait_policy="delayed"):
     annotations = {"tt.pipeline_wait_policy": wait_policy} if stages else {}
+    capacity = block_count if block_count is not None else min(max(stages, 1), max(extent, 1))
 
     @T.prim_func
     def program(A: T.Tensor((32, 32), "float32"), B: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "float32")):
         with T.Kernel(1, 1, threads=1):
-            a = pipeline_shared(block_count)
-            b = pipeline_shared(block_count)
-            c = pipeline_shared(block_count)
+            a = pipeline_shared(capacity)
+            b = pipeline_shared(capacity)
+            c = pipeline_shared(capacity)
             for k in T.Pipelined(start, start + extent, num_stages=stages, annotations=annotations):
                 T.copy(A, a)
                 T.copy(B, b)
-                for i, j in T.Parallel(32, 32):
+                for i, j in T.Tiles(c):
                     c[i, j] = a[i, j] + b[i, j] + T.Cast("float32", k)
                 if inout:
                     T.copy(c, A)
@@ -42,9 +41,7 @@ def make_pipeline(stages=2, extent=5, start=0, block_count=None, inout=False, wa
 
 def lower_pipeline(func, arch="wormhole_b0"):
     target = tvm.target.Target({"kind": "tenstorrent", "arch": arch})
-    return D.expand_current_device_tables(
-        TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), target)
-    )
+    return D.expand_current_device_tables(TenstorrentPassPipelineBody(tvm.IRModule({"main": func}), target))
 
 
 def slot_calls(mod, slot):
@@ -107,7 +104,9 @@ def test_pipeline_explicit_capacity_preserved_and_insufficient_diagnosed():
         lower_pipeline(make_pipeline(3, 5, block_count=2))
 
 
-@pytest.mark.parametrize("stages,extent,diagnostic", [(33, 2, "num_stages <= 32"), (2, 1025, "extent <= 1024"), (2, 0, "positive.*bounds|extent.*positive")])
+@pytest.mark.parametrize(
+    "stages,extent,diagnostic", [(33, 2, "num_stages <= 32"), (2, 1025, "extent <= 1024"), (2, 0, "positive.*bounds|extent.*positive")]
+)
 def test_pipeline_static_limits(stages, extent, diagnostic):
     with pytest.raises((ValueError, NotImplementedError), match=diagnostic):
         lower_pipeline(make_pipeline(stages, extent))
@@ -123,7 +122,7 @@ def loop_carried(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "float3
     with T.Kernel(1, 1, threads=1):
         a = pipeline_shared()
         for _k in T.Pipelined(3, num_stages=2):
-            for i, j in T.Parallel(32, 32):
+            for i, j in T.Tiles(a):
                 a[i, j] = a[i, j] + T.float32(1)
             T.copy(a, C)
 

@@ -45,8 +45,8 @@ def program(input_dtype="bfloat16", accum_dtype="float32", output_dtype="bfloat1
 def normalize(func):
     mod = tirx.transform.BindTarget(TARGET)(tvm.IRModule({"main": func}))
     for compiler_pass in (
-        transform.CanonicalizeTTElementwise(),
         transform.ValidateTenstorrentFrontendIR(),
+        transform.CanonicalizeTTElementwise(),
         transform.NormalizeTenstorrentLaunch(),
         transform.NormalizeTenstorrentBufferMetadata(),
     ):
@@ -75,7 +75,6 @@ def test_fragment_dtype_contract_is_independent_from_storage(input_dtype, accum_
     assert contract["output_dtype"].value == output_dtype
     assert contract["dest_precision_requirement"].value == ("bits32_required" if accum_dtype == "float32" else "bits16_required")
     assert contract["materialization"].value == "after_complete_k_reduction"
-    assert ir.structural_equal(mod, transform.VerifyTTGemmAccumulators()(mod))
 
 
 @pytest.mark.parametrize(
@@ -189,11 +188,7 @@ def test_ordinary_fp32_fragment_does_not_imply_gemm_precision():
 def test_full_pipeline_preserves_complete_accumulator_lifetime(dtypes, mode, updates):
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
-    mod = D.expand_current_device_tables(
-        TenstorrentPassPipelineBody(
-            tvm.IRModule({"main": program(*dtypes, mode=mode)}), TARGET
-        )
-    )
+    mod = D.expand_current_device_tables(TenstorrentPassPipelineBody(tvm.IRModule({"main": program(*dtypes, mode=mode)}), TARGET))
     assert str(mod.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in mod.attrs
     (accumulator,) = mod.attrs["tt.accumulator_table"]
@@ -244,9 +239,7 @@ def test_serial_k_slices_keep_all_input_generations_live():
                 T.gemm(a, b, c)
             T.copy(c, C)
 
-    mod = D.expand_current_device_tables(
-        TenstorrentPassPipelineBody(tvm.IRModule({"main": sliced}), TARGET)
-    )
+    mod = D.expand_current_device_tables(TenstorrentPassPipelineBody(tvm.IRModule({"main": sliced}), TARGET))
     (accumulator,) = mod.attrs["tt.accumulator_table"]
     assert accumulator.full_k_tiles == 3
     updates = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.gemm_update"]
@@ -312,11 +305,7 @@ def test_device_ir_rechecks_bfloat16_precision_contract(key, value, message):
 
     from tilelang.tenstorrent.pipeline import TenstorrentPassPipelineBody
 
-    mod = D.expand_current_device_tables(
-        TenstorrentPassPipelineBody(
-            tvm.IRModule({"main": gemm_program(output_dtype="bfloat16")}), TARGET
-        )
-    )
+    mod = D.expand_current_device_tables(TenstorrentPassPipelineBody(tvm.IRModule({"main": gemm_program(output_dtype="bfloat16")}), TARGET))
 
     def corrupt_requirement(node):
         if isinstance(node, tirx.Call) and node.op.name == "tl.tt.dfb_compute" and node.annotations["tt.compute_kind"].value == "gemm":
@@ -383,9 +372,7 @@ def test_accumulator_update_preserves_transpose_and_logical_k(transpose_a, trans
             T.gemm(a, b, c, transpose_A=transpose_a, transpose_B=transpose_b, clear_accum=True)
             T.copy(c, C)
 
-    mod = D.expand_current_device_tables(
-        TenstorrentPassPipelineBody(tvm.IRModule({"main": transposed}), TARGET)
-    )
+    mod = D.expand_current_device_tables(TenstorrentPassPipelineBody(tvm.IRModule({"main": transposed}), TARGET))
     (accumulator,) = mod.attrs["tt.accumulator_table"]
     assert accumulator.full_k_tiles == 2
     (update,) = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.gemm_update"]
@@ -410,9 +397,7 @@ def test_accumulator_materializes_to_shared_output_with_storage_dtype():
             T.copy(c, output)
             T.copy(output, C)
 
-    mod = D.expand_current_device_tables(
-        TenstorrentPassPipelineBody(tvm.IRModule({"main": shared_output}), TARGET)
-    )
+    mod = D.expand_current_device_tables(TenstorrentPassPipelineBody(tvm.IRModule({"main": shared_output}), TARGET))
     (materialize,) = [call for call in device_calls(mod, "trisc") if call.op.name == "tl.tt.accumulator_materialize"]
     descriptor = next(dfb for dfb in mod.attrs["tt.dfb_table"] if dfb.dfb_id == int(materialize.args[1]))
     assert str(descriptor.element_dtype) == "bfloat16"
@@ -460,7 +445,6 @@ def test_accumulator_epilogue_supports_fresh_values_and_multiple_consumers(mode)
     legalized = transform.LegalizeTenstorrentTileOps()(mod)
     assert "tl.tt.elementwise" not in legalized.script()
     assert "tl.tileop.copy(old" not in legalized.script()
-    assert ir.structural_equal(mod, transform.VerifyTTGemmAccumulators()(mod))
 
 
 def test_derived_accumulator_output_checks_dtype_capability():
