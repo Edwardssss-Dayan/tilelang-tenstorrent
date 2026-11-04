@@ -139,6 +139,18 @@ InferTenstorrentComputeRequirements
 VerifyTenstorrentDeviceIR
 ```
 
+Pass 12 requires `tt.topology_normalized=1`, including single-Core and empty
+programs; direct callers must run `NormalizeTenstorrentTopology` first. There
+is no legacy Add/no-op formation fallback. Supported operations all use the
+shared-grid `GeneralDataflowPlanner`; pipeline and nonpipeline scheduling
+remain distinct. Before planning, formation checks actual operation calls,
+compute kinds, and nested scalar DAGs (including dtype and unary-call variants).
+Its scalar node/unary support set is shared with the Device verifier in
+`compute_support.h`; shape, broadcast access maps, dependencies and resources
+remain subject to planner and Device validation. This is a Lower-stage contract,
+not a promise of TTL codegen or hardware support. Unsupported operations raise
+`NotImplementedError`; missing topology is malformed input (`ValueError`).
+
 `tilelang.tenstorrent.lower_tenstorrent_ir(mod, target)` returns Device IR when
 all computations have consumers. Versions 1–4 retain the existing Add, general,
 pipeline and multicore contracts; version 5 adds persistent GEMM accumulators.
