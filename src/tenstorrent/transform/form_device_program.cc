@@ -336,8 +336,44 @@ struct AccumulatorLifetime {
   Span span;
 };
 
+enum class LoopStrategy { kExpand, kWindow, kPreserve };
+
+struct LoopAnalysis {
+  // Retain the original node: range, step, annotations and span are input facts.
+  For loop;
+  LoopStrategy strategy;
+  int64_t minimum{0};
+  int64_t extent{0};
+  int64_t stages{0};
+  ffi::String wait_policy{"delayed"};
+};
+
+std::vector<For> FindIndependentLoops(const Stmt &body);
+Stmt IndependentLoopBody(const std::vector<For> &loops, const Stmt &fallback);
+
 class GeneralDataflowPlanner {
 public:
+  struct LoopSchedulePlan {
+    LoopAnalysis analysis;
+    int64_t minimum{0};
+    int64_t extent{0};
+    int64_t depth{0};
+    int64_t stages{0};
+    ffi::String wait_policy{"delayed"};
+    ffi::Optional<Stmt> preserved_body;
+  };
+
+  std::vector<For> PlanRoot(const Stmt &body) {
+    auto loops = FindIndependentLoops(body);
+    if (loops.empty()) {
+      Plan(body);
+    } else {
+      auto plan = BuildLoopSchedulePlan({loops.front(), LoopStrategy::kPreserve},
+                                        IndependentLoopBody(loops, body));
+      ApplyLoopSchedulePlan(std::move(plan));
+    }
+    return loops;
+  }
   ffi::Array<AccumulatorDescriptor> Accumulators() const {
     ffi::Array<AccumulatorDescriptor> result;
     for (size_t id = 0; id < accumulators_.size(); ++id) {
@@ -462,13 +498,12 @@ public:
 
   // Phase 5 materializes bounded windows. A value remains an immutable
   // generation, while the same lexical write site shares one capacity pool.
-  void PlanPipeline(const For &loop) {
+  void AnalyzeWindowLoop(const For &loop, LoopAnalysis *plan) const {
     if (precision_regions_)
       ThrowUnsupported(
           "precision regions require statically serialized transactions");
     if (IsPipeline())
       ThrowUnsupported("one bounded T.Pipelined loop per Core is supported");
-    pipeline_resource_begin_ = resources_.size();
     for (const auto &[key, value] : loop->annotations) {
       if (key != "num_stages" && key != "tt.pipeline_wait_policy")
         ThrowUnsupported(
@@ -483,28 +518,27 @@ public:
     auto policy = loop->annotations.Get("tt.pipeline_wait_policy");
     if (policy.has_value()) {
       if (auto string = policy.value().as<ffi::String>()) {
-        pipeline_wait_policy_ = string.value();
+        plan->wait_policy = string.value();
       } else if (auto literal = policy.value().as<StringImm>()) {
-        pipeline_wait_policy_ = literal.value()->value;
+        plan->wait_policy = literal.value()->value;
       } else {
         ThrowMalformed("tt.pipeline_wait_policy must be a string");
       }
-      if (pipeline_wait_policy_ != "conservative" &&
-          pipeline_wait_policy_ != "delayed")
+      if (plan->wait_policy != "conservative" &&
+          plan->wait_policy != "delayed")
         ThrowMalformed(
             "tt.pipeline_wait_policy must be conservative or delayed");
     }
-    pipeline_stages_ = RequirePositiveStaticInteger(
+    plan->stages = RequirePositiveStaticInteger(
         Downcast<PrimExpr>(loop->annotations.at("num_stages")),
         "T.Pipelined num_stages");
-    pipeline_extent_ =
+    plan->extent =
         RequirePositiveStaticInteger(loop->extent, "T.Pipelined extent");
-    int64_t minimum = RequireStaticInteger(loop->min, "T.Pipelined minimum");
-    if (pipeline_stages_ > 32 || pipeline_extent_ > 1024) {
+    plan->minimum = RequireStaticInteger(loop->min, "T.Pipelined minimum");
+    if (plan->stages > 32 || plan->extent > 1024) {
       ThrowUnsupported(
           "T.Pipelined requires num_stages <= 32 and extent <= 1024");
     }
-    pipeline_depth_ = std::min(pipeline_stages_, pipeline_extent_);
     PostOrderVisit(loop->body, [&](const ffi::ObjectRef &object) {
       if (object.as<IfThenElseNode>()) {
         ThrowUnsupported("T.Pipelined conditional write sites are unsupported; "
@@ -517,6 +551,16 @@ public:
         }
       }
     });
+  }
+
+  void ApplyWindowIterations(const LoopSchedulePlan &plan) {
+    const For &loop = plan.analysis.loop;
+    pipeline_resource_begin_ = resources_.size();
+    pipeline_wait_policy_ = plan.wait_policy;
+    pipeline_stages_ = plan.stages;
+    pipeline_extent_ = plan.extent;
+    pipeline_depth_ = plan.depth;
+    int64_t minimum = plan.minimum;
     size_t writes_per_iteration = 0;
     for (int64_t iteration = 0; iteration < pipeline_extent_; ++iteration) {
       current_.clear();
@@ -577,9 +621,24 @@ public:
     return relations;
   }
 
-  void FinalizePipeline() {
-    if (!IsPipeline())
-      return;
+  struct WindowSchedulePlan {
+    ffi::Array<Stmt> operations;
+  };
+
+  static int64_t WindowResourceId(const CallNode *call) {
+    ICHECK(call);
+    bool second = call->op.same_as(tensor_to_dfb_nd()) ||
+                  call->op.same_as(dfb_pipe_recv()) ||
+                  call->op.same_as(dfb_pipe_send()) ||
+                  call->op.same_as(dfb_pipe_wait());
+    size_t index = second ? 1 : 0;
+    ICHECK_GT(call->args.size(), index);
+    const int64_t *id = as_const_int(call->args[index]);
+    ICHECK(id);
+    return *id;
+  }
+
+  WindowSchedulePlan BuildWindowSchedulePlan() const {
     ffi::Array<Stmt> scheduled;
     auto append_singleton = [&](const Stmt &statement) {
       const CallNode *call = statement.as<EvaluateNode>()->value.as<CallNode>();
@@ -593,13 +652,7 @@ public:
             dfb_copy_wait(), {call->args[arg], Integer(1)}, statement->span));
       }
     };
-    auto resource_id = [](const CallNode *call) {
-      bool second = call->op.same_as(tensor_to_dfb_nd()) ||
-                    call->op.same_as(dfb_pipe_recv()) ||
-                    call->op.same_as(dfb_pipe_send()) ||
-                    call->op.same_as(dfb_pipe_wait());
-      return *as_const_int(call->args[second ? 1 : 0]);
-    };
+    auto resource_id = WindowResourceId;
     for (const Stmt &statement : transfer_) {
       int64_t id =
           resource_id(statement.as<EvaluateNode>()->value.as<CallNode>());
@@ -673,7 +726,60 @@ public:
       if (resources_[id].iteration < 0 && id >= pipeline_resource_begin_)
         append_singleton(statement);
     }
-    transfer_ = std::move(scheduled);
+    return {std::move(scheduled)};
+  }
+
+  static void VerifyWindowSchedulePlan(const WindowSchedulePlan &plan,
+                                       const ffi::Array<Stmt> &transfer,
+                                       size_t resource_count) {
+    // Windows may reorder independent resources, but never a resource's own
+    // transport/copy operations. Completion calls are regenerated separately.
+    std::unordered_map<int64_t, std::vector<const Object *>> expected;
+    std::unordered_map<int64_t, size_t> next;
+    std::unordered_set<int64_t> pending_copies;
+    for (const Stmt &stmt : transfer) {
+      const auto *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
+      int64_t id = WindowResourceId(call);
+      ICHECK_GE(id, 0);
+      ICHECK_LT(id, resource_count);
+      if (!call->op.same_as(dfb_copy_wait()))
+        expected[id].push_back(stmt.get());
+    }
+    for (const Stmt &stmt : plan.operations) {
+      const auto *eval = stmt.as<EvaluateNode>();
+      ICHECK(eval);
+      const auto *call = eval->value.as<CallNode>();
+      ICHECK(call);
+      int64_t id = WindowResourceId(call);
+      auto found = expected.find(id);
+      ICHECK(found != expected.end());
+      if (call->op.same_as(dfb_copy_wait())) {
+        ICHECK_EQ(call->args.size(), 2);
+        ICHECK(is_one(call->args[1]));
+        ICHECK_EQ(pending_copies.erase(id), 1);
+        continue;
+      }
+      size_t &index = next[id];
+      ICHECK_LT(index, found->second.size());
+      ICHECK_EQ(found->second[index++], stmt.get());
+      if (call->op.same_as(tensor_to_dfb_nd()) ||
+          call->op.same_as(dfb_to_tensor_nd())) {
+        ICHECK(pending_copies.insert(id).second);
+      } else if (call->op.same_as(dfb_pipe_send())) {
+        ICHECK(!pending_copies.count(id));
+      }
+    }
+    ICHECK(pending_copies.empty());
+    for (const auto &[id, operations] : expected)
+      ICHECK_EQ(next[id], operations.size());
+  }
+
+  void FinalizePipeline() {
+    if (!IsPipeline())
+      return;
+    auto scheduled = BuildWindowSchedulePlan();
+    VerifyWindowSchedulePlan(scheduled, transfer_, resources_.size());
+    transfer_ = std::move(scheduled.operations);
     AddReleases(&compute_, "trisc");
     AddReleases(&transfer_, "ncrisc");
     if (transfers_)
@@ -779,6 +885,83 @@ public:
     unknown_accesses_.clear();
   }
 
+  LoopAnalysis AnalyzeLoop(const For &loop) const {
+    LoopAnalysis analysis{loop, loop->annotations.count("num_stages")
+                                    ? LoopStrategy::kWindow
+                                    : LoopStrategy::kExpand};
+    if (analysis.strategy == LoopStrategy::kExpand) {
+      if (loop->kind != ForKind::kSerial && loop->kind != ForKind::kUnrolled)
+        ThrowUnsupported(
+            "control flow must use a static serial or unrolled loop");
+      if (!loop->annotations.empty() ||
+          (loop->step.has_value() && !is_one(loop->step.value())))
+        ThrowUnsupported("serial computation requires unit step and no "
+                         "pipeline/scheduling annotations");
+      analysis.minimum = RequireStaticInteger(loop->min, "serial loop minimum");
+      analysis.extent =
+          RequirePositiveStaticInteger(loop->extent, "serial loop extent");
+      if (analysis.extent > 1024)
+        ThrowUnsupported("serial loop extent exceeds 1024");
+    } else {
+      AnalyzeWindowLoop(loop, &analysis);
+    }
+    return analysis;
+  }
+
+  LoopSchedulePlan BuildLoopSchedulePlan(
+      const LoopAnalysis &analysis,
+      const ffi::Optional<Stmt> &preserved_body = std::nullopt) const {
+    LoopSchedulePlan plan;
+    plan.analysis = analysis;
+    plan.minimum = analysis.minimum;
+    plan.extent = analysis.extent;
+    plan.stages = analysis.stages;
+    plan.wait_policy = analysis.wait_policy;
+    if (analysis.strategy == LoopStrategy::kWindow)
+      plan.depth = std::min(analysis.stages, analysis.extent);
+    plan.preserved_body = preserved_body;
+    return plan;
+  }
+
+  static void VerifyLoopSchedulePlan(const LoopSchedulePlan &plan) {
+    ICHECK(plan.analysis.loop.defined());
+    if (plan.analysis.strategy == LoopStrategy::kPreserve) {
+      ICHECK(plan.preserved_body.has_value());
+    } else if (plan.analysis.strategy == LoopStrategy::kExpand) {
+      ICHECK_GT(plan.extent, 0);
+      ICHECK_LE(plan.extent, 1024);
+    } else {
+      ICHECK(plan.analysis.loop->annotations.count("num_stages"));
+      ICHECK_GT(plan.stages, 0);
+      ICHECK_LE(plan.stages, 32);
+      ICHECK_GT(plan.extent, 0);
+      ICHECK_LE(plan.extent, 1024);
+      ICHECK_GT(plan.depth, 0);
+      ICHECK_EQ(plan.depth, std::min(plan.stages, plan.extent));
+    }
+  }
+
+  void ApplyLoopSchedulePlan(const LoopSchedulePlan &plan) {
+    VerifyLoopSchedulePlan(plan);
+    if (plan.analysis.strategy == LoopStrategy::kPreserve) {
+      Plan(plan.preserved_body.value());
+    } else if (plan.analysis.strategy == LoopStrategy::kWindow) {
+      ApplyWindowIterations(plan);
+    } else {
+      const For &loop = plan.analysis.loop;
+      for (int64_t i = 0; i < plan.extent; ++i) {
+        StaticIterationSubstituter substitute(
+            loop->loop_var, IntImm(loop->loop_var.dtype(), plan.minimum + i));
+        PlanImpl(substitute(loop->body));
+      }
+    }
+  }
+
+  void PlanLoop(const For &loop) {
+    auto plan = BuildLoopSchedulePlan(AnalyzeLoop(loop));
+    ApplyLoopSchedulePlan(std::move(plan));
+  }
+
   void PlanImpl(const Stmt &stmt) {
     if (++statement_count_ > 65536) {
       ThrowUnsupported(
@@ -805,29 +988,7 @@ public:
       return;
     }
     if (const auto *loop = stmt.as<ForNode>()) {
-      if (loop->annotations.count("num_stages")) {
-        PlanPipeline(ffi::GetRef<For>(loop));
-        return;
-      }
-      if (loop->kind != ForKind::kSerial && loop->kind != ForKind::kUnrolled) {
-        ThrowUnsupported(
-            "control flow must use a static serial or unrolled loop");
-      }
-      if (!loop->annotations.empty() ||
-          (loop->step.has_value() && !is_one(loop->step.value()))) {
-        ThrowUnsupported("serial computation requires unit step and no "
-                         "pipeline/scheduling annotations");
-      }
-      int64_t minimum = RequireStaticInteger(loop->min, "serial loop minimum");
-      int64_t extent =
-          RequirePositiveStaticInteger(loop->extent, "serial loop extent");
-      if (extent > 1024)
-        ThrowUnsupported("serial loop extent exceeds 1024");
-      for (int64_t i = 0; i < extent; ++i) {
-        StaticIterationSubstituter substitute(
-            loop->loop_var, IntImm(loop->loop_var.dtype(), minimum + i));
-        PlanImpl(substitute(loop->body));
-      }
+      PlanLoop(ffi::GetRef<For>(loop));
       return;
     }
     if (const auto *branch = stmt.as<IfThenElseNode>()) {
@@ -3124,8 +3285,7 @@ IRModule PlanCorePrograms(const IRModule &input, const GridPlan &plan) {
     StaticIterationSubstituter specialize_y(core_y_var, Integer(y));
     specialized = specialize_y(specialized);
     GeneralDataflowPlanner planner(frontend, metadata, &transfer_keys, x, y);
-    std::vector<For> independent_loops = FindIndependentLoops(specialized);
-    planner.Plan(IndependentLoopBody(independent_loops, specialized));
+    std::vector<For> independent_loops = planner.PlanRoot(specialized);
     planner.EliminateDeadWrites();
     planner.FinalizeMulticore();
     if (planner.IsPipeline()) {
