@@ -60,7 +60,7 @@ def test_transpose_fragment_exact_dtype_and_reentry(dtype, source_fragment):
     assert all(str(dfb.element_dtype) == dtype for dfb in mod.attrs["tt.dfb_table"])
 
 
-def multicore_values():
+def multicore_values(write_output=True):
     @T.prim_func
     def main(A: T.Tensor((64, 32), "float32"), C: T.Tensor((64, 32), "float32")):
         with T.Kernel(2, 1, threads=1) as (x, y):
@@ -71,22 +71,34 @@ def multicore_values():
                 f[i, j] = a[i, j] + T.float32(1)
             for i, j in T.Tiles(f):
                 f[i, j] = f[i, j] * T.float32(2)
-            T.copy(f, C[x * 32 : (x + 1) * 32, 0:32])
+            if write_output:
+                T.copy(f, C[x * 32 : (x + 1) * 32, 0:32])
 
     return main
 
 
-def test_multicore_values_have_isolated_versions_and_numeric_outputs():
-    mod = lower(multicore_values())
+@pytest.mark.parametrize("write_output", [False, True])
+def test_multicore_values_have_isolated_versions_and_numeric_outputs(write_output):
+    from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_formation_support import before_formation
+
+    formed = transform.FormTenstorrentDeviceProgram()(before_formation(multicore_values(write_output)))
+    formed = D.expand_current_device_tables(formed)
+    calls = [call for func in formed.functions.values() for call in _calls(func.body)]
+    # Unused value chains intentionally retain their definitions and DFB inputs.
+    assert sum(call.op.name == "tl.tt.compute_value" for call in calls) == 4
+    assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in calls) == 2
+    assert sum(call.op.name == "tl.tt.dfb_to_tensor_nd" for call in calls) == (2 if write_output else 0)
+    mod = lower(multicore_values()) if write_output else formed
     assert len(mod.functions) == 3
     assert [str(symbol) for symbol in mod.attrs["tt.kernel_order"]] == [
         "main_trisc",
         "main_ncrisc",
         "main_brisc",
     ]
-    a = np.arange(64 * 32, dtype="float32").reshape(64, 32)
-    outputs, _ = interpret(mod, [a, np.zeros_like(a)])
-    np.testing.assert_array_equal(outputs[1], (a + 1) * 2)
+    if write_output:
+        a = np.arange(64 * 32, dtype="float32").reshape(64, 32)
+        outputs, _ = interpret(mod, [a, np.zeros_like(a)])
+        np.testing.assert_array_equal(outputs[1], (a + 1) * 2)
     definitions = list(mod.attrs["tt.compute_value_table"])
     assert len({int(value.value_id) for value in definitions}) == len(definitions)
     # One logical Buffer family is shared by the function; Core domain plus

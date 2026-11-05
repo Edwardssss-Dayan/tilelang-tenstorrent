@@ -94,6 +94,77 @@ int main() {
   reject_loop(plan);
   plan.analysis.loop = For();
   reject_loop(plan);
+  size_t dead_write_rejected = 0;
+  for (bool value_mode : {false, true}) {
+    Planner::DeadWriteAnalysis analysis;
+    analysis.compute_value_mode = value_mode;
+    analysis.roots = {3};
+    analysis.inputs = {{3, {2}}, {2, {1}}, {1, {2}}, {5, {4}}};
+    analysis.compute = {{5, false}, {3, false}, {-1, true}, {1, false}};
+    analysis.transfer = {{4, false}, {2, false}, {0, false}};
+    auto dead_plan = Planner::BuildDeadWritePlan(analysis);
+    Planner::VerifyDeadWritePlan(analysis, dead_plan, 6);
+    if (dead_plan.live != std::unordered_set<int64_t>({1, 2, 3}) ||
+        dead_plan.compute != std::vector<bool>({false, true, true, true}) ||
+        dead_plan.transfer != std::vector<bool>({false, true, false}) ||
+        dead_plan.recompute_tensor_reads == value_mode)
+      throw std::runtime_error("incorrect dead-write fixed point or masks");
+    auto reject_dead_write = [&](const Planner::DeadWriteAnalysis &facts,
+                                 const Planner::DeadWriteEliminationPlan &bad) {
+      try {
+        Planner::VerifyDeadWritePlan(facts, bad, 6);
+      } catch (const std::exception &) {
+        ++dead_write_rejected;
+        return;
+      }
+      throw std::runtime_error("invalid dead-write plan accepted");
+    };
+    auto bad = dead_plan;
+    bad.live.erase(3);
+    reject_dead_write(analysis, bad);
+    bad = dead_plan;
+    bad.live.erase(1);
+    reject_dead_write(analysis, bad);
+    bad = dead_plan;
+    bad.live.insert(0);
+    reject_dead_write(analysis, bad);
+    bad = dead_plan;
+    bad.compute.pop_back();
+    reject_dead_write(analysis, bad);
+    bad = dead_plan;
+    bad.transfer.push_back(false);
+    reject_dead_write(analysis, bad);
+    bad = dead_plan;
+    bad.compute[0] = true;
+    reject_dead_write(analysis, bad);
+    bad = dead_plan;
+    bad.compute[2] = false;
+    reject_dead_write(analysis, bad);
+    bad = dead_plan;
+    bad.transfer[1] = false;
+    reject_dead_write(analysis, bad);
+    bad = dead_plan;
+    bad.recompute_tensor_reads = value_mode;
+    reject_dead_write(analysis, bad);
+    auto malformed = analysis;
+    malformed.roots.insert(6);
+    reject_dead_write(malformed, Planner::BuildDeadWritePlan(malformed));
+    malformed = analysis;
+    malformed.inputs[5].push_back(-1);
+    reject_dead_write(malformed, dead_plan);
+    malformed = analysis;
+    malformed.compute.push_back({6, false});
+    reject_dead_write(malformed, Planner::BuildDeadWritePlan(malformed));
+    analysis.roots.clear();
+    dead_plan = Planner::BuildDeadWritePlan(analysis);
+    Planner::VerifyDeadWritePlan(analysis, dead_plan, 6);
+    if (!dead_plan.live.empty() ||
+        dead_plan.compute != std::vector<bool>({false, false, true, false}))
+      throw std::runtime_error("rootless dead writes retained");
+  }
+  std::cout << "dead-write plan: both modes, cyclic closure, dead components, "
+            << "mandatory operations and empty roots accepted; "
+            << dead_write_rejected << " malformed plans rejected\n";
   std::cout << "window plan: forwarding and independent reorder accepted, "
             << rejected << " malformed schedules and " << loop_rejected
             << " malformed loop plans rejected\n";

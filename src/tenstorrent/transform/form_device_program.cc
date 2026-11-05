@@ -786,84 +786,205 @@ public:
       AddReleases(&pipe_, "brisc");
   }
 
-  void EliminateDeadWrites() {
-    if (compute_value_mode_) {
-      EliminateDeadValueWrites();
-      return;
-    }
-    std::unordered_set<int64_t> live;
+  struct DeadWriteOperation {
+    int64_t resource;
+    bool mandatory;
+  };
+
+  struct DeadWriteAnalysis {
     std::unordered_map<int64_t, std::vector<int64_t>> inputs;
+    std::unordered_set<int64_t> roots;
+    std::vector<DeadWriteOperation> compute, transfer;
+    bool compute_value_mode;
+  };
+
+  struct DeadWriteEliminationPlan {
+    std::unordered_set<int64_t> live;
+    std::vector<bool> compute, transfer;
+    bool recompute_tensor_reads;
+  };
+
+  DeadWriteAnalysis CollectDeadWriteDependencies() const {
+    DeadWriteAnalysis analysis;
+    analysis.compute_value_mode = compute_value_mode_;
     for (const Stmt &statement : compute_) {
       const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
-      if (call->op.same_as(tenstorrent::dfb_compute())) {
+      if (call->op.same_as(dfb_compute())) {
         int64_t output = *as_const_int(call->args[0]);
         for (size_t i = 1; i < call->args.size(); ++i)
-          inputs[output].push_back(*as_const_int(call->args[i]));
-      } else if (call->op.same_as(tenstorrent::dfb_local_copy())) {
-        inputs[*as_const_int(call->args[1])].push_back(
-            *as_const_int(call->args[0]));
-      } else if (call->op.same_as(tenstorrent::dfb_gather_copy())) {
-        inputs[*as_const_int(call->args[1])].push_back(
-            *as_const_int(call->args[0]));
-      } else if (call->op.same_as(tenstorrent::dfb_collective_reduce())) {
-        int64_t output = *as_const_int(call->args[2]);
-        inputs[output].push_back(*as_const_int(call->args[0]));
-        inputs[output].push_back(*as_const_int(call->args[1]));
+          analysis.inputs[output].push_back(*as_const_int(call->args[i]));
+      } else if (!compute_value_mode_) {
+        if (call->op.same_as(dfb_local_copy()) ||
+            call->op.same_as(dfb_gather_copy())) {
+          analysis.inputs[*as_const_int(call->args[1])].push_back(
+              *as_const_int(call->args[0]));
+        } else if (call->op.same_as(dfb_collective_reduce())) {
+          auto &inputs = analysis.inputs[*as_const_int(call->args[2])];
+          inputs.push_back(*as_const_int(call->args[0]));
+          inputs.push_back(*as_const_int(call->args[1]));
+        }
+      }
+      // Value definitions remain roots of their DFB inputs even when unused.
+      // This is DFB dead-write elimination, not compute-value DCE.
+      if (compute_value_mode_ && call->op.same_as(compute_value())) {
+        for (size_t i = 1; i < call->args.size(); ++i)
+          analysis.roots.insert(*as_const_int(call->args[i]));
+      } else if (compute_value_mode_ &&
+                 call->op.same_as(compute_value_gemm())) {
+        analysis.roots.insert(*as_const_int(call->args[1]));
+        analysis.roots.insert(*as_const_int(call->args[2]));
       }
     }
-    for (const auto &state : accumulators_) {
-      if (state.output_id < 0)
-        ThrowMalformed("accumulator has no final materialization");
-      inputs[state.output_id] = state.inputs;
+    if (!compute_value_mode_) {
+      for (const auto &state : accumulators_) {
+        if (state.output_id < 0)
+          ThrowMalformed("accumulator has no final materialization");
+        analysis.inputs[state.output_id] = state.inputs;
+      }
+      analysis.roots.insert(observable_resources_.begin(),
+                            observable_resources_.end());
     }
-    std::function<void(int64_t)> mark = [&](int64_t id) {
-      if (!live.insert(id).second)
-        return;
-      for (int64_t input : inputs[id])
-        mark(input);
-    };
     for (const Stmt &statement : transfer_) {
       const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
-      if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
-        mark(*as_const_int(call->args[0]));
+      if (call->op.same_as(dfb_to_tensor_nd()))
+        analysis.roots.insert(*as_const_int(call->args[0]));
     }
     for (const PipeEndpoint &endpoint : endpoints_)
-      mark(endpoint.dfb_id);
-    for (int64_t id : observable_resources_)
-      mark(id);
-    auto filter = [&](const ffi::Array<Stmt> &body) {
-      ffi::Array<Stmt> result;
+      analysis.roots.insert(endpoint.dfb_id);
+    auto associate = [&](const ffi::Array<Stmt> &body) {
+      std::vector<DeadWriteOperation> operations;
       for (const Stmt &statement : body) {
         const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
-        if (call->op.same_as(tenstorrent::accumulator_init()) ||
-            call->op.same_as(tenstorrent::gemm_update()) ||
-            call->op.same_as(tenstorrent::accumulator_materialize())) {
-          size_t arg = call->op.same_as(tenstorrent::gemm_update()) ? 2 : 0;
-          int64_t id = *as_const_int(call->args[arg]);
-          if (live.count(accumulators_[id].output_id))
-            result.push_back(statement);
+        if (compute_value_mode_ &&
+            (call->op.same_as(compute_value()) ||
+             call->op.same_as(compute_value_gemm()) ||
+             call->op.same_as(compute_precision()))) {
+          operations.push_back({-1, true});
           continue;
         }
-        size_t arg = call->op.same_as(tenstorrent::tensor_to_dfb_nd()) ||
-                             call->op.same_as(tenstorrent::dfb_pipe_send()) ||
-                             call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
-                             call->op.same_as(tenstorrent::dfb_pipe_wait())
+        if (!compute_value_mode_ &&
+            (call->op.same_as(accumulator_init()) ||
+             call->op.same_as(gemm_update()) ||
+             call->op.same_as(accumulator_materialize()))) {
+          size_t arg = call->op.same_as(gemm_update()) ? 2 : 0;
+          int64_t id = *as_const_int(call->args[arg]);
+          operations.push_back({accumulators_[id].output_id, false});
+          continue;
+        }
+        size_t arg = call->op.same_as(tensor_to_dfb_nd()) ||
+                             (compute_value_mode_ &&
+                              call->op.same_as(compute_value_store())) ||
+                             call->op.same_as(dfb_pipe_send()) ||
+                             call->op.same_as(dfb_pipe_recv()) ||
+                             call->op.same_as(dfb_pipe_wait())
                          ? 1
                          : 0;
-        if (live.count(*as_const_int(call->args[arg])))
-          result.push_back(statement);
+        operations.push_back({*as_const_int(call->args[arg]), false});
       }
+      return operations;
+    };
+    analysis.compute = associate(compute_);
+    analysis.transfer = associate(transfer_);
+    return analysis;
+  }
+
+  static std::unordered_set<int64_t>
+  ComputeLiveResources(const DeadWriteAnalysis &analysis) {
+    std::unordered_set<int64_t> live;
+    std::vector<int64_t> pending(analysis.roots.begin(), analysis.roots.end());
+    while (!pending.empty()) {
+      int64_t id = pending.back();
+      pending.pop_back();
+      if (!live.insert(id).second)
+        continue;
+      auto found = analysis.inputs.find(id);
+      if (found != analysis.inputs.end())
+        pending.insert(pending.end(), found->second.begin(), found->second.end());
+    }
+    return live;
+  }
+
+  static DeadWriteEliminationPlan
+  BuildDeadWritePlan(const DeadWriteAnalysis &analysis) {
+    DeadWriteEliminationPlan plan;
+    plan.live = ComputeLiveResources(analysis);
+    plan.recompute_tensor_reads = !analysis.compute_value_mode;
+    auto select = [&](const std::vector<DeadWriteOperation> &operations) {
+      std::vector<bool> keep;
+      for (const auto &operation : operations)
+        keep.push_back(operation.mandatory ||
+                       plan.live.count(operation.resource));
+      return keep;
+    };
+    plan.compute = select(analysis.compute);
+    plan.transfer = select(analysis.transfer);
+    return plan;
+  }
+
+  static void VerifyDeadWritePlan(const DeadWriteAnalysis &analysis,
+                                  const DeadWriteEliminationPlan &plan,
+                                  size_t resource_count) {
+    auto valid = [&](int64_t id) {
+      ICHECK_GE(id, 0);
+      ICHECK_LT(static_cast<size_t>(id), resource_count);
+    };
+    for (int64_t id : plan.live)
+      valid(id);
+    for (int64_t id : analysis.roots) {
+      valid(id);
+      ICHECK(plan.live.count(id));
+    }
+    for (const auto &entry : analysis.inputs) {
+      valid(entry.first);
+      for (int64_t input : entry.second) {
+        valid(input);
+        ICHECK(!plan.live.count(entry.first) || plan.live.count(input));
+      }
+    }
+    ICHECK(plan.live == ComputeLiveResources(analysis));
+    auto verify = [&](const std::vector<DeadWriteOperation> &operations,
+                      const std::vector<bool> &keep) {
+      ICHECK_EQ(operations.size(), keep.size());
+      for (size_t i = 0; i < operations.size(); ++i) {
+        const auto &operation = operations[i];
+        if (!operation.mandatory)
+          valid(operation.resource);
+        ICHECK_EQ(keep[i], operation.mandatory ||
+                               plan.live.count(operation.resource));
+      }
+    };
+    verify(analysis.compute, plan.compute);
+    verify(analysis.transfer, plan.transfer);
+    ICHECK_EQ(plan.recompute_tensor_reads, !analysis.compute_value_mode);
+  }
+
+  void ApplyDeadWritePlan(DeadWriteEliminationPlan plan) {
+    auto filter = [](const ffi::Array<Stmt> &body,
+                     const std::vector<bool> &keep) {
+      ffi::Array<Stmt> result;
+      for (size_t i = 0; i < body.size(); ++i)
+        if (keep[i])
+          result.push_back(body[i]);
       return result;
     };
-    compute_ = filter(compute_);
-    transfer_ = filter(transfer_);
-    live_ = std::move(live);
-    std::fill(tensor_reads_.begin(), tensor_reads_.end(), false);
-    for (const Stmt &statement : transfer_) {
-      const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
-      if (call->op.same_as(tenstorrent::tensor_to_dfb_nd()))
-        tensor_reads_[*as_const_int(call->args[0])] = true;
+    compute_ = filter(compute_, plan.compute);
+    transfer_ = filter(transfer_, plan.transfer);
+    live_ = std::move(plan.live);
+    if (plan.recompute_tensor_reads) {
+      std::fill(tensor_reads_.begin(), tensor_reads_.end(), false);
+      for (const Stmt &statement : transfer_) {
+        const auto *call = statement.as<EvaluateNode>()->value.as<CallNode>();
+        if (call->op.same_as(tensor_to_dfb_nd()))
+          tensor_reads_[*as_const_int(call->args[0])] = true;
+      }
     }
+  }
+
+  void EliminateDeadWrites() {
+    DeadWriteAnalysis analysis = CollectDeadWriteDependencies();
+    DeadWriteEliminationPlan plan = BuildDeadWritePlan(analysis);
+    VerifyDeadWritePlan(analysis, plan, resources_.size());
+    ApplyDeadWritePlan(std::move(plan));
   }
 
   void Plan(const Stmt &stmt) {
@@ -1833,69 +1954,6 @@ private:
     compute_.push_back(
         Evaluate(Call(DataType::Void(), dfb_compute(), args, attrs, call->span),
                  call->span));
-  }
-
-  void EliminateDeadValueWrites() {
-    std::unordered_map<int64_t, std::vector<int64_t>> inputs;
-    std::unordered_set<int64_t> live;
-    // Compute values are immutable definitions. Retain their predecessor chains
-    // and all input lifetimes even when a value only feeds another fragment.
-    for (const Stmt &stmt : compute_) {
-      const CallNode *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
-      if (call->op.same_as(dfb_compute())) {
-        int64_t out = *as_const_int(call->args[0]);
-        for (size_t i = 1; i < call->args.size(); ++i)
-          inputs[out].push_back(*as_const_int(call->args[i]));
-      }
-    }
-    std::function<void(int64_t)> mark = [&](int64_t id) {
-      if (!live.insert(id).second)
-        return;
-      for (int64_t input : inputs[id])
-        mark(input);
-    };
-    for (const Stmt &stmt : compute_) {
-      const CallNode *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
-      if (call->op.same_as(compute_value())) {
-        for (size_t i = 1; i < call->args.size(); ++i)
-          mark(*as_const_int(call->args[i]));
-      } else if (call->op.same_as(compute_value_gemm())) {
-        mark(*as_const_int(call->args[1]));
-        mark(*as_const_int(call->args[2]));
-      }
-    }
-    for (const Stmt &stmt : transfer_) {
-      const CallNode *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
-      if (call->op.same_as(dfb_to_tensor_nd()))
-        mark(*as_const_int(call->args[0]));
-    }
-    for (const PipeEndpoint &endpoint : endpoints_)
-      mark(endpoint.dfb_id);
-    auto filter = [&](const ffi::Array<Stmt> &body) {
-      ffi::Array<Stmt> result;
-      for (const Stmt &stmt : body) {
-        const CallNode *call = stmt.as<EvaluateNode>()->value.as<CallNode>();
-        if (call->op.same_as(compute_value()) ||
-            call->op.same_as(compute_value_gemm()) ||
-            call->op.same_as(compute_precision())) {
-          result.push_back(stmt);
-          continue;
-        }
-        size_t arg = call->op.same_as(tensor_to_dfb_nd()) ||
-                             call->op.same_as(compute_value_store()) ||
-                             call->op.same_as(dfb_pipe_send()) ||
-                             call->op.same_as(dfb_pipe_recv()) ||
-                             call->op.same_as(dfb_pipe_wait())
-                         ? 1
-                         : 0;
-        if (live.count(*as_const_int(call->args[arg])))
-          result.push_back(stmt);
-      }
-      return result;
-    };
-    compute_ = filter(compute_);
-    transfer_ = filter(transfer_);
-    live_ = std::move(live);
   }
 
   void PlanCompute(const Call &call) {

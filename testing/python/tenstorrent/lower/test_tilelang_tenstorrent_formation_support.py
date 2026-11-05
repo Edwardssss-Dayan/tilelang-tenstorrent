@@ -73,6 +73,47 @@ def test_all_inputs_require_normalized_topology(frontend):
         transform.FormTenstorrentDeviceProgram()(mod)
 
 
+@pytest.mark.parametrize("write_output", [False, True])
+def test_dfb_dead_chain_and_tensor_read_bookkeeping(write_output):
+    mod = before_formation()
+    if not write_output:
+        copies = []
+        tirx.stmt_functor.post_order_visit(
+            mod["main"].body,
+            lambda node: copies.append(node)
+            if isinstance(node, tirx.Call)
+            and isinstance(node.op, Op)
+            and node.op.name == "tl.tileop.copy"
+            else None,
+        )
+        output_copy = copies[-1]
+        body = tirx.stmt_functor.ir_transform(
+            mod["main"].body,
+            None,
+            lambda node: tirx.Evaluate(0)
+            if isinstance(node, tirx.Evaluate) and node.value.same_as(output_copy)
+            else None,
+            ["tirx.Evaluate"],
+        )
+        mod["main"] = mod["main"].with_body(body)
+    formed = transform.FormTenstorrentDeviceProgram()(mod)
+    operations = []
+    for function in formed.functions.values():
+        tirx.stmt_functor.post_order_visit(
+            function.body,
+            lambda node: operations.append(node.op.name)
+            if isinstance(node, tirx.Call) and isinstance(node.op, Op)
+            else None,
+        )
+    assert bool(operations.count("tl.tt.dfb_compute")) == write_output
+    assert bool(operations.count("tl.tt.tensor_to_dfb_nd")) == write_output
+    assert operations.count("tl.tt.dfb_to_tensor_nd") == int(write_output)
+    if not write_output:
+        assert not formed.attrs["tt.dfb_families"]
+        assert all(not function.attrs["tt.tensor_arg_indices"] for function in formed.functions.values())
+    transform.VerifyTenstorrentDeviceIR()(transform.InferTenstorrentComputeRequirements()(formed))
+
+
 def test_empty_body_uses_common_planner():
     mod = transform.FormTenstorrentDeviceProgram()(before_formation(phase1_noop))
     assert str(mod.attrs["tt.ir_stage"]) == "device"
