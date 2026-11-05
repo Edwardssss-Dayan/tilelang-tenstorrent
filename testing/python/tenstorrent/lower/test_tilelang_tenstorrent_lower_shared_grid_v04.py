@@ -633,3 +633,19 @@ def test_bf16_flash_precision_conflict_returns_atomic_structured_module():
     assert "tt.device_ir_version" not in mod.attrs
     assert "tt.dfb_table" not in mod.attrs
     assert any("conflicting hard destination width requirements" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])
+
+
+@pytest.mark.parametrize("program", [point_transfer, producer_forwarded_broadcast])
+@pytest.mark.parametrize("seed", [17, 71])
+def test_reference_explicit_multicore_delivery(program, seed):
+    import numpy as np
+    from testing.python.tenstorrent._support.reference import _round, interpret
+
+    rng = np.random.default_rng(93)
+    a = rng.normal(size=(32, 32)).astype("float32")
+    broadcast = program is producer_forwarded_broadcast
+    if broadcast:
+        a = _round(a, "bfloat16")
+    expected = np.tile(_round(a @ a, "bfloat16"), (2, 1)) if broadcast else a
+    outputs, _ = interpret(lower(program), [a, np.zeros_like(expected)], seed=seed)
+    np.testing.assert_allclose(outputs[1], expected, rtol=0, atol=0)

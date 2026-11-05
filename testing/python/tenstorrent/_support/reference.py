@@ -38,37 +38,73 @@ def _specialize_call(call, bindings, core):
     return tirx.Call(call.dtype, call.op, args, annotations, call.span)
 
 
-def _calls(body, bindings=None, core=None):
+def _calls(body, bindings=None, core=None, *, execute=False):
     bindings = {} if bindings is None else bindings
     if isinstance(body, tirx.SeqStmt):
         for stmt in body.seq:
-            yield from _calls(stmt, bindings, core)
+            yield from _calls(stmt, bindings, core, execute=execute)
     elif isinstance(body, tirx.Evaluate) and isinstance(body.value, tirx.Call):
         yield _specialize_call(body.value, bindings, core)
     elif isinstance(body, tirx.Evaluate) and int(body.value) == 0:
         return
     elif isinstance(body, tirx.IfThenElse):
-        yield from _calls(body.then_case, bindings, core)
+        if execute:
+            condition = _specialize_expr(body.condition, bindings, core)
+            assert isinstance(condition, tirx.IntImm), f"Unresolved Device condition: {condition}"
+            branch = body.then_case if int(condition) else body.else_case
+            if branch is not None:
+                yield from _calls(branch, bindings, core, execute=True)
+            return
+        yield from _calls(body.then_case, bindings, core, execute=execute)
         if body.else_case is not None:
-            yield from _calls(body.else_case, bindings, core)
+            yield from _calls(body.else_case, bindings, core, execute=execute)
     elif isinstance(body, tirx.SBlockRealize):
         domain = body.block.annotations.get("tt.core_domain")
         if domain is not None and core is None:
             for x in range(int(domain.begin.x), int(domain.end.x)):
                 for y in range(int(domain.begin.y), int(domain.end.y)):
-                    yield from _calls(body.block.body, bindings, (x, y))
+                    yield from _calls(body.block.body, bindings, (x, y), execute=execute)
         else:
-            yield from _calls(body.block.body, bindings, core)
+            if execute and domain is not None:
+                assert core is not None
+                if not (int(domain.begin.x) <= core[0] < int(domain.end.x)
+                        and int(domain.begin.y) <= core[1] < int(domain.end.y)):
+                    return
+            yield from _calls(body.block.body, bindings, core, execute=execute)
     elif isinstance(body, tirx.For):
-        minimum = int(body.min)
-        step = int(body.step) if body.step is not None else 1
-        for offset in range(int(body.extent)):
+        minimum = int(_specialize_expr(body.min, bindings, core))
+        step = int(_specialize_expr(body.step, bindings, core)) if body.step is not None else 1
+        for offset in range(int(_specialize_expr(body.extent, bindings, core))):
             iteration = tirx.IntImm(body.loop_var.dtype, minimum + offset * step)
             nested = dict(bindings)
             nested[body.loop_var] = iteration
-            yield from _calls(body.body, nested, core)
+            yield from _calls(body.body, nested, core, execute=execute)
     else:
         raise AssertionError(f"Unexpected Device statement: {body}")
+
+
+def _execution_streams(mod):
+    streams, cores = [], []
+    for func in mod.functions.values():
+        domain = getattr(func, "attrs", {}).get("tt.core_domain")
+        coordinates = [(0, 0)] if domain is None else [
+            (x, y) for x in range(int(domain.begin.x), int(domain.end.x))
+            for y in range(int(domain.begin.y), int(domain.end.y))
+        ]
+        for core in coordinates:
+            streams.append(list(_calls(func.body, core=core, execute=True)))
+            cores.append(core)
+    return streams, cores
+
+
+def _snapshots(local_values):
+    # Preserve the historical integer keys when a value has only one owner.
+    result = {}
+    for core, values in local_values.items():
+        for identifier, value in values.items():
+            owners = sum(identifier in other for other in local_values.values())
+            result[identifier if owners == 1 else (core, identifier)] = value
+    return result
 
 
 def _core_statements(func):
@@ -117,16 +153,7 @@ def _round(value, dtype):
     raise AssertionError(f"Unsupported interpreter dtype: {dtype}")
 
 
-def interpret_values(mod, tensors):
-    """Run streams with waits, preserving snapshots after input DFB release."""
-    mod = D.expand_current_device_tables(mod)
-    arrays = [np.array(value, copy=True) for value in tensors]
-    dfbs, values = {}, {}
-    descriptors = {int(value.value_id): value for value in mod.attrs["tt.compute_value_table"]}
-    dfb_descriptors = {int(dfb.dfb_id): dfb for dfb in mod.attrs["tt.dfb_table"]}
-    streams = [list(_calls(func.body)) for func in mod.functions.values()]
-    cursors = [0] * len(streams)
-
+def _expression_evaluator(dfbs, values):
     def expression(expr, maps):
         if isinstance(expr, (tirx.FloatImm, tirx.IntImm)):
             return _round(expr.value, expr.dtype)
@@ -181,13 +208,31 @@ def interpret_values(mod, tensors):
                 return result if str(expr.dtype) == "bool" else _round(result, expr.dtype)
         raise AssertionError(f"Unexpected expression: {expr}")
 
+    return expression
+
+
+def interpret_values(mod, tensors):
+    """Run streams with waits, preserving snapshots after input DFB release."""
+    mod = D.expand_current_device_tables(mod)
+    arrays = [np.array(value, copy=True) for value in tensors]
+    dfbs, values = {}, {}
+    descriptors = {int(value.value_id): value for value in mod.attrs["tt.compute_value_table"]}
+    dfb_descriptors = {int(dfb.dfb_id): dfb for dfb in mod.attrs["tt.dfb_table"]}
+    streams, cores = _execution_streams(mod)
+    local_values = {core: {} for core in cores}
+    local_dfbs = {core: {} for core in cores}
+    cursors = [0] * len(streams)
+
     for _ in range(10000):
         if all(cursor == len(stream) for cursor, stream in zip(cursors, streams)):
-            return arrays, values
+            return arrays, _snapshots(local_values)
         advanced = False
         for index, stream in enumerate(streams):
             if cursors[index] == len(stream):
                 continue
+            core = cores[index]
+            values, dfbs = local_values[core], local_dfbs[core]
+            expression = _expression_evaluator(dfbs, values)
             call = stream[cursors[index]]
             name, args = call.op.name, list(map(int, call.args))
             if name == "tl.tt.dfb_wait" and args[0] not in dfbs:
@@ -248,56 +293,71 @@ def interpret(mod, inputs, seed=0):
     """Execute value, DFB, and point-delivery contracts independently of lowering."""
     mod = D.expand_current_device_tables(mod)
     tensors = [np.array(value, copy=True) for value in inputs]
-    values, dfbs, deliveries, accumulators = {}, {}, {}, {}
-    pending = {}
-    occupied = set()
+    deliveries = {}
+    local_pending, local_occupied, local_accumulators = {}, {}, {}
     groups = {int(k): int(v) for k, v in mod.attrs.get("tt.dfb_storage_groups", {}).items()}
     accumulator_info = {int(a.accumulator_id): a for a in mod.attrs.get("tt.accumulator_table", [])}
     random = np.random.default_rng(seed)
     value_info = {int(value.value_id): value for value in mod.attrs.get("tt.compute_value_table", [])}
     dfb_info = {int(dfb.dfb_id): dfb for dfb in mod.attrs["tt.dfb_table"]}
-    streams = [list(_calls(func.body)) for func in mod.functions.values()]
+    streams, cores = _execution_streams(mod)
+    local_values = {core: {} for core in cores}
+    local_dfbs = {core: {} for core in cores}
     explicit_release = any(call.op.name == "tl.tt.dfb_release" for stream in streams for call in stream)
     cursors = [0] * len(streams)
     value_owners = {
-        int(call.args[0]): index
+        (cores[index], int(call.args[0])): index
         for index, stream in enumerate(streams)
         for call in stream
         if call.op.name in ("tl.tt.compute_value", "tl.tt.compute_value_gemm")
     }
     precision = {}
-    asynchronous = {int(call.args[0]) for stream in streams for call in stream if call.op.name == "tl.tt.dfb_copy_wait"}
+    asynchronous_by_core = {
+        core: {int(call.args[0]) for stream, owner in zip(streams, cores) if owner == core
+               for call in stream if call.op.name == "tl.tt.dfb_copy_wait"}
+        for core in cores
+    }
+    steps = {int(step.step_id): step for step in mod.attrs.get("tt.communication_step_table", [])}
+    transfers = {int(record.transfer_id): record for record in mod.attrs.get("tt.pipe_transfer_table", [])}
 
-    def expression(expr, maps):
-        if isinstance(expr, (tirx.IntImm, tirx.FloatImm)):
-            return _round(expr.value, expr.dtype)
-        if isinstance(expr, tirx.Cast):
-            return _round(expression(expr.value, maps), expr.dtype)
-        if isinstance(expr, tirx.Call):
-            if expr.op.name in ("tl.tt.dfb_load", "tl.tt.compute_value_load"):
-                identifier = int(expr.args[0])
-                return dfbs[identifier] if expr.op.name == "tl.tt.dfb_load" else values[identifier]
-            if expr.op.name == "tl.tt.compute_broadcast":
-                source = expression(expr.args[0], maps)
-                axes = {int(axis) for axis in expr.args[1:]}
-                return source[tuple(slice(0, 1) if axis in axes else slice(None) for axis in range(source.ndim))]
-            if expr.op.name == "tirx.exp2":
-                return _round(np.exp2(expression(expr.args[0], maps)), expr.dtype)
-            raise AssertionError(expr.op.name)
-        binary = {tirx.Add: np.add, tirx.Sub: np.subtract, tirx.Mul: np.multiply, tirx.Div: np.divide, tirx.Max: np.maximum}
-        return _round(binary[type(expr)](expression(expr.a, maps), expression(expr.b, maps)), expr.dtype)
+    def endpoints(call, core):
+        refs = call.annotations.get("tt_communication_step_refs", [])
+        records = [steps[int(ref)] for ref in refs]
+        if not records:
+            assert int(call.args[0]) in transfers, "Missing explicit transfer endpoints"
+            records = [transfers[int(call.args[0])]]
+        keys = []
+        for record in records:
+            current = hasattr(record, "source_core")
+            source = record.source_core if current else record.src_coord
+            target = record.destination_core if current else record.dst_coord
+            src, dst = (int(source.x), int(source.y)), (int(target.x), int(target.y))
+            sending = call.op.name == "tl.tt.dfb_pipe_send"
+            assert core == (src if sending else dst), "Transfer executed on wrong core"
+            assert int(call.args[1]) == int(record.source_dfb_id if sending else record.destination_dfb_id)
+            keys.append((src, dst, int(record.source_dfb_id), int(record.destination_dfb_id),
+                         int(record.communication_id if current else record.pipe_net_id), int(record.occurrence)))
+        return keys
 
     for _ in range(10000):
         if all(cursor == len(stream) for cursor, stream in zip(cursors, streams)):
-            assert not pending, "Copies remain incomplete"
+            assert not any(local_pending.values()), "Copies remain incomplete"
+            assert not any(deliveries.values()), "Deliveries remain unconsumed"
             if explicit_release:
-                assert not occupied, "DFB reservations remain live"
-            return tensors, values
+                assert not any(local_occupied.values()), "DFB reservations remain live"
+            return tensors, _snapshots(local_values)
         advanced = False
         for index in random.permutation(len(streams)):
             stream = streams[index]
             if cursors[index] == len(stream):
                 continue
+            core = cores[index]
+            values, dfbs = local_values[core], local_dfbs[core]
+            expression = _expression_evaluator(dfbs, values)
+            pending = local_pending.setdefault(core, {})
+            occupied = local_occupied.setdefault(core, set())
+            accumulators = local_accumulators.setdefault(core, {})
+            asynchronous = asynchronous_by_core[core]
             call = stream[cursors[index]]
             name, args = call.op.name, list(map(int, call.args))
             if name == "tl.tt.compute_precision":
@@ -306,17 +366,19 @@ def interpret(mod, inputs, seed=0):
                 # Compute-local values cannot survive a destination precision
                 # transition. Only explicit DFB snapshots can reload them.
                 for identifier in list(values):
-                    if value_owners[identifier] == index:
+                    if value_owners[(core, identifier)] == index:
                         del values[identifier]
             if name == "tl.tt.dfb_wait" and args[0] not in dfbs:
                 continue
-            if name == "tl.tt.dfb_pipe_recv" and args[0] not in deliveries:
-                continue
+            if name == "tl.tt.dfb_pipe_recv":
+                delivery_keys = endpoints(call, core)
+                if not all(deliveries.get(key) for key in delivery_keys):
+                    continue
             if name == "tl.tt.dfb_reserve":
+                assert args[0] not in occupied, "Duplicate same-core DFB reservation"
                 group = groups.get(args[0], args[0])
                 if sum(groups.get(resource, resource) == group for resource in occupied) >= int(dfb_info[args[0]].block_count):
                     continue
-                assert args[0] not in occupied
                 occupied.add(args[0])
             elif name == "tl.tt.tensor_to_dfb_nd":
                 region = tuple(slice(args[i], args[i] + args[i + 1]) for i in range(2, len(args), 2))
@@ -342,9 +404,11 @@ def interpret(mod, inputs, seed=0):
                 else:
                     tensors[action[1]][action[2]] = action[3]
             elif name == "tl.tt.dfb_pipe_send":
-                deliveries[args[0]] = dfbs[args[1]].copy()
+                for key in endpoints(call, core):
+                    deliveries.setdefault(key, []).append(dfbs[args[1]].copy())
             elif name == "tl.tt.dfb_pipe_recv":
-                dfbs[args[1]] = deliveries[args[0]].copy()
+                assert len(delivery_keys) == 1
+                dfbs[args[1]] = deliveries[delivery_keys[0]].pop(0)
             elif name in ("tl.tt.compute_value", "tl.tt.dfb_compute"):
                 attrs = call.annotations
                 kind = str(attrs["tt.compute_kind"].value)

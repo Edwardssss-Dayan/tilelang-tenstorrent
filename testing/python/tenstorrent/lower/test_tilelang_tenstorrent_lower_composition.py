@@ -88,17 +88,16 @@ def test_multicore_values_have_isolated_versions_and_numeric_outputs(write_outpu
     assert sum(call.op.name == "tl.tt.compute_value" for call in calls) == 4
     assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in calls) == 2
     assert sum(call.op.name == "tl.tt.dfb_to_tensor_nd" for call in calls) == (2 if write_output else 0)
-    mod = lower(multicore_values()) if write_output else formed
+    mod = lower(multicore_values(write_output))
     assert len(mod.functions) == 3
     assert [str(symbol) for symbol in mod.attrs["tt.kernel_order"]] == [
         "main_trisc",
         "main_ncrisc",
         "main_brisc",
     ]
-    if write_output:
-        a = np.arange(64 * 32, dtype="float32").reshape(64, 32)
-        outputs, _ = interpret(mod, [a, np.zeros_like(a)])
-        np.testing.assert_array_equal(outputs[1], (a + 1) * 2)
+    a = np.arange(64 * 32, dtype="float32").reshape(64, 32)
+    outputs, _ = interpret(mod, [a, np.zeros_like(a)], seed=71)
+    np.testing.assert_array_equal(outputs[1], (a + 1) * 2 if write_output else np.zeros_like(a))
     definitions = list(mod.attrs["tt.compute_value_table"])
     assert len({int(value.value_id) for value in definitions}) == len(definitions)
     # One logical Buffer family is shared by the function; Core domain plus
@@ -422,3 +421,29 @@ def test_loop_carried_ordinary_fragment_requires_explicit_spill_plan():
         "carries a value across iterations" in str(reason)
         for reason in mod.attrs["tt.deferred_reasons"]
     )
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+@pytest.mark.parametrize("capacity", [1, 2])
+def test_reference_reservations_are_core_local(monkeypatch, duplicate, capacity):
+    from types import SimpleNamespace
+    from tvm import tirx
+
+    def call(name, args):
+        return tirx.Evaluate(tirx.Call("handle", tvm.ir.Op.get("tl.tt." + name), args))
+
+    body = [call("dfb_reserve", [0])]
+    if duplicate:
+        body.append(call("dfb_reserve", [0]))
+    body += [call("tensor_to_dfb_nd", [0, 0, 0, 1, 0, 1]), call("dfb_release", [0])]
+    domain = SimpleNamespace(begin=SimpleNamespace(x=0, y=0), end=SimpleNamespace(x=2, y=1))
+    mod = SimpleNamespace(
+        attrs={"tt.dfb_table": [SimpleNamespace(dfb_id=0, block_count=capacity, block_shape_in_tiles=(1, 1))]},
+        functions={"reader": SimpleNamespace(attrs={"tt.core_domain": domain}, body=tirx.SeqStmt(body))},
+    )
+    monkeypatch.setattr(D, "expand_current_device_tables", lambda mod: mod)
+    if duplicate:
+        with pytest.raises(AssertionError, match="Duplicate same-core DFB reservation"):
+            interpret(mod, [np.ones((1, 1))], seed=91)
+    else:
+        interpret(mod, [np.ones((1, 1))], seed=91)
