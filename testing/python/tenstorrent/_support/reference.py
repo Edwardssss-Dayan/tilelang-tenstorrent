@@ -234,7 +234,7 @@ def interpret_values(mod, tensors):
             values, dfbs = local_values[core], local_dfbs[core]
             expression = _expression_evaluator(dfbs, values)
             call = stream[cursors[index]]
-            name, args = call.op.name, list(map(int, call.args))
+            name, args = call.op.name, _static_args(call)
             if name == "tl.tt.dfb_wait" and args[0] not in dfbs:
                 continue
             if name == "tl.tt.dfb_to_tensor_nd" and args[0] not in dfbs:
@@ -274,6 +274,8 @@ def interpret_values(mod, tensors):
                     result = result + values[old]
                 assert output not in values
                 values[output] = _round(result, descriptors[output].buffer.dtype)
+            elif name in ("tl.tt.dfb_local_copy", "tl.tt.dfb_gather_copy"):
+                dfbs[args[1]] = _round(dfbs[args[0]].copy(), dfb_info[args[1]].element_dtype)
             elif name == "tl.tt.compute_value_store":
                 value_dtype = str(descriptors[args[0]].buffer.dtype)
                 dfb_dtype = str(dfb_descriptors[args[1]].element_dtype)
@@ -287,6 +289,18 @@ def interpret_values(mod, tensors):
             advanced = True
         assert advanced, "Device streams deadlocked"
     raise AssertionError("Device interpreter exceeded its instruction bound")
+
+
+def _static_args(call):
+    """Return positional integer arguments; non-integer literals stay None."""
+    args = []
+    for arg in call.args:
+        text = arg.value if isinstance(arg, tirx.StringImm) else arg
+        try:
+            args.append(int(text))
+        except (TypeError, ValueError):
+            args.append(None)
+    return args
 
 
 def interpret(mod, inputs, seed=0):
@@ -359,7 +373,7 @@ def interpret(mod, inputs, seed=0):
             accumulators = local_accumulators.setdefault(core, {})
             asynchronous = asynchronous_by_core[core]
             call = stream[cursors[index]]
-            name, args = call.op.name, list(map(int, call.args))
+            name, args = call.op.name, _static_args(call)
             if name == "tl.tt.compute_precision":
                 assert args[0] in (0, 1)
                 precision[index] = args[0]
@@ -457,6 +471,11 @@ def interpret(mod, inputs, seed=0):
                 accumulators[identifier] = _round(result, accumulator_info[identifier].accumulation_dtype)
             elif name == "tl.tt.accumulator_materialize":
                 dfbs[args[1]] = _round(accumulators.pop(args[0]), dfb_info[args[1]].element_dtype)
+            elif name in ("tl.tt.dfb_local_copy", "tl.tt.dfb_gather_copy"):
+                dfbs[args[1]] = _round(dfbs[args[0]].copy(), dfb_info[args[1]].element_dtype)
+            elif name == "tl.tt.dfb_collective_reduce":
+                reducer = {"sum": np.sum, "max": np.max, "min": np.min}[str(call.args[3].value)]
+                dfbs[args[2]] = reducer(np.stack([dfbs[args[0]], dfbs[args[1]]]), axis=0)
             elif name == "tl.tt.compute_value_store":
                 value_dtype = str(value_info[args[0]].buffer.dtype)
                 dfb_dtype = str(dfb_info[args[1]].element_dtype)

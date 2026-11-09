@@ -3108,14 +3108,10 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     Check(CoreOf(source->consumer_domain) == CoreOf(transfer->src_coord) &&
               CoreOf(destination->producer_domain) == dest,
           "Pipe transfer endpoint owner Core mismatch");
-    const bool forwarding = extended && source->producer_slot == "ncrisc" &&
-                            source->consumer_slot == "trisc" &&
-                            source->tensor_backing.has_value();
-    Check(
-        (source->consumer_slot == "brisc" || forwarding) &&
-            destination->producer_slot == "ncrisc",
-        "Pipe source requires BRISC affinity or a forwarding NCRISC producer, "
-        "and receiver requires NCRISC");
+    Check(source->consumer_slot == "brisc" &&
+              destination->producer_slot == "brisc",
+          "Pipe source requires BRISC transport affinity, and the receiver "
+          "requires a BRISC producer");
     Check(source->element_dtype == destination->element_dtype &&
               ffi::StructuralEqual()(source->tile_shape,
                                      destination->tile_shape) &&
@@ -3415,39 +3411,27 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
             previous_record->second = ordinal;
           }
           if (call->op.same_as(dfb_pipe_send())) {
-            const bool forwarding = extended && slot == "ncrisc" &&
-                                    dfbs.at(id)->producer_slot == slot &&
-                                    dfbs.at(id)->consumer_slot == "trisc";
-            Check(source && (slot == "brisc" || forwarding),
-                  "Pipe send requires source BRISC or forwarding NCRISC "
-                  "affinity");
-            if (forwarding) {
-              Check(copy_completions.count(id) && producers.count(id) &&
-                        events[copy_issues.at(id)].call->op.same_as(
-                            tensor_to_dfb_nd()),
-                    "Pipe forwarding must follow its Tensor copy completion");
-            } else {
-              read(id);
-            }
+            Check(source && slot == "brisc",
+                  "Pipe send requires source BRISC transport affinity");
+            read(id);
             Check(sends.emplace(tid, event).second,
                   "Pipe transaction sent more than once");
           } else if (call->op.same_as(dfb_pipe_recv())) {
-            Check(!source && slot == "ncrisc",
-                  "Pipe receive requires destination NCRISC");
+            Check(!source && slot == "brisc",
+                  "Pipe receive requires destination BRISC transport");
             Check(reserves.count(id),
                   "Pipe receive must follow destination reserve");
             Check(receives.emplace(tid, event).second,
                   "Pipe transaction received more than once");
           } else if (source) {
-            Check((slot == "brisc" || (extended && slot == "ncrisc" &&
-                                       dfbs.at(id)->producer_slot == slot)) &&
-                      sends.count(tid) && events[sends.at(tid)].slot == slot,
-                  "Pipe source completion must follow send in its source slot");
+            Check(slot == "brisc" && sends.count(tid) &&
+                      events[sends.at(tid)].slot == slot,
+                  "Pipe source completion must follow send in BRISC");
             Check(send_completions.emplace(tid, event).second,
                   "Pipe source completion duplicated");
           } else {
-            Check(slot == "ncrisc" && receives.count(tid),
-                  "Pipe destination completion must follow receive in NCRISC");
+            Check(slot == "brisc" && receives.count(tid),
+                  "Pipe destination completion must follow receive in BRISC");
             Check(recv_completions.emplace(tid, event).second,
                   "Pipe destination completion duplicated");
             publish(id);
@@ -3542,12 +3526,6 @@ void VerifyMulticoreProgram(const IRModule &mod, const TensorTable &tensors,
     if (events[i].call->op.same_as(dfb_wait())) {
       int64_t id = RequireStaticInteger(events[i].call->args[0], "DFB wait ID");
       dependencies[i].push_back(producers.at(id));
-      // A forwarding producer publishes readiness only after every outgoing
-      // transfer completes. The consumer's wait protects its eventual release.
-      if (dfbs.at(id)->producer_slot == "ncrisc" &&
-          dfbs.at(id)->consumer_slot == "trisc")
-        for (int64_t transfer : outgoing[id])
-          dependencies[i].push_back(send_completions.at(transfer));
     }
   // Reject cross-Core writes to overlapping global regions; no ordering of
   // unrelated NCRISC streams can establish a deterministic winning write.
@@ -3794,7 +3772,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
   std::map<LocalKey, ffi::Array<PrimExpr>> tensor_load_shapes;
   std::map<LocalKey, std::pair<int64_t, bool>> copy_issues;
   std::map<LocalKey, int64_t> copy_completions;
-  std::map<LocalKey, std::vector<int64_t>> forwarding_completions;
   struct InputShapeUse {
     LocalKey key;
     ffi::Array<PrimExpr> shape;
@@ -4222,7 +4199,9 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             bool pipe_send = call->op.same_as(dfb_pipe_send());
             bool pipe_recv = call->op.same_as(dfb_pipe_recv());
             bool pipe_wait = call->op.same_as(dfb_pipe_wait());
-            bool local_copy = call->op.same_as(dfb_local_copy());
+            bool local_copy = call->op.same_as(dfb_local_copy()) &&
+                              call->annotations.Get("tt.communication_site")
+                                  .has_value();
             bool gather_copy = call->op.same_as(dfb_gather_copy());
             bool local_reduce = call->op.same_as(dfb_collective_reduce());
             bool communication_op = pipe_send || pipe_recv || pipe_wait ||
@@ -4488,26 +4467,20 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               } else if (call->op.same_as(dfb_pipe_send())) {
                 int64_t transfer = id(call, 0);
                 int64_t resource = id(call, 1);
-                const DFBDescriptor &descriptor = dfb_table.at(resource);
-                bool forwarding = owner == descriptor->producer_slot &&
-                                  descriptor->tensor_backing.has_value();
-                if (forwarding) {
-                  auto &entry = state(resource);
-                  Check(
-                      entry.produced,
-                      "producer forwarding must follow Tensor copy completion");
-                } else {
-                  use(resource);
-                }
+                Check(owner == "brisc",
+                      "Pipe send must execute in BRISC transport");
+                use(resource);
                 Check(
-                    sent_transfers
-                        .emplace(std::make_pair(transfer, resource), forwarding)
+                    sent_transfers.emplace(std::make_pair(transfer, resource),
+                                           false)
                         .second,
                     "Pipe transfer is sent more than once in one Core work "
                     "item");
               } else if (call->op.same_as(dfb_pipe_recv())) {
                 int64_t transfer = id(call, 0);
                 int64_t resource = id(call, 1);
+                Check(owner == "brisc",
+                      "Pipe receive must execute in BRISC transport");
                 state(resource);
                 Check(received_transfers.insert({transfer, resource}).second,
                       "Pipe transfer is received more than once in one Core "
@@ -4515,11 +4488,10 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
               } else if (call->op.same_as(dfb_pipe_wait())) {
                 int64_t transfer = id(call, 0);
                 int64_t resource = id(call, 1);
+                Check(owner == "brisc",
+                      "Pipe completion must execute in BRISC transport");
                 auto sent = sent_transfers.find({transfer, resource});
-                if (sent != sent_transfers.end() && sent->second) {
-                  forwarding_completions[LocalKey{x, y, resource}].push_back(
-                      event);
-                } else if (received_transfers.count({transfer, resource})) {
+                if (received_transfers.count({transfer, resource})) {
                   produce(resource, event);
                 } else if (sent != sent_transfers.end()) {
                   use(resource);
@@ -4588,13 +4560,6 @@ IRModule VerifyCurrentDeviceModule(IRModule mod) {
             "Tensor export DFB is missing release");
       event_successors[completion->second].push_back(release->second);
     }
-  }
-  for (const auto &[key, completions] : forwarding_completions) {
-    auto release = release_events.find(key);
-    Check(release != release_events.end(),
-          "producer-forwarded DFB is missing final release");
-    for (int64_t completion : completions)
-      event_successors[completion].push_back(release->second);
   }
   struct GroupReserve {
     int64_t ordinal;

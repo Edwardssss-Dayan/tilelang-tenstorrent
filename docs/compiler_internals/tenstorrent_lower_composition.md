@@ -61,8 +61,29 @@ verifier 独立检查池形状/dtype/归属、容量、copy completion、最后�
 保存的旧值和 identity 链仍借用原 DFB，不能在最后的传递消费者读取前释放。
 诊断包含当前 PrimFunc、operation/resource ID，并在可用时附带源位置。
 
-SUMMA 的 NCRISC 若转发本地加载的 panel，会在首次 send 前完成该 panel 的
-Tensor copy。其余输入保留窗口预取，避免接收端读取尚未发布的数据。
+### 槽位职责
+
+当前 Device IR 固定以下职责，Pass 14 两条验证路径（当前 shared-grid 与旧
+`VerifyMulticoreProgram`）同时强制：
+
+| Slot | 职责 |
+| --- | --- |
+| TRISC | 计算；不产生通信 payload，也不执行核间传输 |
+| NCRISC | Tensor 搬入/搬出及核内 DFB→DFB 搬运 |
+| BRISC | `dfb_pipe_send` / `dfb_pipe_recv` / `dfb_pipe_wait` 与发送完成 |
+
+发送 payload 使用独立的 transport DFB（`tt_transport_<site>_<occurrence>`），
+producer 为 NCRISC、consumer 为 BRISC。Tensor-backed panel 由 NCRISC 重新装载，
+计算 panel 保持自己的 generation；计算产生的 payload 由 NCRISC 做核内 copy。
+接收端由 BRISC 写入 transport DFB，再由 NCRISC 搬入 compute generation。
+
+因此每个 DFB generation 仍只有一个 producer slot 和一个 consumer slot，但通信
+不再借用 compute panel，也不再使用 producer forwarding。代价是每个广播 panel
+多一次 NCRISC 搬运、每个接收 panel 多一次核内 copy，并新增 transport storage
+group。BRISC 的 `noc_index` 固定为 1，核间流量因此走 NOC1。
+
+BRISC transport 保持逐迭代词法顺序：不新增窗口重排，也不为接收端做提前调度。
+其余输入保留窗口预取，避免接收端读取尚未发布的数据。
 
 ## 能力查询和保留边界
 

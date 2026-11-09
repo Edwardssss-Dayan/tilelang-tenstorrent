@@ -237,19 +237,40 @@ def producer_forwarded_broadcast(
         T.copy(accumulator, C[x * 32 : (x + 1) * 32, 0:32])
 
 
-def test_tensor_panel_producer_forwarding_is_a_closed_ncrisc_transaction():
+def test_tensor_panel_transport_is_a_closed_brisc_transaction():
     mod = lower(producer_forwarded_broadcast)
-    steps = list(expanded(mod).attrs["tt.communication_step_table"])
-    source_steps = [step for step in steps if str(step.kind) in ("send", "completion")]
-    assert source_steps
-    assert all(str(step.owner_slot) == "ncrisc" for step in source_steps)
-    sends = [
+    table = expanded(mod)
+    steps = list(table.attrs["tt.communication_step_table"])
+    transport_steps = [
+        step
+        for step in steps
+        if str(step.kind) in ("send", "receive", "completion", "publish")
+    ]
+    assert transport_steps
+    assert all(str(step.owner_slot) == "brisc" for step in transport_steps)
+    pipe_ops = [
         (str(function.attrs["tt.kernel_slot"]), call.op.name)
         for function in mod.functions.values()
         for call in calls(function.body)
-        if call.op.name == "tl.tt.dfb_pipe_send"
+        if call.op.name in {"tl.tt.dfb_pipe_send", "tl.tt.dfb_pipe_recv", "tl.tt.dfb_pipe_wait"}
     ]
-    assert sends == [("ncrisc", "tl.tt.dfb_pipe_send")]
+    assert pipe_ops
+    assert {slot for slot, _ in pipe_ops} == {"brisc"}
+
+    dfbs = {int(dfb.dfb_id): dfb for dfb in table.attrs["tt.dfb_table"]}
+    transports = list(table.attrs["tt.transport_table"])
+    assert transports
+    for transport in transports:
+        payload = dfbs[int(transport.payload_dfb_id)]
+        assert str(payload.producer_slot) == "ncrisc"
+        assert str(payload.consumer_slot) == "brisc"
+    brisc_steps = [step for step in steps if str(step.owner_slot) == "brisc"]
+    assert {str(step.kind) for step in brisc_steps} == {
+        "send",
+        "receive",
+        "completion",
+        "publish",
+    }
 
 
 def _body_counts(function):
@@ -381,20 +402,25 @@ def test_summa_uses_parameterized_core_occurrence_and_resource_families():
             "tt.transport_table",
         )
     )
+    # Each broadcast panel keeps a compute generation and an independent
+    # NCRISC-built transport payload generation.
     assert [tuple(len(mod.attrs[key]) for key in family_keys) for mod in modules] == [
-        (3, 1, 10, 1),
-        (3, 1, 10, 1),
-        (3, 1, 10, 1),
+        (6, 1, 10, 1),
+        (6, 1, 10, 1),
+        (6, 1, 10, 1),
     ]
 
+    assert [len(mod.attrs["tt.dfb_storage_groups"]) for mod in modules] == [11, 19, 19]
     for mod in modules:
-        assert len(mod.attrs["tt.dfb_storage_groups"]) == 3
         functions = {str(func.attrs["tt.kernel_slot"]): func for func in mod.functions.values()}
         trisc = _body_counts(functions["trisc"])
         ncrisc = _body_counts(functions["ncrisc"])
+        brisc = _body_counts(functions["brisc"])
         assert trisc["if"] == 0
         assert trisc["block"] == 1
         assert trisc["for"] >= 1
+        assert ncrisc["for"] >= 1
+        assert brisc["for"] >= 1
         assert "tt.storage_group_statements_specialized" not in mod.attrs
         assert _compact_loop_names(mod)
         assert _dynamic_dfb_operands(mod)
@@ -534,7 +560,7 @@ def test_lower_preserves_parameterized_storage_group_selection_for_codegen():
     assert set(resolved) == set(map(str, mod.attrs["tt.kernel_order"]))
     assert resolved["main_trisc"]
     assert resolved["main_ncrisc"]
-    assert not resolved["main_brisc"]
+    assert resolved["main_brisc"], "BRISC now owns every inter-core transport"
     with pytest.raises(NotImplementedError) as error:
         codegen.prepare_ttl_codegen(mod, TARGET)
     assert "DFB-family binding resolution failed" not in str(error.value)
@@ -585,9 +611,9 @@ def test_flash_attention_core_and_kv_repetition_remain_parameterized():
         "tt.transport_families",
     )
     assert [tuple(len(mod.attrs[key]) for key in family_keys) for mod in modules] == [
-        (14, 2, 8, 10, 1),
-        (14, 2, 8, 10, 1),
-        (14, 2, 8, 10, 1),
+        (17, 2, 8, 10, 1),
+        (17, 2, 8, 10, 1),
+        (17, 2, 8, 10, 1),
     ]
     for mod in modules:
         assert "tt.storage_group_statements_specialized" not in mod.attrs
@@ -648,4 +674,128 @@ def test_reference_explicit_multicore_delivery(program, seed):
         a = _round(a, "bfloat16")
     expected = np.tile(_round(a @ a, "bfloat16"), (2, 1)) if broadcast else a
     outputs, _ = interpret(lower(program), [a, np.zeros_like(expected)], seed=seed)
+    np.testing.assert_allclose(outputs[1], expected, rtol=0, atol=0)
+
+
+def _slot_functions(mod):
+    return {
+        str(function.attrs["tt.kernel_slot"]): function
+        for function in mod.functions.values()
+    }
+
+
+def _dfbs(mod):
+    return {int(dfb.dfb_id): dfb for dfb in expanded(mod).attrs["tt.dfb_table"]}
+
+
+def _replace_dfb(dfb, **changes):
+    fields = {
+        "dfb_id": int(dfb.dfb_id),
+        "source_buffer_identity": str(dfb.source_buffer_identity),
+        "element_dtype": dfb.element_dtype,
+        "tile_shape": dfb.tile_shape,
+        "block_shape_in_tiles": dfb.block_shape_in_tiles,
+        "block_count": dfb.block_count,
+        "tensor_backing": dfb.tensor_backing,
+        "producer_slot": str(dfb.producer_slot),
+        "producer_domain": dfb.producer_domain,
+        "consumer_slot": str(dfb.consumer_slot),
+        "consumer_domain": dfb.consumer_domain,
+        "transaction_count_or_loop_relation": dfb.transaction_count_or_loop_relation,
+        "source_span": dfb.source_span,
+    }
+    fields.update(changes)
+    return D.DFBDescriptor(**fields)
+
+
+@pytest.mark.parametrize(
+    "program", [point_transfer, producer_forwarded_broadcast, all_gather, all_reduce]
+)
+def test_ncrisc_moves_payloads_and_brisc_owns_every_transport(program):
+    mod = lower(program)
+    table = expanded(mod)
+    dfbs = _dfbs(mod)
+    pipe_ops = {"tl.tt.dfb_pipe_send", "tl.tt.dfb_pipe_recv", "tl.tt.dfb_pipe_wait"}
+    slots_by_op = {}
+    for slot, function in _slot_functions(mod).items():
+        for call in calls(function.body):
+            if call.op.name in pipe_ops:
+                slots_by_op.setdefault(call.op.name, set()).add(slot)
+    assert slots_by_op
+    assert all(slots == {"brisc"} for slots in slots_by_op.values())
+
+    for transport in table.attrs["tt.transport_table"]:
+        payload = dfbs[int(transport.payload_dfb_id)]
+        assert str(payload.producer_slot) == "ncrisc"
+        assert str(payload.consumer_slot) == "brisc"
+    for step in table.attrs["tt.communication_step_table"]:
+        if str(step.kind) in ("send", "receive", "completion", "publish"):
+            assert str(step.owner_slot) == "brisc"
+
+    # The compute panel is never the transport payload: TRISC never copies it.
+    payload_ids = {int(t.payload_dfb_id) for t in table.attrs["tt.transport_table"]}
+    for call in calls(_slot_functions(mod)["trisc"].body):
+        assert call.op.name not in pipe_ops
+        if call.op.name == "tl.tt.dfb_compute":
+            assert int(call.args[0]) not in payload_ids
+
+
+def test_transport_step_owner_outside_brisc_is_rejected():
+    base = expanded(lower(producer_forwarded_broadcast))
+    steps = list(base.attrs["tt.communication_step_table"])
+    index = next(
+        i for i, step in enumerate(steps) if str(step.kind) in ("send", "receive")
+    )
+    step = steps[index]
+    steps[index] = D.CommunicationStepDescriptor(
+        int(step.step_id),
+        int(step.communication_id),
+        int(step.occurrence),
+        str(step.kind),
+        step.source_core,
+        step.destination_core,
+        int(step.source_dfb_id),
+        int(step.destination_dfb_id),
+        "ncrisc",
+        list(step.dependencies),
+        step.parameter,
+        step.source_span,
+    )
+    with pytest.raises(ValueError, match="owner|brisc|BRISC"):
+        transform.VerifyTenstorrentDeviceIR()(
+            base.with_attr("tt.communication_step_table", steps)
+        )
+
+
+def test_transport_payload_must_be_brisc_consumer():
+    base = expanded(lower(point_transfer))
+    payload = int(list(base.attrs["tt.transport_table"])[0].payload_dfb_id)
+    changed = [
+        _replace_dfb(dfb, consumer_slot="trisc") if int(dfb.dfb_id) == payload else dfb
+        for dfb in base.attrs["tt.dfb_table"]
+    ]
+    with pytest.raises(ValueError, match="brisc|BRISC|consumer"):
+        transform.VerifyTenstorrentDeviceIR()(base.with_attr("tt.dfb_table", changed))
+
+
+@pytest.mark.parametrize("seed", [0, 13])
+def test_reference_elementwise_all_reduce_sums_every_panel(seed):
+    import numpy as np
+    from testing.python.tenstorrent._support.reference import interpret
+
+    @T.prim_func
+    def program(A: T.Tensor((64, 32), "float32"), C: T.Tensor((64, 32), "float32")):
+        with T.Kernel(2, 1, threads=1) as (x, _y):
+            src = T.alloc_shared((32, 32), "float32")
+            dst = T.alloc_shared((32, 32), "float32")
+            T.copy(A[x * 32 : (x + 1) * 32, 0:32], src)
+            T.comm.all_reduce(
+                src=src, dst=dst, group=T.comm.CoreRange((0, 0), (2, 1)), op="sum"
+            )
+            T.copy(dst, C[x * 32 : (x + 1) * 32, 0:32])
+
+    rng = np.random.default_rng(seed)
+    a = rng.normal(size=(64, 32)).astype("float32")
+    expected = np.tile(a[0:32] + a[32:64], (2, 1))
+    outputs, _ = interpret(lower(program), [a, np.zeros_like(a)], seed=seed)
     np.testing.assert_allclose(outputs[1], expected, rtol=0, atol=0)
