@@ -1,5 +1,7 @@
 """Independent verifier checks for composed v7 lowering contracts."""
 
+import inspect
+
 import pytest
 
 from tilelang import tvm
@@ -50,7 +52,7 @@ def test_cross_core_value_operand_is_rejected_without_mutation():
 
     def edit(call):
         nonlocal changed
-        if changed or call.op.name != "tl.tt.compute_value" or not len(call.annotations["tt.value_inputs"]):
+        if changed or call.op.name != "tl.tt.compute_value" or not len(call.annotations.get("tt.value_inputs", [])):
             return None
         changed = True
         remote = next(identifier for identifier, core in owners.items() if core == 1)
@@ -81,7 +83,11 @@ def test_cross_core_value_definition_is_rejected():
             return None
         changed = True
         args = list(call.args)
-        args[0] = tirx.IntImm(args[0].dtype, 0)
+        args[0] = tirx.Call(
+            "handle",
+            tvm.ir.Op.get("tl.tt.compute_value_ref"),
+            [tirx.IntImm("int32", 0)],
+        )
         return tirx.Call(call.dtype, call.op, args, call.annotations, call.span)
 
     malformed = rewrite_calls(mod, edit)
@@ -125,12 +131,30 @@ def test_operation_diagnostic_identifies_symbol_resource_and_source():
 
     def edit(call):
         nonlocal changed
-        if not changed and call.op.name == "tl.tt.compute_value":
-            changed = True
-            attrs = dict(call.annotations)
-            attrs["tt.compute_dtype"] = tirx.StringImm("bfloat16")
-            return tirx.Call(call.dtype, call.op, call.args, attrs, call.span)
-        return None
+        if changed or call.op.name != "tl.tt.compute_value":
+            return None
+        attrs = dict(call.annotations)
+        expression = attrs.get("tt.expression")
+        if expression is None:
+            return None
+
+        def corrupt_operand(node):
+            if node.op.name == "tl.tt.dfb_operand":
+                return tirx.Call(
+                    node.dtype,
+                    node.op,
+                    [tirx.IntImm("int32", 999)],
+                    node.annotations,
+                    node.span,
+                )
+            return None
+
+        rewritten = tirx.stmt_functor.ir_transform(tirx.Evaluate(expression), None, corrupt_operand, ["tirx.Call"]).value
+        if rewritten.same_as(expression):
+            return None
+        changed = True
+        attrs["tt.expression"] = rewritten
+        return tirx.Call(call.dtype, call.op, call.args, attrs, call.span)
 
     malformed = rewrite_calls(mod, edit)
     before = ir.save_json(malformed)
@@ -193,73 +217,65 @@ def test_value_cannot_borrow_foreign_core_dfb():
     check_rejected(malformed, "borrows a DFB owned by another Core")
 
 
-def test_pipeline_value_cannot_resurrect_released_previous_epoch():
+def test_pipeline_value_cannot_yield_the_stale_entry_epoch():
     @T.prim_func
     def main(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "float32")):
         with T.Kernel(1, 1, threads=1):
             a = T.alloc_shared((32, 32), "float32", annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 2})
             f = T.alloc_fragment((32, 32), "float32")
-            for _k in T.Pipelined(3, num_stages=2):
+            T.clear(f)
+            for _k in T.serial(3):
                 T.copy(A, a)
                 for i, j in T.Tiles(32, 32):
-                    f[i, j] = a[i, j] * 2
-                for i, j in T.Tiles(32, 32):
-                    f[i, j] = f[i, j] + 1
-                T.copy(f, C)
+                    f[i, j] = f[i, j] + a[i, j]
+            T.copy(f, C)
 
     mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET))
-    for global_var, function in list(mod.functions.items()):
-        if str(function.attrs["tt.kernel_slot"]) == "trisc":
-            concrete = [tirx.Evaluate(call) for call in _calls(function.body)]
-            mod.update_func(global_var, _with_core_statements(function, concrete))
-    first = None
+    entry = None
+    for function in mod.functions.values():
+        if str(function.attrs["tt.kernel_slot"]) != "trisc":
+            continue
+        for call in _calls(function.body):
+            if call.op.name == "tl.tt.compute_value_state_init":
+                entry = int(call.args[1])
+                break
+    assert entry is not None
     changed = False
 
     def edit(call):
-        nonlocal first, changed
-        if call.op.name != "tl.tt.compute_value" or not len(call.annotations["tt.value_inputs"]):
-            return None
-        if first is None:
-            first = int(call.args[0])
-            return None
-        if changed:
+        nonlocal changed
+        if changed or call.op.name != "tl.tt.compute_value_state_yield":
             return None
         changed = True
-        attrs = dict(call.annotations)
-        attrs["tt.value_inputs"] = [tirx.IntImm("int64", first)]
-
-        def replace_load(node):
-            if node.op.name == "tl.tt.compute_value_load":
-                return tirx.Call(node.dtype, node.op, [tirx.IntImm("int64", first)], node.annotations, node.span)
-            return None
-
-        attrs["tt.expression"] = tirx.stmt_functor.ir_transform(
-            tirx.Evaluate(attrs["tt.expression"]), None, replace_load, ["tirx.Call"]
-        ).value
-        return tirx.Call(call.dtype, call.op, call.args, attrs, call.span)
+        return tirx.Call(
+            call.dtype,
+            call.op,
+            [call.args[0], tirx.IntImm("int64", entry)],
+            call.annotations,
+            call.span,
+        )
 
     malformed = rewrite_calls(mod, edit)
     assert changed
-    check_rejected(malformed, "after release")
+    check_rejected(malformed, "loop-state value predecessor disagrees")
 
 
-@pytest.mark.parametrize("mutation", ["stage", "shared_pool"])
-def test_pipeline_singleton_contract_cannot_be_forged(mutation):
+@pytest.mark.parametrize("mutation", ["transaction_count", "duplicate_id"])
+def test_pipeline_stream_contract_cannot_be_forged(mutation):
     from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_lower_composition import full_k_pipeline, lower
 
     mod = lower(full_k_pipeline(), version=5)
-    relations = {str(key): list(value) for key, value in mod.attrs["tt.pipeline_relations"].items()}
-    singleton = next(key for key, relation in relations.items() if int(relation[0]) == -1)
-    if mutation == "stage":
-        relations[singleton] = [tirx.IntImm("int64", -1), tirx.IntImm("int64", 1)]
-        malformed = mod.with_attr("tt.pipeline_relations", relations)
-        check_rejected(malformed, "invalid iteration/stage")
-    else:
-        groups = {str(key): value for key, value in mod.attrs["tt.dfb_storage_groups"].items()}
-        pooled = next(key for key, relation in relations.items() if int(relation[0]) >= 0)
-        groups[singleton] = groups[pooled]
-        malformed = mod.with_attr("tt.dfb_storage_groups", groups)
-        check_rejected(malformed, "singleton|generations disagree")
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
+    group = groups[0]
+    fields = {name: getattr(group, name) for name in inspect.signature(D.DFBStorageGroupDescriptor.__init__).parameters if name != "self"}
+    fields["transaction_count_or_loop_relation" if mutation == "transaction_count" else "storage_group_id"] = (
+        2 if mutation == "transaction_count" else 1
+    )
+    groups[0] = D.DFBStorageGroupDescriptor(**fields)
+    check_rejected(
+        mod.with_attr("tt.dfb_storage_groups", groups),
+        "transaction count disagrees|IDs must be dense",
+    )
 
 
 @pytest.mark.skip(reason="legacy PipeNet pipeline is not an active v04 Lower input")

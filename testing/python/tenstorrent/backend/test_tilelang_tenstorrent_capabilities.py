@@ -72,7 +72,6 @@ def keepdims_reduction(dtype="float32", reduction_kind="sum"):
             a = T.alloc_shared((32, 32), dtype, annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 1})
             f = T.alloc_fragment((32, 32), dtype)
             row = T.alloc_fragment((32, 1), dtype)
-            column = T.alloc_shared((32, 32), dtype, annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 1})
             output = T.alloc_shared((32, 32), dtype, annotations={"tt.tile_shape": (32, 32), "tt.dfb_block_count": 1})
             T.copy(A, a)
             T.copy(a, f)
@@ -82,9 +81,8 @@ def keepdims_reduction(dtype="float32", reduction_kind="sum"):
                 T.reduce_max(f, row, dim=1)
             else:
                 T.reduce_min(f, row, dim=1)
-            T.copy(row, column[:, 0:1])
             for i, j in T.Tiles(output):
-                output[i, j] = column[i, 0]
+                output[i, j] = row[i, 0]
             T.copy(output, C)
 
     return main
@@ -292,7 +290,7 @@ def test_legacy_gemm_query_keeps_lower_separate_from_validation(version, multico
 @pytest.mark.parametrize("arch", ["wormhole_b0", "blackhole"])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("reduction_kind", ["sum", "max", "min"])
-def test_keepdims_capability_matches_fragment_reduction_lower(arch, dtype, reduction_kind):
+def test_keepdims_reduction_broadcasts_directly_from_fragment(arch, dtype, reduction_kind):
     capability = lower_capability(
         "reduce",
         arch=arch,

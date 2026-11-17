@@ -16,24 +16,26 @@ the complete K reduction materializes it to a shared output or Tensor.
 Ordinary stores, intermediate copies, ambiguous aliases and cross-slot uses
 are rejected.
 
-For v6, each Core owns a separate accumulator ID and complete K lifetime, even
-when topology specialization retains the same frontend Buffer handle. Static
-K-loop expansion propagates scalar aliases such as `k_begin = stage * block_k`
-before validating transfer regions. Repeated PipeNet records carry a zero-based
-`PipeTransferDescriptor.occurrence`; sender and receiver counts, destinations,
-payloads and completion order are checked for every occurrence.
+For the current shared-grid contract, accumulator IDs are local to the executing
+Core. The complete identity is `(accumulator ID, Core coordinate, occurrence)`,
+so every Core owns an independent complete-K lifetime even when all Cores execute
+one shared TRISC body and retain the same frontend Buffer handle. Versioned v6
+artifacts keep their historical globally unique IDs. Static K-loop expansion
+propagates scalar aliases such as `k_begin = stage * block_k` before validating
+transfer regions.
 
-SUMMA source Cores forward a completed Tensor load from NCRISC using the same
-DFB that local TRISC consumes. The local consumer's `dfb_wait` observes publication
-only after all outgoing sends of that DFB complete. This preserves the order
-reserve → Tensor load → send/completion → local consumption without a TRISC
+For source-inclusive SUMMA multicast, BRISC owns the complete source transaction:
+reserve, Tensor load, copy completion, and send completion. NCRISC publishes a
+separate loopback/remote receive generation, and every TRISC instance consumes
+that uniform generation. This preserves local SPSC ownership without a TRISC
 snapshot copy. Releases follow the final local computation or output write
 completion. These are logical Device IR scheduling contracts; physical circular
 buffer allocation and hardware synchronization remain code-generation work.
 
-`VerifyTTGemmAccumulators` establishes frontend lifetime facts, without claiming
-that a target can compile or execute the program. Regions normalization makes
-bounded static K slices concrete. Legalization preserves accumulator operations;
+The accumulator analysis inside `LegalizeTenstorrentTileOps` establishes
+frontend lifetime facts, without claiming that a target can compile or execute
+the program. Regions normalization makes bounded static K slices concrete.
+Legalization emits accumulator operations carrying the dtype contract directly;
 layout validation does not assign them a CB or a physical DST index. Formation
 creates one logical accumulator, its updates, and a final output DFB. DCE keeps
 the accumulator's input dependencies live until materialization.
@@ -44,10 +46,12 @@ BF16 Tensor inputs → BF16 input DFB generations
 → final BF16 output DFB → Tensor writer
 ```
 
-The module attribute `tt.accumulator_table` contains typed
-`AccumulatorDescriptor` objects with:
+Current Device IR stores typed `AccumulatorDescriptor` prototypes and instance
+relations in `tt.accumulator_families`. Diagnostic expansion may materialize an
+`tt.accumulator_table` with synthetic globally unique IDs, but those IDs are not
+part of the persisted shared-grid body contract. Each descriptor records:
 
-- `accumulator_id`, independently numbered from DFB IDs;
+- a Core-local `accumulator_id`, independently numbered from DFB IDs;
 - `accumulator_region`, preserving fragment Buffer/data identity;
 - `input_dtype`, `accumulation_dtype`, `output_dtype`;
 - `full_k_tiles`, the sum of K tiles across every update;
@@ -57,9 +61,9 @@ Final operations are registered, effectful TileLang intrinsics:
 
 | Operation | Operands |
 | --- | --- |
-| `tl.tt.accumulator_init` | accumulator ID |
-| `tl.tt.gemm_update` | lhs DFB, rhs DFB, accumulator ID, transpose A, transpose B |
-| `tl.tt.accumulator_materialize` | accumulator ID, output DFB |
+| `tl.tt.accumulator_init` | Core-local accumulator ID |
+| `tl.tt.gemm_update` | lhs DFB, rhs DFB, Core-local accumulator ID, transpose A, transpose B |
+| `tl.tt.accumulator_materialize` | Core-local accumulator ID, output DFB |
 
 Only TRISC owns these operations. Input DFB waits and output reserve/writer
 ordering remain part of the ordinary verified DFB protocol. A final Tensor copy
@@ -80,8 +84,9 @@ Device verifier. It derives typed `tt.compute_requirements` per compute function
 | BF16 | FP32 | BF16 | bits32_required | required |
 | FP32 | FP32 | FP32 | bits32_required | required |
 
-The final verifier independently checks lexical lifetime, full K tile count,
-operation operands, dtype/shape, slot ownership and the stored requirements.
+The final verifier resolves each local ID in the current Core, then independently
+checks lexical lifetime, full K tile count, operation operands, dtype/shape, slot
+ownership and the stored requirements.
 Forged or stale requirements are rejected, not repaired. In v1–v7, a 16/32-bit
 conflict in one compute kernel is an error; no implicit widening or narrowing
 occurs. v8 supports explicit regions with independent requirements and exact

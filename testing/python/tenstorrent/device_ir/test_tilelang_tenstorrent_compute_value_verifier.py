@@ -18,9 +18,7 @@ from testing.python.tenstorrent._support.reference import _core_statements, _wit
 
 def device(gemm=False):
     func = gemm_epilogue("store") if gemm else fragment_program()
-    return D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": func}), TARGET)
-    )
+    return D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": func}), TARGET))
 
 
 def rewrite_calls(mod, edit):
@@ -71,7 +69,7 @@ def test_future_value_reference_is_rejected():
 
     def edit(call):
         nonlocal changed
-        if not changed and call.op.name == "tl.tt.compute_value" and len(call.annotations["tt.value_inputs"]):
+        if not changed and call.op.name == "tl.tt.compute_value" and len(call.annotations.get("tt.value_inputs", [])):
             changed = True
             attrs = dict(call.annotations)
             attrs["tt.value_inputs"] = [tirx.IntImm("int64", future)]
@@ -89,26 +87,55 @@ def test_duplicate_value_definition():
     statements = _core_statements(trisc)
     definition = next(s for s in statements if isinstance(s, tirx.Evaluate) and s.value.op.name == "tl.tt.compute_value")
     mod.update_func(mod.get_global_var(str(trisc.attrs["global_symbol"])), _with_core_statements(trisc, [*statements, definition]))
-    check_rejected(mod, "duplicated|after release")
+    check_rejected(mod, "duplicated|after release|no active acquisition")
 
 
 def test_missing_release_and_release_before_read():
     mod = device()
     func = next(f for f in mod.functions.values() if f.attrs["tt.kernel_slot"] == "trisc")
-    statements = _core_statements(func)
-    release = next(i for i, stmt in enumerate(statements) if stmt.value.op.name == "tl.tt.dfb_release")
+
+    def mutate_release(body, *, remove):
+        changed = False
+
+        def rewrite(node):
+            nonlocal changed
+            if changed or not isinstance(node, tirx.SeqStmt):
+                return None
+            statements = list(node.seq)
+            release = next(
+                (
+                    index
+                    for index, statement in enumerate(statements)
+                    if isinstance(statement, tirx.Evaluate)
+                    and isinstance(statement.value, tirx.Call)
+                    and statement.value.op.name == "tl.tt.dfb_release"
+                ),
+                None,
+            )
+            if release is None:
+                return None
+            changed = True
+            statement = statements.pop(release)
+            if not remove:
+                statements.insert(0, statement)
+            return tirx.SeqStmt(statements)
+
+        result = tirx.stmt_functor.ir_transform(body, None, rewrite, ["tirx.SeqStmt"])
+        assert changed
+        return result
+
     missing = ir.load_json(ir.save_json(mod))
     missing.update_func(
         missing.get_global_var(str(func.attrs["global_symbol"])),
-        _with_core_statements(func, statements[:release] + statements[release + 1 :]),
+        func.with_body(mutate_release(func.body, remove=True)),
     )
     check_rejected(missing, "missing release")
     premature = ir.load_json(ir.save_json(mod))
     premature.update_func(
         premature.get_global_var(str(func.attrs["global_symbol"])),
-        _with_core_statements(func, [statements[release], *statements[:release], *statements[release + 1 :]]),
+        func.with_body(mutate_release(func.body, remove=False)),
     )
-    check_rejected(premature, "must follow wait|release precedes")
+    check_rejected(premature, "must follow wait|release precedes|no active acquisition")
 
 
 def test_accumulator_zero_initialization_cannot_be_forged():

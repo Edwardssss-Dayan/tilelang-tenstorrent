@@ -15,11 +15,20 @@ _FIXED_DTYPES = {
     "pipe_dst_range": "int32",
     "core_x": "int32",
     "core_y": "int32",
+    "tensor_ref": "handle",
+    "dfb_stream_ref": "handle",
+    "pipe_net_ref": "handle",
+    "accumulator_ref": "handle",
+    "compute_value_ref": "handle",
+    "compute_state_ref": "handle",
+    "pipe_record_ref": "handle",
 }
 
 _DYNAMIC_DTYPE = {
+    "dfb_operand",
     "dfb_load",
     "compute_broadcast",
+    "compute_value_operand",
     "compute_value_load",
 }
 
@@ -36,6 +45,10 @@ _VOID_INTRINSICS = {
     "compute_value",
     "compute_value_store",
     "compute_value_gemm",
+    "compute_value_state_init",
+    "compute_value_state_input",
+    "compute_value_state_yield",
+    "compute_value_state_result",
     "tensor_to_dfb_nd",
     "dfb_to_tensor_nd",
     "dfb_reserve",
@@ -45,6 +58,9 @@ _VOID_INTRINSICS = {
     "dfb_pipe_send",
     "dfb_pipe_recv",
     "dfb_pipe_wait",
+    "dfb_pipe_send_record",
+    "dfb_pipe_recv_record",
+    "dfb_pipe_wait_record",
     "tensor_to_dfb",
     "dfb_to_tensor",
     "dfb_add",

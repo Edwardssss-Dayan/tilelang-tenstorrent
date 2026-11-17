@@ -74,12 +74,10 @@ DFB_STORAGE_GROUPS_ATTR = "tt.dfb_storage_groups"
 DFB_STORAGE_GROUP_RELATIONS_ATTR = "tt.dfb_storage_group_relations"
 ACCUMULATOR_FAMILIES_ATTR = "tt.accumulator_families"
 COMPUTE_VALUE_FAMILIES_ATTR = "tt.compute_value_families"
-COMMUNICATION_STEP_FAMILIES_ATTR = "tt.communication_step_families"
 TRANSPORT_FAMILIES_ATTR = "tt.transport_families"
 PIPE_TABLE_ATTR = "tt.pipe_table"
 PIPE_TRANSFER_TABLE_ATTR = "tt.pipe_transfer_table"
 COMMUNICATION_TABLE_ATTR = "tt.communication_table"
-COMMUNICATION_STEP_TABLE_ATTR = "tt.communication_step_table"
 TRANSPORT_TABLE_ATTR = "tt.transport_table"
 KERNEL_ORDER_ATTR = "tt.kernel_order"
 KERNEL_SLOT_ATTR = "tt.kernel_slot"
@@ -209,6 +207,12 @@ def device_ir_to_tirx(mod: IRModule) -> str:
         index += 1
 
     result = tokenize.untokenize(encoded)
+    legend = (
+        "# Device ABI legend: calling_conv=2 is DEVICE_KERNEL_LAUNCH; "
+        "tt.noc_index=0/1 selects NOC0/NOC1; tt.tensor_arg_indices indexes "
+        "tt.tensor_table.\n"
+    )
+    result = legend + result
     ast.parse(result)
     return result
 
@@ -375,40 +379,6 @@ class CommunicationDescriptor(Node):
         )
 
 
-@tvm_ffi.register_object("tl.tenstorrent.CommunicationStepDescriptor")
-class CommunicationStepDescriptor(Node):
-    def __init__(
-        self,
-        step_id,
-        communication_id,
-        occurrence,
-        kind,
-        source_core,
-        destination_core,
-        source_dfb_id,
-        destination_dfb_id,
-        owner_slot,
-        dependencies=(),
-        parameter=0,
-        source_span=None,
-    ):
-        self.__init_handle_by_constructor__(
-            _ffi_api.CommunicationStepDescriptor,
-            int(step_id),
-            int(communication_id),
-            int(occurrence),
-            kind,
-            source_core,
-            destination_core,
-            int(source_dfb_id),
-            int(destination_dfb_id),
-            owner_slot,
-            list(dependencies),
-            _expr(parameter),
-            source_span,
-        )
-
-
 @tvm_ffi.register_object("tl.tenstorrent.DFBDescriptor")
 class DFBDescriptor(Node):
     def __init__(
@@ -460,6 +430,7 @@ class DFBStorageGroupDescriptor(Node):
         producer_domain: CoreDomain,
         consumer_slot: str,
         consumer_domain: CoreDomain,
+        transaction_count_or_loop_relation,
         storage_backing: TensorStorageBacking | None,
         source_span: Span,
     ):
@@ -474,6 +445,7 @@ class DFBStorageGroupDescriptor(Node):
             producer_domain,
             consumer_slot,
             consumer_domain,
+            _expr(transaction_count_or_loop_relation),
             storage_backing,
             source_span,
         )
@@ -481,7 +453,11 @@ class DFBStorageGroupDescriptor(Node):
 
 @tvm_ffi.register_object("tl.tenstorrent.AccumulatorDescriptor")
 class AccumulatorDescriptor(Node):
-    """One persistent fragment, retained until all ``full_k_tiles`` updates finish."""
+    """One persistent fragment contract.
+
+    In current shared-grid Device IR, ``accumulator_id`` is local to the active
+    Core; the family Core domain and occurrence relation identify the instance.
+    """
 
     def __init__(self, accumulator_id, accumulator_region, input_dtype, accumulation_dtype, output_dtype, full_k_tiles, source_span):
         self.__init_handle_by_constructor__(
@@ -498,7 +474,11 @@ class AccumulatorDescriptor(Node):
 
 @tvm_ffi.register_object("tl.tenstorrent.ComputeValueDescriptor")
 class ComputeValueDescriptor(Node):
-    """Immutable fragment version; previous and accumulator IDs use -1 when absent."""
+    """Immutable fragment version with Core-local current-stage IDs.
+
+    ``previous_value_id`` and ``accumulator_id`` use -1 when absent. Versioned
+    legacy artifacts retain their historical globally unique ID contract.
+    """
 
     def __init__(self, value_id, buffer, version, previous_value_id, accumulator_id, source_span):
         self.__init_handle_by_constructor__(
@@ -530,7 +510,8 @@ class PipeDescriptor(Node):
     def __init__(
         self,
         pipe_net_id: int,
-        event_index: int,
+        communication_id: int,
+        record_index: int,
         src_coord: CoreCoord,
         dst_begin: CoreCoord,
         dst_end: CoreCoord,
@@ -541,7 +522,8 @@ class PipeDescriptor(Node):
         self.__init_handle_by_constructor__(
             _ffi_api.PipeDescriptor,
             int(pipe_net_id),
-            int(event_index),
+            int(communication_id),
+            int(record_index),
             src_coord,
             dst_begin,
             dst_end,
@@ -559,6 +541,7 @@ class PipeTransferDescriptor(Node):
         self,
         transfer_id: int,
         pipe_net_id: int,
+        communication_id: int,
         record_index: int,
         occurrence: int,
         src_coord: CoreCoord,
@@ -572,6 +555,7 @@ class PipeTransferDescriptor(Node):
             _ffi_api.PipeTransferDescriptor,
             int(transfer_id),
             int(pipe_net_id),
+            int(communication_id),
             int(record_index),
             int(occurrence),
             src_coord,
@@ -734,9 +718,7 @@ __all__ = (
     "COMPUTE_VALUE_TABLE_ATTR",
     "ComputeRequirements",
     "CommunicationDescriptor",
-    "CommunicationStepDescriptor",
     "COMMUNICATION_TABLE_ATTR",
-    "COMMUNICATION_STEP_TABLE_ATTR",
     "ACCUMULATOR_TABLE_ATTR",
     "COMPUTE_REQUIREMENTS_ATTR",
     "COMPUTE_REGION_REQUIREMENTS_ATTR",

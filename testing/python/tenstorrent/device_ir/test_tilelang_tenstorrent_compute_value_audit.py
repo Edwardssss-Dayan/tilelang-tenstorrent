@@ -36,9 +36,7 @@ def test_bf16_value_with_fp32_intermediate_requires_fp32_destination():
                 result[i, j] = T.cast(T.cast(value[i, j], "float32") * T.float32(0.5), "bfloat16")
             T.copy(result, C)
 
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET))
     assert all(str(entry.buffer.dtype) == "bfloat16" for entry in mod.attrs["tt.compute_value_table"])
     requirement = slot_function(mod, "trisc")[1].attrs["tt.compute_requirements"]
     assert requirement.destination_width == "bits32_required"
@@ -69,7 +67,10 @@ def test_raw_accumulator_region_cannot_disagree_with_its_fragment(start, extent)
 def forge_fp32_output(mod):
     import inspect
 
-    from tilelang.tenstorrent.device_ir import DFBDescriptor, TensorDescriptor
+    from tilelang.tenstorrent.device_ir import (
+        DFBStorageGroupDescriptor,
+        TensorDescriptor,
+    )
     from testing.python.tenstorrent.device_ir.test_tilelang_tenstorrent_compute_value_verifier import rewrite_calls
 
     def replace(node, cls, **changes):
@@ -82,12 +83,48 @@ def forge_fp32_output(mod):
     tensor_id = int(tensors[target].global_arg_index)
     tensors[target] = replace(tensors[target], TensorDescriptor, dtype="float32")
     dfbs = list(mod.attrs["tt.dfb_table"])
-    output = next(
-        i for i, dfb in enumerate(dfbs) if dfb.tensor_backing is not None and int(dfb.tensor_backing.global_arg_index) == tensor_id
-    )
+    resource_refs = {}
+    resource_ref_names = {}
+    for function in mod.functions.values():
+        tirx.stmt_functor.post_order_visit(
+            function.body,
+            lambda node: (
+                (
+                    resource_refs.setdefault(node.var, (node.value.op.name, int(node.value.args[0]))),
+                    resource_ref_names.setdefault(str(node.var.name), (node.value.op.name, int(node.value.args[0]))),
+                )
+                if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call)
+                else None
+            ),
+        )
+
+    def resource_id(expr, kind):
+        if isinstance(expr, tirx.Var):
+            reference = resource_refs.get(expr) or resource_ref_names.get(str(expr.name))
+        elif isinstance(expr, tirx.Call):
+            reference = (expr.op.name, int(expr.args[0]))
+        else:
+            reference = None
+        return reference[1] if reference and reference[0] == kind else None
+
+    exports = []
+    for function in mod.functions.values():
+
+        def visit(node):
+            if (
+                isinstance(node, tirx.Call)
+                and node.op.name == "tl.tt.dfb_to_tensor_nd"
+                and resource_id(node.args[1], "tl.tt.tensor_ref") == tensor_id
+            ):
+                exports.append((node, resource_id(node.args[0], "tl.tt.dfb_stream_ref")))
+
+        tirx.stmt_functor.post_order_visit(function.body, visit)
+    ((export, output_id),) = exports
+    output = next(i for i, dfb in enumerate(dfbs) if int(dfb.dfb_id) == output_id)
     dfb_id = int(dfbs[output].dfb_id)
-    dfbs[output] = replace(dfbs[output], DFBDescriptor, element_dtype="float32")
-    mod = mod.with_attr("tt.tensor_table", tensors).with_attr("tt.dfb_table", dfbs).without_attr("tt.l1_payload_bytes")
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
+    groups[dfb_id] = replace(groups[dfb_id], DFBStorageGroupDescriptor, element_dtype="float32")
+    mod = mod.with_attr("tt.tensor_table", tensors).with_attr("tt.dfb_storage_groups", groups).without_attr("tt.l1_payload_bytes")
     symbol, ncrisc = slot_function(mod, "ncrisc")
     buffers = dict(ncrisc.buffer_map)
     for param, buffer in list(buffers.items()):
@@ -97,7 +134,7 @@ def forge_fp32_output(mod):
     mod.update_func(symbol, tirx.PrimFunc(ncrisc.params, ncrisc.body, ncrisc.ret_type, buffers, ncrisc.attrs, ncrisc.span))
 
     def remove_final_cast(call):
-        if call.op.name == "tl.tt.dfb_compute" and int(call.args[0]) == dfb_id:
+        if call.op.name == "tl.tt.dfb_compute" and resource_id(call.args[0], "tl.tt.dfb_stream_ref") == dfb_id:
             attrs = dict(call.annotations)
             expression = attrs["tt.expression"]
             attrs["tt.expression"] = (
@@ -105,7 +142,6 @@ def forge_fp32_output(mod):
                 if isinstance(expression, tirx.Cast) and str(expression.value.dtype) == "float32"
                 else tirx.Cast("float32", expression)
             )
-            attrs["tt.compute_dtype"] = tirx.StringImm("float32")
             attrs["tt.compute_kind"] = tirx.StringImm("elementwise")
             return tirx.Call(call.dtype, call.op, call.args, attrs, call.span)
         return None
@@ -116,11 +152,7 @@ def forge_fp32_output(mod):
 def test_raw_final_tensor_dtype_cannot_bypass_accumulator_capability():
     from testing.python.tenstorrent.frontend.test_tilelang_tenstorrent_frontend02 import gemm_epilogue
 
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(
-            tvm.IRModule({"main": gemm_epilogue("inplace")}), TARGET
-        )
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": gemm_epilogue("inplace")}), TARGET))
     corrupt = forge_fp32_output(mod)
     with pytest.raises(ValueError, match="GEMM final output dtype"):
         corrupt = transform.InferTenstorrentComputeRequirements()(clear_requirements(corrupt))
@@ -169,9 +201,7 @@ def test_raw_dfb_to_fragment_reentry_retains_accumulator_output_contract(explici
             T.copy(storage, reloaded)
             T.copy(reloaded, C)
 
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET))
     values = list(mod.attrs["tt.compute_value_table"])
     (accumulator,) = mod.attrs["tt.accumulator_table"]
     reloaded = [value for value in values if str(value.buffer.name) == "reloaded"]

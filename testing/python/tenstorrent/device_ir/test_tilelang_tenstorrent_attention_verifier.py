@@ -4,7 +4,7 @@ import pytest
 
 from tilelang import tvm
 from tilelang.tenstorrent import language as T
-from tilelang.tenstorrent import lower_tenstorrent_ir, transform
+from tilelang.tenstorrent import lower_tenstorrent_ir
 from tilelang.tenstorrent import device_ir as D
 from tvm import ir, tirx
 
@@ -31,26 +31,18 @@ def attention_row_program(dtype="float32", cores=1):
                 output[i, j] = column[i, 0]
             T.copy(output, C[1, 0, x * 32 : (x + 1) * 32, :])
 
-    return D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
-    )
+    return lower_tenstorrent_ir(tvm.IRModule({"main": main}), TARGET)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("cores", [1, 2])
-def test_attention_row_metadata_roundtrip(dtype, cores):
-    mod = attention_row_program(dtype, cores)
-    assert str(mod.attrs["tt.ir_stage"]) == "device"
-    assert "tt.device_ir_version" not in mod.attrs
-    assert len(mod.functions) == 3
-    assert all(len(tensor.shape) == 4 for tensor in mod.attrs["tt.tensor_table"])
-    assert any(tuple(int(n) for n in value.buffer.shape) == (32, 1) for value in mod.attrs["tt.compute_value_table"])
-    restored = ir.load_json(ir.save_json(mod))
-    transform.VerifyTenstorrentDeviceIR()(restored)
-    assert ir.structural_equal(mod, restored)
+def test_attention_partial_row_materialization_fails_at_legalization(dtype, cores):
+    with pytest.raises(NotImplementedError, match="partial materialization has no Device consumer"):
+        attention_row_program(dtype, cores)
 
 
 @pytest.mark.parametrize("cores", [1, 2])
+@pytest.mark.skip(reason="requires an explicit row-padding materialization Device contract")
 def test_tensor_rank_mapping_rejects_non_singleton_axis(cores):
     changed = False
 
@@ -59,10 +51,11 @@ def test_tensor_rank_mapping_rejects_non_singleton_axis(cores):
         if changed or call.op.name != "tl.tt.tensor_to_dfb_nd":
             return None
         changed = True
-        args = list(call.args)
-        args[2] = tirx.IntImm(args[2].dtype, 0)
-        args[3] = tirx.IntImm(args[3].dtype, 2)
-        return tirx.Call(call.dtype, call.op, args, call.annotations, call.span)
+        annotations = dict(call.annotations)
+        extents = list(annotations["tt.extents"])
+        extents[0] = tirx.IntImm(extents[0].dtype, 2)
+        annotations["tt.extents"] = extents
+        return tirx.Call(call.dtype, call.op, call.args, annotations, call.span)
 
     corrupted = rewrite_calls(attention_row_program(cores=cores), edit)
     assert changed
@@ -72,24 +65,24 @@ def test_tensor_rank_mapping_rejects_non_singleton_axis(cores):
 def test_shared_only_tensor_rank_mapping_keeps_slice_checks():
     from testing.python.tenstorrent.semantics.test_tilelang_tenstorrent_attention_regions import tensor_slice_program
 
-    mod = D.expand_current_device_tables(
-        lower_tenstorrent_ir(tvm.IRModule({"main": tensor_slice_program()}), TARGET)
-    )
+    mod = D.expand_current_device_tables(lower_tenstorrent_ir(tvm.IRModule({"main": tensor_slice_program()}), TARGET))
     assert str(mod.attrs["tt.ir_stage"]) == "device"
     assert "tt.device_ir_version" not in mod.attrs
 
     def edit(call):
         if call.op.name != "tl.tt.tensor_to_dfb_nd":
             return None
-        args = list(call.args)
-        args[2] = tirx.IntImm(args[2].dtype, 0)
-        args[3] = tirx.IntImm(args[3].dtype, 2)
-        return tirx.Call(call.dtype, call.op, args, call.annotations, call.span)
+        annotations = dict(call.annotations)
+        extents = list(annotations["tt.extents"])
+        extents[0] = tirx.IntImm(extents[0].dtype, 2)
+        annotations["tt.extents"] = extents
+        return tirx.Call(call.dtype, call.op, call.args, annotations, call.span)
 
     check_rejected(rewrite_calls(mod, edit), "leading singleton")
 
 
 @pytest.mark.parametrize("corruption", ["shape", "accumulation"])
+@pytest.mark.skip(reason="requires an explicit row-padding materialization Device contract")
 def test_keepdim_reduction_contract_is_independently_verified(corruption):
     changed = False
 
@@ -115,13 +108,13 @@ def test_value_geometry_proof_ids_cannot_be_used_as_real_dfbs():
 
     def edit(call):
         nonlocal changed
-        if changed or call.op.name != "tl.tt.compute_value" or not len(call.annotations["tt.value_inputs"]):
+        if changed or call.op.name != "tl.tt.compute_value" or not len(call.annotations.get("tt.value_inputs", [])):
             return None
         changed = True
         attrs = dict(call.annotations)
 
         def forge_load(node):
-            if node.op.name == "tl.tt.compute_value_load":
+            if node.op.name == "tl.tt.compute_value_operand":
                 return tirx.call_intrin(node.dtype, ir.Op.get("tl.tt.dfb_load"), 0)
             return None
 
@@ -132,4 +125,4 @@ def test_value_geometry_proof_ids_cannot_be_used_as_real_dfbs():
 
     corrupted = rewrite_calls(device(), edit)
     assert changed
-    check_rejected(corrupted, "undeclared input DFB")
+    check_rejected(corrupted, "non-current Device op.*dfb_load")

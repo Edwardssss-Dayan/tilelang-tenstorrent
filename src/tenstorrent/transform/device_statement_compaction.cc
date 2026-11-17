@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/creator.h>
 #include <tvm/ir/module.h>
 #include <tvm/ir/op.h>
@@ -23,11 +24,14 @@
 namespace tvm {
 namespace tl {
 namespace tenstorrent {
+static tirx::Stmt ScheduleLocalDFBWaits(const tirx::Stmt &body);
 namespace {
 using namespace tirx;
 
 constexpr int64_t kMaxExpansion = 4000000;
 constexpr size_t kMaxBlock = 4096;
+
+std::vector<size_t> DFBOperandPositions(const Call &call);
 
 [[noreturn]] void Invalid(const char *message) {
   TVM_FFI_THROW(ValueError) << "[TenstorrentDeviceStatements] " << message;
@@ -118,13 +122,13 @@ size_t CoreLocalHash(const ffi::ObjectRef &object) {
     hash = Combine(hash, ScalarHash(buffer.value()->dtype));
     hash = Combine(hash, ffi::StructuralHash()(buffer.value()->shape));
     hash = Combine(hash, ffi::StructuralHash()(buffer.value()->strides));
-    hash = Combine(hash,
-                   ffi::StructuralHash()(buffer.value()->axis_separators));
+    hash =
+        Combine(hash, ffi::StructuralHash()(buffer.value()->axis_separators));
     hash = Combine(hash, ffi::StructuralHash()(buffer.value()->elem_offset));
     hash = Combine(hash, std::hash<int>()(buffer.value()->data_alignment));
     hash = Combine(hash, std::hash<int>()(buffer.value()->offset_factor));
-    hash = Combine(hash,
-                   std::hash<int>()(static_cast<int>(buffer.value()->buffer_type)));
+    hash = Combine(
+        hash, std::hash<int>()(static_cast<int>(buffer.value()->buffer_type)));
     return Combine(hash, CoreLocalHash(buffer.value()->span));
   }
   if (auto variable = object.as<Var>()) {
@@ -144,8 +148,7 @@ size_t CoreLocalHash(const ffi::ObjectRef &object) {
   return Combine(hash, ScalarHash(object));
 }
 
-bool SameCoreLocal(const ffi::ObjectRef &left,
-                   const ffi::ObjectRef &right) {
+bool SameCoreLocal(const ffi::ObjectRef &left, const ffi::ObjectRef &right) {
   if (!left.defined() || !right.defined())
     return left.defined() == right.defined();
   if (auto a = left.as<Buffer>()) {
@@ -203,9 +206,8 @@ size_t Describe(const ffi::Any &value, std::vector<IntImm> *integers,
     hash = Combine(hash, ScalarHash(integer.value()->dtype));
     return Combine(hash, ScalarHash(integer.value()->span));
   }
-  if (semantic_core_locals &&
-      (ref.as<BufferNode>() || ref.as<VarNode>() || ref.as<SpanNode>() ||
-       ref.as<SourceNameNode>()))
+  if (semantic_core_locals && (ref.as<BufferNode>() || ref.as<VarNode>() ||
+                               ref.as<SpanNode>() || ref.as<SourceNameNode>()))
     return CoreLocalHash(ref);
   if (Opaque(ref) || (!Container(ref) &&
                       !ffi::HasCreator(TVMFFIGetTypeInfo(ref->type_index()))))
@@ -214,10 +216,9 @@ size_t Describe(const ffi::Any &value, std::vector<IntImm> *integers,
   hash = Combine(hash, fields.size());
   bool map = ref.as<ffi::Map<ffi::Any, ffi::Any>>().has_value();
   for (size_t i = 0; i < fields.size(); ++i)
-    hash = Combine(hash,
-                   map && i % 2 == 0
-                       ? ScalarHash(fields[i])
-                       : Describe(fields[i], integers, semantic_core_locals));
+    hash = Combine(hash, map && i % 2 == 0 ? ScalarHash(fields[i])
+                                           : Describe(fields[i], integers,
+                                                      semantic_core_locals));
   return hash;
 }
 
@@ -249,9 +250,64 @@ bool SameSkeleton(const ffi::Any &a, const ffi::Any &b,
     return false;
   bool map = x.value().as<ffi::Map<ffi::Any, ffi::Any>>().has_value();
   for (size_t i = 0; i < lhs.size(); ++i)
-    if (!(map && i % 2 == 0 ? ScalarEqual(lhs[i], rhs[i])
-                            : SameSkeleton(lhs[i], rhs[i],
-                                           semantic_core_locals)))
+    if (!(map && i % 2 == 0
+              ? ScalarEqual(lhs[i], rhs[i])
+              : SameSkeleton(lhs[i], rhs[i], semantic_core_locals)))
+      return false;
+  return true;
+}
+
+bool SameDFBOperands(const Stmt &left, const Stmt &right) {
+  auto collect = [](const Stmt &statement) {
+    std::vector<PrimExpr> operands;
+    PostOrderVisit(statement, [&](const ffi::ObjectRef &object) {
+      const auto *node = object.as<CallNode>();
+      if (!node)
+        return;
+      Call call = ffi::GetRef<Call>(node);
+      for (size_t position : DFBOperandPositions(call)) {
+        if (position >= call->args.size())
+          Invalid("Device DFB operation is missing an operand");
+        operands.push_back(call->args[position]);
+      }
+    });
+    return operands;
+  };
+  std::vector<PrimExpr> lhs = collect(left), rhs = collect(right);
+  if (lhs.size() != rhs.size())
+    return false;
+  for (size_t index = 0; index < lhs.size(); ++index)
+    if (!ffi::StructuralEqual()(lhs[index], rhs[index]))
+      return false;
+  return true;
+}
+
+bool SameControlIdentities(const Stmt &left, const Stmt &right) {
+  struct Signature {
+    std::vector<PrimExpr> predicates;
+    std::vector<ffi::ObjectRef> annotations;
+  };
+  auto collect = [](const Stmt &statement) {
+    Signature signature;
+    PostOrderVisit(statement, [&](const ffi::ObjectRef &object) {
+      if (const auto *branch = object.as<IfThenElseNode>())
+        signature.predicates.push_back(branch->condition);
+      else if (const auto *realize = object.as<SBlockRealizeNode>())
+        signature.predicates.push_back(realize->predicate);
+      else if (const auto *block = object.as<SBlockNode>())
+        signature.annotations.push_back(block->annotations);
+    });
+    return signature;
+  };
+  Signature lhs = collect(left), rhs = collect(right);
+  if (lhs.predicates.size() != rhs.predicates.size() ||
+      lhs.annotations.size() != rhs.annotations.size())
+    return false;
+  for (size_t index = 0; index < lhs.predicates.size(); ++index)
+    if (!ffi::StructuralEqual()(lhs.predicates[index], rhs.predicates[index]))
+      return false;
+  for (size_t index = 0; index < lhs.annotations.size(); ++index)
+    if (!ffi::StructuralEqual()(lhs.annotations[index], rhs.annotations[index]))
       return false;
   return true;
 }
@@ -401,11 +457,15 @@ private:
       return value.dtype() == dtype ? value : Cast(dtype, value);
     };
     if (column.x_step)
-      result = result + coordinate(tenstorrent::core_x()) *
-                            IntImm(dtype, column.x_step);
+      result = Add(result,
+                   Mul(coordinate(tenstorrent::core_x()),
+                       IntImm(dtype, column.x_step), integer.value()->span),
+                   integer.value()->span);
     if (column.y_step)
-      result = result + coordinate(tenstorrent::core_y()) *
-                            IntImm(dtype, column.y_step);
+      result = Add(result,
+                   Mul(coordinate(tenstorrent::core_y()),
+                       IntImm(dtype, column.y_step), integer.value()->span),
+                   integer.value()->span);
     return result;
   }
 
@@ -432,9 +492,8 @@ bool FitCoreAffine(const std::vector<DeviceCoreBody> &points,
   if (points.empty() || points.size() != values.size())
     return false;
   const int64_t x0 = points[0].x, y0 = points[0].y, value0 = values[0];
-  bool constant =
-      std::all_of(values.begin(), values.end(),
-                  [&](int64_t value) { return value == value0; });
+  bool constant = std::all_of(values.begin(), values.end(),
+                              [&](int64_t value) { return value == value0; });
   if (constant) {
     *result = {value0, 0, 0};
     return Fits(value0, dtype);
@@ -521,8 +580,8 @@ TryParameterizeCoreBody(const std::vector<DeviceCoreBody> &points) {
     for (const StatementInfo &description : descriptions)
       values.push_back(description.integers[column]->value);
     CoreAffineColumn relation;
-    if (!FitCoreAffine(points, values,
-                       descriptions[0].integers[column]->dtype, &relation))
+    if (!FitCoreAffine(points, values, descriptions[0].integers[column]->dtype,
+                       &relation))
       return std::nullopt;
     columns.push_back(relation);
   }
@@ -574,33 +633,39 @@ PartitionRectangles(const std::vector<DeviceCoreBody> &bodies) {
   return rectangles;
 }
 
-PrimExpr CoreRangePredicate(const CoreRectangle &rectangle) {
+PrimExpr CoreRangePredicate(const CoreRectangle &rectangle, int64_t grid_x,
+                            int64_t grid_y) {
   PrimExpr x = Call(DataType::Int(32), tenstorrent::core_x(), {});
   PrimExpr y = Call(DataType::Int(32), tenstorrent::core_y(), {});
-  PrimExpr x_active = rectangle.end_x == rectangle.begin_x + 1
-                          ? x == Integer(rectangle.begin_x)
-                          : x >= Integer(rectangle.begin_x) &&
-                                x < Integer(rectangle.end_x);
-  PrimExpr y_active = rectangle.end_y == rectangle.begin_y + 1
-                          ? y == Integer(rectangle.begin_y)
-                          : y >= Integer(rectangle.begin_y) &&
-                                y < Integer(rectangle.end_y);
+  PrimExpr x_active =
+      rectangle.end_x == rectangle.begin_x + 1
+          ? x == Integer(rectangle.begin_x)
+          : x >= Integer(rectangle.begin_x) && x < Integer(rectangle.end_x);
+  PrimExpr y_active =
+      rectangle.end_y == rectangle.begin_y + 1
+          ? y == Integer(rectangle.begin_y)
+          : y >= Integer(rectangle.begin_y) && y < Integer(rectangle.end_y);
+  bool full_x = rectangle.begin_x == 0 && rectangle.end_x == grid_x;
+  bool full_y = rectangle.begin_y == 0 && rectangle.end_y == grid_y;
+  if (full_x)
+    return y_active;
+  if (full_y)
+    return x_active;
   return x_active && y_active;
 }
 
 void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
-                                int64_t grid_y,
-                                const ffi::String &owner_slot,
+                                int64_t grid_y, const ffi::String &owner_slot,
                                 const Span &fallback_span,
+                                const ffi::String &block_name,
+                                ffi::Optional<Integer> work_group,
                                 ffi::Array<Stmt> *result) {
-  ffi::Optional<Stmt> parameterized =
-      TryParameterizeCoreBody(rectangle.points);
+  ffi::Optional<Stmt> parameterized = TryParameterizeCoreBody(rectangle.points);
   if (!parameterized.has_value() && rectangle.points.size() > 1) {
     bool split_x = rectangle.end_x - rectangle.begin_x >=
                    rectangle.end_y - rectangle.begin_y;
-    int64_t middle = split_x
-                         ? (rectangle.begin_x + rectangle.end_x) / 2
-                         : (rectangle.begin_y + rectangle.end_y) / 2;
+    int64_t middle = split_x ? (rectangle.begin_x + rectangle.end_x) / 2
+                             : (rectangle.begin_y + rectangle.end_y) / 2;
     CoreRectangle first = rectangle, second = rectangle;
     first.points.clear();
     second.points.clear();
@@ -616,28 +681,78 @@ void EmitParameterizedRectangle(const CoreRectangle &rectangle, int64_t grid_x,
           .push_back(point);
     if (!first.points.empty())
       EmitParameterizedRectangle(first, grid_x, grid_y, owner_slot,
-                                 fallback_span, result);
+                                 fallback_span, block_name, work_group, result);
     if (!second.points.empty())
       EmitParameterizedRectangle(second, grid_x, grid_y, owner_slot,
-                                 fallback_span, result);
+                                 fallback_span, block_name, work_group, result);
     return;
   }
   if (!parameterized.has_value())
     Invalid("singleton Core body could not be parameterized");
-  Stmt body = CompactDeviceStatementsRecursive(parameterized.value());
+  // Current formation preserves source structured loops. Keep only the local
+  // wait scheduling normalization here; statement compaction is a legacy
+  // artifact compatibility operation, not a current Lower reconstruction step.
+  Stmt body = ScheduleLocalDFBWaits(parameterized.value());
   Span span = body->span.defined() ? body->span : fallback_span;
   CoreDomain domain(CoreCoord(rectangle.begin_x, rectangle.begin_y),
                     CoreCoord(rectangle.end_x, rectangle.end_y));
-  SBlock work({}, {}, {}, "tt_device_core_work", body, std::nullopt, {}, {},
-              {{"tt.core_domain", domain}, {"tt.owner_slot", owner_slot}},
+  ffi::Map<ffi::String, ffi::Any> annotations{{"tt.core_domain", domain},
+                                              {"tt.owner_slot", owner_slot}};
+  if (work_group.has_value())
+    annotations.Set("tt.work_group", work_group.value());
+  if (block_name == "tt_device_stream_work") {
+    bool sends = false, receives = false;
+    std::set<int64_t> communication_ids, pipe_net_ids;
+    PostOrderVisit(body, [&](const ffi::ObjectRef &object) {
+      const auto *node = object.as<CallNode>();
+      if (!node)
+        return;
+      sends |= node->op.same_as(tenstorrent::dfb_pipe_send()) ||
+               node->op.same_as(tenstorrent::dfb_pipe_send_record());
+      receives |= node->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+                  node->op.same_as(tenstorrent::dfb_pipe_recv_record());
+      auto communication =
+          node->annotations.Get("tt.internal_communication_id");
+      if (communication.has_value()) {
+        auto integer = communication.value().as<Integer>();
+        if (!integer.has_value())
+          Invalid("internal communication ID must be an integer");
+        communication_ids.insert(integer.value()->value);
+      }
+      if (node->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
+          node->op.same_as(tenstorrent::dfb_pipe_recv_record()) ||
+          node->op.same_as(tenstorrent::dfb_pipe_wait_record())) {
+        const int64_t *pipe_net = as_const_int(node->args[0]);
+        if (!pipe_net)
+          Invalid("PipeNet ID must be static before Core parameterization");
+        pipe_net_ids.insert(*pipe_net);
+      }
+    });
+    if (sends && receives)
+      Invalid("one communication role region cannot send and receive");
+    if (sends || receives) {
+      annotations.Set("tt.communication_role",
+                      ffi::String(sends ? "source" : "destination"));
+      ffi::Array<Integer> communication_array, pipe_net_array;
+      for (int64_t communication : communication_ids)
+        communication_array.push_back(Integer(communication));
+      for (int64_t pipe_net : pipe_net_ids)
+        pipe_net_array.push_back(Integer(pipe_net));
+      if (communication_array.empty() || pipe_net_array.empty())
+        Invalid("communication role region has no communication or PipeNet ID");
+      annotations.Set("tt.communication_ids", communication_array);
+      annotations.Set("tt.pipe_net_ids", pipe_net_array);
+    }
+  }
+  SBlock work({}, {}, {}, block_name, body, std::nullopt, {}, {}, annotations,
               span);
   Stmt realize = SBlockRealize({}, const_true(), work, span);
   if (rectangle.begin_x == 0 && rectangle.begin_y == 0 &&
       rectangle.end_x == grid_x && rectangle.end_y == grid_y)
     result->push_back(realize);
   else
-    result->push_back(
-        IfThenElse(CoreRangePredicate(rectangle), realize, std::nullopt, span));
+    result->push_back(IfThenElse(CoreRangePredicate(rectangle, grid_x, grid_y),
+                                 realize, std::nullopt, span));
 }
 
 class AffineReader : public ObjectRewriter {
@@ -695,8 +810,6 @@ private:
 int64_t ExpandedCount(const Stmt &body, int64_t limit, size_t depth = 0) {
   if (depth > 64)
     Invalid("compact statement nesting exceeds the limit of 64");
-  if (body.as<EvaluateNode>())
-    return 1;
   if (auto sequence = body.as<SeqStmt>()) {
     if (sequence.value()->seq.empty())
       Invalid("compact statement sequences must not be empty");
@@ -711,7 +824,7 @@ int64_t ExpandedCount(const Stmt &body, int64_t limit, size_t depth = 0) {
   }
   auto loop = body.as<For>();
   if (!loop.has_value())
-    Invalid("only Evaluate, SeqStmt and serial loops can be expanded");
+    return 1;
   auto minimum = loop.value()->min.as<IntImm>();
   auto extent = loop.value()->extent.as<IntImm>();
   auto step = loop.value()->step;
@@ -754,6 +867,22 @@ void Expand(const Stmt &body, AffineReader::Bindings *bindings,
       Expand(loop.value()->body, bindings, output);
     }
     bindings->erase(variable);
+  } else if (auto branch = body.as<IfThenElse>()) {
+    ffi::Map<Var, PrimExpr> replacements;
+    for (const auto &[variable, value] : *bindings)
+      replacements.Set(variable,
+                       IntImm(variable.dtype(), value, variable->span));
+    PrimExpr condition = Substitute(branch.value()->condition, replacements);
+    condition = arith::Analyzer().Simplify(condition);
+    if (const int64_t *selected = as_const_int(condition)) {
+      if (*selected)
+        Expand(branch.value()->then_case, bindings, output);
+      else if (branch.value()->else_case.has_value())
+        Expand(branch.value()->else_case.value(), bindings, output);
+    } else {
+      AffineReader reader(*bindings);
+      output->push_back(Downcast<Stmt>(reader.Rewrite(body)));
+    }
   } else {
     AffineReader reader(*bindings);
     output->push_back(Downcast<Stmt>(reader.Rewrite(body)));
@@ -761,7 +890,124 @@ void Expand(const Stmt &body, AffineReader::Bindings *bindings,
 }
 } // namespace
 
-Stmt CompactDeviceStatements(const Stmt &body) {
+static bool ReferencesDFBResource(const Stmt &statement, int64_t resource) {
+  bool referenced = false;
+  PostOrderVisit(statement, [&](const ffi::ObjectRef &object) {
+    const auto *node = object.as<CallNode>();
+    if (!node)
+      return;
+    Call call = ffi::GetRef<Call>(node);
+    for (size_t operand : DFBOperandPositions(call))
+      if (operand < call->args.size()) {
+        const int64_t *value = as_const_int(call->args[operand]);
+        referenced |= !value || *value == resource;
+      }
+  });
+  return referenced;
+}
+
+static bool ProducesLocalDFBResource(const Stmt &statement, int64_t resource) {
+  const auto *evaluate = statement.as<EvaluateNode>();
+  const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+  if (!call)
+    return false;
+  size_t output;
+  if (call->op.same_as(tenstorrent::dfb_compute()))
+    output = 0;
+  else if (call->op.same_as(tenstorrent::compute_value_store()))
+    output = 1;
+  else
+    return false;
+  const int64_t *value =
+      output < call->args.size() ? as_const_int(call->args[output]) : nullptr;
+  return value && *value == resource;
+}
+
+static bool ReleasesDFBResource(const Stmt &statement, int64_t resource) {
+  const auto *evaluate = statement.as<EvaluateNode>();
+  const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+  const int64_t *value = call && call->op.same_as(tenstorrent::dfb_release()) &&
+                                 call->args.size() == 1
+                             ? as_const_int(call->args[0])
+                             : nullptr;
+  return value && *value == resource;
+}
+
+// A TRISC-local result can be awaited once its producing instruction has been
+// issued. Keep the following wait next to that transaction instead of after an
+// unrelated compute phase. This exposes the original serial period without
+// moving waits for Tensor, Pipe, or other cross-slot producers.
+static Stmt ScheduleLocalDFBWaits(const Stmt &body) {
+  auto sequence = body.as<SeqStmt>();
+  if (!sequence.has_value())
+    return body;
+  std::vector<Stmt> statements(sequence.value()->seq.begin(),
+                               sequence.value()->seq.end());
+  bool changed = false;
+  for (size_t index = 0; index < statements.size(); ++index) {
+    const auto *evaluate = statements[index].as<EvaluateNode>();
+    const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+    const int64_t *resource =
+        call && call->op.same_as(tenstorrent::dfb_wait()) &&
+                call->args.size() == 1
+            ? as_const_int(call->args[0])
+            : nullptr;
+    if (!resource)
+      continue;
+    size_t producer = index;
+    for (size_t cursor = index; cursor > 0;) {
+      --cursor;
+      if (ProducesLocalDFBResource(statements[cursor], *resource)) {
+        producer = cursor;
+        break;
+      }
+      if (ReferencesDFBResource(statements[cursor], *resource) &&
+          !ReleasesDFBResource(statements[cursor], *resource))
+        break;
+    }
+    if (producer == index)
+      continue;
+    size_t target = producer + 1;
+    for (size_t cursor = target; cursor < index; ++cursor)
+      if (ReferencesDFBResource(statements[cursor], *resource))
+        target = cursor + 1;
+    if (target == index)
+      continue;
+    Span producer_span = statements[producer]->span;
+    ffi::Array<PrimExpr> wait_args;
+    for (const PrimExpr &arg : call->args) {
+      if (auto integer = arg.as<IntImm>())
+        wait_args.push_back(IntImm(integer.value()->dtype,
+                                   integer.value()->value, producer_span));
+      else
+        wait_args.push_back(arg);
+    }
+    auto wait_annotations = call->annotations;
+    auto identity = wait_annotations.Get("tt.stream_identity");
+    if (identity.has_value()) {
+      ffi::Array<Integer> normalized;
+      for (const Integer &value :
+           Downcast<ffi::Array<Integer>>(identity.value()))
+        normalized.push_back(IntImm(value->dtype, value->value, producer_span));
+      wait_annotations.Set("tt.stream_identity", normalized);
+    }
+    Stmt wait = Evaluate(
+        Call(call->dtype, call->op, wait_args, wait_annotations, producer_span),
+        producer_span);
+    statements.erase(statements.begin() + index);
+    statements.insert(statements.begin() + target, wait);
+    changed = true;
+    --index;
+  }
+  if (!changed)
+    return body;
+  ffi::Array<Stmt> scheduled(statements.begin(), statements.end());
+  return SeqStmt(scheduled, body->span);
+}
+
+static Stmt CompactDeviceStatementsImpl(const Stmt &body,
+                                        bool semantic_core_locals,
+                                        bool allow_dfb_variants = false) {
   auto sequence = body.as<SeqStmt>();
   if (!sequence.has_value() || sequence.value()->seq.size() < 2)
     return body;
@@ -772,11 +1018,13 @@ Stmt CompactDeviceStatements(const Stmt &body) {
   std::vector<uint64_t> prefix(count + 1), powers(count + 1, 1);
   constexpr uint64_t kBase = 1000000007;
   for (size_t i = 0; i < count; ++i) {
-    const auto *evaluate = statements[i].as<EvaluateNode>();
-    if (!evaluate || !evaluate->value.as<CallNode>())
-      return body;
+    if (!semantic_core_locals) {
+      const auto *evaluate = statements[i].as<EvaluateNode>();
+      if (!evaluate || !evaluate->value.as<CallNode>())
+        return body;
+    }
     StatementInfo item;
-    item.hash = Describe(statements[i], &item.integers);
+    item.hash = Describe(statements[i], &item.integers, semantic_core_locals);
     positions[item.hash].push_back(i);
     prefix[i + 1] = prefix[i] * kBase + item.hash;
     powers[i + 1] = powers[i] * kBase;
@@ -790,6 +1038,7 @@ Stmt CompactDeviceStatements(const Stmt &body) {
   for (size_t begin = 0; begin < count;) {
     size_t best_length = 0, best_repeats = 0, best_saving = 0;
     std::vector<std::vector<int64_t>> best_steps;
+    std::vector<bool> best_dfb_variants;
     const auto &candidates = positions.at(info[begin].hash);
     auto next = std::upper_bound(candidates.begin(), candidates.end(), begin);
     size_t attempts = 0;
@@ -807,16 +1056,26 @@ Stmt CompactDeviceStatements(const Stmt &body) {
       if (!same_block(begin, begin + length, length))
         continue;
       std::vector<std::vector<int64_t>> steps(length);
+      std::vector<bool> dfb_variants(length, false);
       bool valid = true;
       for (size_t j = 0; j < length && valid; ++j) {
         const auto &first = info[begin + j].integers;
         const auto &second = info[begin + length + j].integers;
         if (first.size() != second.size() ||
-            !SameSkeleton(statements[begin + j],
-                          statements[begin + length + j])) {
+            !SameSkeleton(statements[begin + j], statements[begin + length + j],
+                          semantic_core_locals) ||
+            (semantic_core_locals && !allow_dfb_variants &&
+             !SameDFBOperands(statements[begin + j],
+                              statements[begin + length + j])) ||
+            (semantic_core_locals &&
+             !SameControlIdentities(statements[begin + j],
+                                    statements[begin + length + j]))) {
           valid = false;
           break;
         }
+        dfb_variants[j] = allow_dfb_variants &&
+                          !SameDFBOperands(statements[begin + j],
+                                           statements[begin + length + j]);
         for (size_t k = 0; k < first.size(); ++k) {
           __int128 step = __int128{second[k]->value} - first[k]->value;
           if (step < std::numeric_limits<int64_t>::min() ||
@@ -836,11 +1095,23 @@ Stmt CompactDeviceStatements(const Stmt &body) {
              same_block(begin, begin + repeats * length, length)) {
         valid = true;
         for (size_t j = 0; j < length && valid; ++j) {
+          if (dfb_variants[j]) {
+            valid = false;
+            break;
+          }
           const auto &first = info[begin + j].integers;
           const auto &current = info[begin + repeats * length + j].integers;
           if (first.size() != current.size() ||
               !SameSkeleton(statements[begin + j],
-                            statements[begin + repeats * length + j])) {
+                            statements[begin + repeats * length + j],
+                            semantic_core_locals) ||
+              (semantic_core_locals &&
+               !SameDFBOperands(statements[begin + j],
+                                statements[begin + repeats * length + j])) ||
+              (semantic_core_locals &&
+               !SameControlIdentities(
+                   statements[begin + j],
+                   statements[begin + repeats * length + j]))) {
             valid = false;
             break;
           }
@@ -856,12 +1127,17 @@ Stmt CompactDeviceStatements(const Stmt &body) {
           break;
         ++repeats;
       }
-      size_t saving = length * (repeats - 1) - 1;
+      size_t variant_count =
+          std::count(dfb_variants.begin(), dfb_variants.end(), true);
+      size_t raw_saving = length * (repeats - 1) - 1;
+      size_t saving =
+          raw_saving > variant_count ? raw_saving - variant_count : 0;
       if (saving > best_saving) {
         best_saving = saving;
         best_length = length;
         best_repeats = repeats;
         best_steps = std::move(steps);
+        best_dfb_variants = std::move(dfb_variants);
       }
     }
     if (!best_length) {
@@ -871,6 +1147,12 @@ Stmt CompactDeviceStatements(const Stmt &body) {
     Var iteration("tt_compact_iteration", DataType::Int(64));
     ffi::Array<Stmt> loop_body;
     for (size_t j = 0; j < best_length; ++j) {
+      if (best_dfb_variants[j]) {
+        loop_body.push_back(IfThenElse(
+            EQ(iteration, IntImm(DataType::Int(64), 0)), statements[begin + j],
+            statements[begin + best_length + j]));
+        continue;
+      }
       AffineWriter writer(best_steps[j], iteration);
       loop_body.push_back(
           Downcast<Stmt>(writer.Rewrite(statements[begin + j])));
@@ -891,28 +1173,172 @@ Stmt CompactDeviceStatements(const Stmt &body) {
   return loop;
 }
 
+static bool SameConcreteGeneratedStatement(const Stmt &expected,
+                                           const Stmt &actual) {
+  std::vector<IntImm> expected_integers, actual_integers;
+  if (Describe(expected, &expected_integers, /*semantic_core_locals=*/true) !=
+          Describe(actual, &actual_integers,
+                   /*semantic_core_locals=*/true) ||
+      expected_integers.size() != actual_integers.size() ||
+      !SameSkeleton(expected, actual, /*semantic_core_locals=*/true) ||
+      !SameDFBOperands(expected, actual) ||
+      !SameControlIdentities(expected, actual))
+    return false;
+  for (size_t index = 0; index < expected_integers.size(); ++index)
+    if (expected_integers[index]->value != actual_integers[index]->value)
+      return false;
+  return true;
+}
+
+static bool IsTerminalRelease(const ffi::Array<Stmt> &statements,
+                              size_t position) {
+  const auto *evaluate = statements[position].as<EvaluateNode>();
+  const auto *call = evaluate ? evaluate->value.as<CallNode>() : nullptr;
+  const int64_t *resource =
+      call && call->op.same_as(tenstorrent::dfb_release()) &&
+              call->args.size() == 1
+          ? as_const_int(call->args[0])
+          : nullptr;
+  if (!resource)
+    return false;
+  for (size_t index = position + 1; index < statements.size(); ++index) {
+    bool referenced = false;
+    PostOrderVisit(statements[index], [&](const ffi::ObjectRef &object) {
+      const auto *node = object.as<CallNode>();
+      if (!node)
+        return;
+      Call later = ffi::GetRef<Call>(node);
+      for (size_t operand : DFBOperandPositions(later))
+        if (operand < later->args.size()) {
+          const int64_t *value = as_const_int(later->args[operand]);
+          referenced |= !value || *value == *resource;
+        }
+    });
+    if (referenced)
+      return false;
+  }
+  return true;
+}
+
+static Stmt ExtendGeneratedCompactLoops(const Stmt &body) {
+  auto sequence = body.as<SeqStmt>();
+  if (!sequence.has_value())
+    return body;
+  const ffi::Array<Stmt> &statements = sequence.value()->seq;
+  ffi::Array<Stmt> result;
+  bool changed = false;
+  for (size_t index = 0; index < statements.size();) {
+    auto candidate = statements[index].as<For>();
+    if (!candidate.has_value() ||
+        std::string(candidate.value()->loop_var->name_hint)
+                .rfind("tt_compact_iteration", 0) != 0) {
+      result.push_back(statements[index++]);
+      continue;
+    }
+    auto extent = candidate.value()->extent.as<IntImm>();
+    if (!extent.has_value()) {
+      result.push_back(statements[index++]);
+      continue;
+    }
+    ffi::Array<Stmt> template_statements;
+    if (auto template_sequence = candidate.value()->body.as<SeqStmt>())
+      template_statements = template_sequence.value()->seq;
+    else
+      template_statements = {candidate.value()->body};
+    int64_t repeats = extent.value()->value;
+    size_t consumed = 1;
+    ffi::Array<Stmt> deferred_releases;
+    while (repeats < kMaxExpansion && consumed < statements.size() - index) {
+      AffineReader::Bindings bindings{{candidate.value()->loop_var, repeats}};
+      AffineReader reader(bindings);
+      bool continuation = true;
+      size_t cursor = index + consumed;
+      ffi::Array<Stmt> iteration_releases;
+      for (size_t item = 0; item < template_statements.size(); ++item) {
+        Stmt expected =
+            Downcast<Stmt>(reader.Rewrite(template_statements[item]));
+        while (cursor < statements.size() &&
+               !SameConcreteGeneratedStatement(expected, statements[cursor]) &&
+               IsTerminalRelease(statements, cursor))
+          iteration_releases.push_back(statements[cursor++]);
+        if (cursor >= statements.size() ||
+            !SameConcreteGeneratedStatement(expected, statements[cursor])) {
+          continuation = false;
+          break;
+        }
+        ++cursor;
+      }
+      if (!continuation)
+        break;
+      consumed = cursor - index;
+      for (const Stmt &release : iteration_releases)
+        deferred_releases.push_back(release);
+      ++repeats;
+    }
+    if (repeats != extent.value()->value) {
+      For extended = candidate.value();
+      extended.CopyOnWrite()->extent =
+          IntImm(extent.value()->dtype, repeats, extent.value()->span);
+      result.push_back(extended);
+      for (const Stmt &release : deferred_releases)
+        result.push_back(release);
+      changed = true;
+    } else {
+      result.push_back(statements[index]);
+    }
+    index += consumed;
+  }
+  return changed ? SeqStmt(result, body->span) : body;
+}
+
+Stmt CompactDeviceStatements(const Stmt &body) {
+  return CompactDeviceStatementsImpl(body, /*semantic_core_locals=*/false,
+                                     /*allow_dfb_variants=*/false);
+}
+
 namespace {
 class NestedDeviceStatementCompactor : public StmtMutator {
+public:
+  explicit NestedDeviceStatementCompactor(bool semantic_core_locals)
+      : semantic_core_locals_(semantic_core_locals) {}
+
+private:
   Stmt VisitStmt_(const ForNode *op) final {
     For loop = ffi::GetRef<For>(op);
-    Stmt body = CompactDeviceStatementsRecursive(op->body);
+    bool generated_compact_loop =
+        semantic_core_locals_ &&
+        std::string(op->loop_var->name_hint).rfind("tt_compact_iteration", 0) ==
+            0;
+    Stmt normalized =
+        semantic_core_locals_ ? ScheduleLocalDFBWaits(op->body) : op->body;
+    Stmt body = CompactDeviceStatementsImpl(normalized, semantic_core_locals_,
+                                            generated_compact_loop);
+    if (semantic_core_locals_)
+      body = ExtendGeneratedCompactLoops(body);
+    body = NestedDeviceStatementCompactor(semantic_core_locals_)(body);
     if (body.same_as(op->body))
       return loop;
     loop.CopyOnWrite()->body = std::move(body);
     return loop;
   }
+
+  bool semantic_core_locals_;
 };
 } // namespace
 
 Stmt CompactDeviceStatementsRecursive(const Stmt &body) {
   Stmt compact = CompactDeviceStatements(body);
-  NestedDeviceStatementCompactor nested;
+  NestedDeviceStatementCompactor nested(/*semantic_core_locals=*/false);
   return nested(compact);
 }
 
-Stmt ParameterizeDeviceCoreStatements(
+namespace {
+
+Stmt ParameterizeDeviceCoreStatementsImpl(
     const std::vector<DeviceCoreBody> &bodies, int64_t grid_x, int64_t grid_y,
-    const ffi::String &owner_slot, const Span &span) {
+    const ffi::String &owner_slot, const Span &span,
+    const ffi::String &block_name = "tt_device_core_work",
+    ffi::Optional<Integer> work_group = std::nullopt) {
   if (bodies.empty())
     return Evaluate(Integer(0), span);
   if (grid_x <= 0 || grid_y <= 0 ||
@@ -938,10 +1364,280 @@ Stmt ParameterizeDeviceCoreStatements(
   for (const auto &skeleton : skeletons)
     for (const CoreRectangle &rectangle : PartitionRectangles(skeleton))
       EmitParameterizedRectangle(rectangle, grid_x, grid_y, owner_slot, span,
-                                 &result);
+                                 block_name, work_group, &result);
   if (result.empty())
     return Evaluate(Integer(0), span);
   return result.size() == 1 ? result[0] : SeqStmt(result, span);
+}
+
+std::vector<size_t> DFBOperandPositions(const Call &call) {
+  if (call->op.same_as(tenstorrent::dfb_compute())) {
+    std::vector<size_t> positions(call->args.size());
+    std::iota(positions.begin(), positions.end(), 0);
+    return positions;
+  }
+  if (call->op.same_as(tenstorrent::compute_value())) {
+    std::vector<size_t> positions(call->args.size() > 0 ? call->args.size() - 1
+                                                        : 0);
+    std::iota(positions.begin(), positions.end(), 1);
+    return positions;
+  }
+  if (call->op.same_as(tenstorrent::dfb_reserve()) ||
+      call->op.same_as(tenstorrent::dfb_wait()) ||
+      call->op.same_as(tenstorrent::dfb_copy_wait()) ||
+      call->op.same_as(tenstorrent::dfb_release()) ||
+      call->op.same_as(tenstorrent::dfb_load()))
+    return {0};
+  if (call->op.same_as(tenstorrent::dfb_pipe_send()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_wait()) ||
+      call->op.same_as(tenstorrent::tensor_to_dfb_nd()))
+    return {1};
+  if (call->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_recv_record()) ||
+      call->op.same_as(tenstorrent::dfb_pipe_wait_record()))
+    return {2};
+  if (call->op.same_as(tenstorrent::dfb_to_tensor_nd()))
+    return {0};
+  if (call->op.same_as(tenstorrent::gemm_update()))
+    return {0, 1};
+  if (call->op.same_as(tenstorrent::accumulator_materialize()) ||
+      call->op.same_as(tenstorrent::compute_value_store()))
+    return {1};
+  if (call->op.same_as(tenstorrent::compute_value_gemm()))
+    return {1, 2};
+  if (call->op.same_as(tenstorrent::dfb_local_copy()) ||
+      call->op.same_as(tenstorrent::dfb_gather_copy()))
+    return {0, 1};
+  if (call->op.same_as(tenstorrent::dfb_collective_reduce()))
+    return {0, 1, 2};
+  return {};
+}
+
+bool StatementDFBs(const Stmt &statement, std::vector<int64_t> *ids) {
+  const auto *evaluate = statement.as<EvaluateNode>();
+  if (!evaluate)
+    return false;
+  const auto *node = evaluate->value.as<CallNode>();
+  if (!node)
+    return is_zero(evaluate->value);
+  Call call = ffi::GetRef<Call>(node);
+  for (size_t position : DFBOperandPositions(call)) {
+    if (position >= call->args.size())
+      Invalid("Device DFB operation is missing an operand");
+    const int64_t *value = as_const_int(call->args[position]);
+    if (!value || *value < 0)
+      return false;
+    ids->push_back(*value);
+  }
+  return !ids->empty();
+}
+
+struct StatementSegment {
+  int64_t component;
+  Stmt body;
+};
+
+ffi::Optional<Stmt>
+TryParameterizeDFBComponents(const std::vector<DeviceCoreBody> &bodies,
+                             int64_t grid_x, int64_t grid_y,
+                             const ffi::String &owner_slot, const Span &span) {
+  if (owner_slot == "trisc" || bodies.empty())
+    return std::nullopt;
+
+  std::vector<For> common_loops;
+  Stmt prototype = bodies.front().body;
+  while (auto loop = prototype.as<For>()) {
+    if (loop.value()->kind != ForKind::kSerial)
+      return std::nullopt;
+    common_loops.push_back(loop.value());
+    prototype = loop.value()->body;
+  }
+
+  std::vector<DeviceCoreBody> leaves;
+  leaves.reserve(bodies.size());
+  for (const DeviceCoreBody &core : bodies) {
+    Stmt current = core.body;
+    for (const For &expected : common_loops) {
+      auto loop = current.as<For>();
+      if (!loop.has_value() || loop.value()->kind != expected->kind ||
+          !ffi::StructuralEqual()(loop.value()->min, expected->min) ||
+          !ffi::StructuralEqual()(loop.value()->extent, expected->extent) ||
+          !ffi::StructuralEqual()(loop.value()->annotations,
+                                  expected->annotations) ||
+          loop.value()->thread_binding.defined() !=
+              expected->thread_binding.defined() ||
+          (loop.value()->thread_binding.defined() &&
+           !ffi::StructuralEqual()(loop.value()->thread_binding.value(),
+                                   expected->thread_binding.value())) ||
+          loop.value()->step.defined() != expected->step.defined() ||
+          (loop.value()->step.defined() &&
+           !ffi::StructuralEqual()(loop.value()->step.value(),
+                                   expected->step.value())))
+        return std::nullopt;
+      current = Substitute(
+          loop.value()->body,
+          {{loop.value()->loop_var, PrimExpr(expected->loop_var)}});
+    }
+    if (current.as<For>())
+      return std::nullopt;
+    leaves.push_back({core.x, core.y, current});
+  }
+
+  std::map<int64_t, int64_t> parent;
+  std::vector<std::vector<Stmt>> statements;
+  auto find = [&](auto &&self, int64_t value) -> int64_t {
+    auto found = parent.find(value);
+    if (found == parent.end())
+      return parent.emplace(value, value).first->second;
+    if (found->second != value)
+      found->second = self(self, found->second);
+    return found->second;
+  };
+  auto unite = [&](int64_t left, int64_t right) {
+    left = find(find, left);
+    right = find(find, right);
+    if (left == right)
+      return;
+    if (left > right)
+      std::swap(left, right);
+    parent[right] = left;
+  };
+
+  for (const DeviceCoreBody &core : leaves) {
+    ffi::Array<Stmt> flat;
+    if (auto sequence = core.body.as<SeqStmt>())
+      flat = sequence.value()->seq;
+    else
+      flat = {core.body};
+    std::vector<Stmt> local;
+    for (const Stmt &statement : flat) {
+      std::vector<int64_t> ids;
+      if (!StatementDFBs(statement, &ids))
+        return std::nullopt;
+      std::sort(ids.begin(), ids.end());
+      ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+      for (int64_t id : ids)
+        find(find, id);
+      for (size_t index = 1; index < ids.size(); ++index)
+        unite(ids[0], ids[index]);
+      local.push_back(statement);
+    }
+    statements.push_back(std::move(local));
+  }
+  std::set<int64_t> components;
+  for (const auto &[id, _] : parent)
+    components.insert(find(find, id));
+  std::map<int64_t, std::vector<DeviceCoreBody>> component_points;
+  std::map<int64_t, std::set<int64_t>> successors;
+  std::map<int64_t, int64_t> indegree;
+  bool sparse = bodies.size() != static_cast<size_t>(grid_x * grid_y);
+  for (size_t core = 0; core < statements.size(); ++core) {
+    const auto &local = statements[core];
+    std::vector<StatementSegment> segments;
+    for (const Stmt &statement : local) {
+      std::vector<int64_t> ids;
+      if (!StatementDFBs(statement, &ids) || ids.empty())
+        return std::nullopt;
+      int64_t component = find(find, ids[0]);
+      for (int64_t id : ids)
+        if (find(find, id) != component)
+          Invalid("one Device statement spans disconnected DFB components");
+      if (!segments.empty() && segments.back().component == component) {
+        segments.back().body =
+            SeqStmt::Flatten(segments.back().body, statement);
+      } else {
+        segments.push_back({component, statement});
+      }
+    }
+    std::set<int64_t> seen;
+    for (const StatementSegment &segment : segments) {
+      if (!seen.insert(segment.component).second)
+        return std::nullopt;
+      component_points[segment.component].push_back(
+          {leaves[core].x, leaves[core].y, segment.body});
+      indegree.try_emplace(segment.component, 0);
+    }
+    for (size_t index = 1; index < segments.size(); ++index) {
+      int64_t before = segments[index - 1].component;
+      int64_t after = segments[index].component;
+      if (successors[before].insert(after).second)
+        ++indegree[after];
+    }
+    sparse |= segments.size() != components.size();
+  }
+  if (component_points.empty() || (!sparse && component_points.size() < 2))
+    return std::nullopt;
+
+  if (sparse) {
+    for (const auto &[component, points] : component_points) {
+      bool has_pipe = false;
+      for (const DeviceCoreBody &point : points)
+        PostOrderVisit(point.body, [&](const ffi::ObjectRef &object) {
+          const auto *call = object.as<CallNode>();
+          has_pipe |= call &&
+                      (call->op.same_as(tenstorrent::dfb_pipe_send()) ||
+                       call->op.same_as(tenstorrent::dfb_pipe_recv()) ||
+                       call->op.same_as(tenstorrent::dfb_pipe_send_record()) ||
+                       call->op.same_as(tenstorrent::dfb_pipe_recv_record()));
+        });
+      if (!has_pipe)
+        return std::nullopt;
+    }
+  }
+
+  std::set<int64_t> ready;
+  for (const auto &[component, degree] : indegree)
+    if (degree == 0)
+      ready.insert(component);
+  std::vector<int64_t> component_order;
+  while (!ready.empty()) {
+    int64_t component = *ready.begin();
+    ready.erase(ready.begin());
+    component_order.push_back(component);
+    for (int64_t successor : successors[component])
+      if (--indegree[successor] == 0)
+        ready.insert(successor);
+  }
+  if (component_order.size() != component_points.size())
+    return std::nullopt;
+
+  ffi::Array<Stmt> ordered;
+  for (int64_t component : component_order) {
+    Stmt role = ParameterizeDeviceCoreStatementsImpl(
+        component_points.at(component), grid_x, grid_y, owner_slot, span,
+        "tt_device_stream_work", Integer(component));
+    if (auto sequence = role.as<SeqStmt>()) {
+      for (const Stmt &statement : sequence.value()->seq)
+        ordered.push_back(statement);
+    } else {
+      ordered.push_back(role);
+    }
+  }
+  Stmt scheduled = ordered.size() == 1 ? ordered[0] : SeqStmt(ordered, span);
+  for (auto loop = common_loops.rbegin(); loop != common_loops.rend(); ++loop)
+    scheduled = For((*loop)->loop_var, (*loop)->min, (*loop)->extent,
+                    (*loop)->kind, scheduled, (*loop)->thread_binding,
+                    (*loop)->annotations, (*loop)->step, (*loop)->span);
+  scheduled = ScheduleLocalDFBWaits(scheduled);
+  CoreDomain domain(CoreCoord(0, 0), CoreCoord(grid_x, grid_y));
+  SBlock work({}, {}, {}, "tt_device_core_work", scheduled, std::nullopt, {},
+              {}, {{"tt.core_domain", domain}, {"tt.owner_slot", owner_slot}},
+              span);
+  return SBlockRealize({}, const_true(), work, span);
+}
+
+} // namespace
+
+Stmt ParameterizeDeviceCoreStatements(const std::vector<DeviceCoreBody> &bodies,
+                                      int64_t grid_x, int64_t grid_y,
+                                      const ffi::String &owner_slot,
+                                      const Span &span) {
+  if (auto components = TryParameterizeDFBComponents(bodies, grid_x, grid_y,
+                                                     owner_slot, span))
+    return components.value();
+  return ParameterizeDeviceCoreStatementsImpl(bodies, grid_x, grid_y,
+                                              owner_slot, span);
 }
 
 Stmt ExpandDeviceStatements(const Stmt &body, int64_t *budget) {

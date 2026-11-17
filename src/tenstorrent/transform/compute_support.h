@@ -5,8 +5,8 @@
 #ifndef TVM_TL_TENSTORRENT_TRANSFORM_COMPUTE_SUPPORT_H_
 #define TVM_TL_TENSTORRENT_TRANSFORM_COMPUTE_SUPPORT_H_
 
-#include <tvm/tirx/expr.h>
 #include <string>
+#include <tvm/tirx/expr.h>
 
 namespace tvm::tl::tenstorrent {
 

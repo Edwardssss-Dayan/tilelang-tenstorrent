@@ -44,17 +44,66 @@ unreachable from the stage-only public entry. Pipeline/multicore Device Lower
 remains available. Its typed DFB-to-storage-group resolver is implemented, but
 the current TTL operation/control-flow/transport emitter is not.
 
+Current Device communication bodies use record-level
+`dfb_pipe_send_record`/`dfb_pipe_recv_record`/`dfb_pipe_wait_record` operations.
+One source operation represents the complete `PipeDescriptor` destination
+range; destination Cores execute one receive role each. Collective ranges may
+include the source. In that case Lower keeps the source send staging generation
+separate from the source-local receive/compute generation, emits the complete
+source Tensor-load/send transaction on BRISC and destination work on NCRISC,
+and represents the loopback in the same PipeNet record. Each slot's
+`tt.tensor_arg_indices` contains exactly the Tensor values used by that function.
+Point-to-point records remain non-loopback. The current emitter
+must map source/destination `tt_device_stream_work` regions to
+`ttl.pipenet_foreach_src`/`ttl.pipenet_foreach_dst` and must not expand a
+collective source record into per-destination `ttl.copy` operations.
+Transport families carry a dense `pipe_net_id`, a parent `communication_id`,
+and a dense per-PipeNet `record_index`; Codegen uses those indices directly for
+`PipeNetRecordsAttr` without coordinate-based renumbering. Record operations
+carry `pipe_record_ref(pipe_net_ref, record_index)` and the local logical DFB
+stream. Structured
+control flow represents repeated execution; the final Device body is the
+communication schedule and does not persist a duplicate step table.
+
 The pinned finalizer can recolor many static logical DFB declarations into at
 most the target's physical CB-index capacity; therefore logical storage-group
-count alone is not a preflight failure. Current Lower keeps compiler-made
-compact loops and affine Core-dependent generation operands. Non-pipeline
+count alone is not a preflight failure. Current Lower preserves source
+structured loops and uses static stream operands plus loop epochs; it does not
+generate `tt_compact_iteration` or iteration-specific resources. Non-pipeline
 generations share a logical group only when the formation transaction DAG proves
 reserve/publication/wait/release FIFO order and remains acyclic after adding each
-release-before-reserve reuse edge. Loop-carried transactions that are not
-expanded for proof remain independent; pipelined families retain the planner's
-explicit pool relation. The pure resolver binds the finite groups required by
+release-before-reserve reuse edge. Loop-carried transactions use typed
+recurrence/state relations, and pipelined lexical sites retain the planner's
+capacity relation. The pure resolver binds the finite groups required by
 each kernel slot from typed producer/consumer ownership without expanding the
 body or materializing concrete descriptor tables.
+
+Current Device bodies distinguish identities from ordinary scalar integers with
+pure, handle-typed `tensor_ref`, `dfb_stream_ref`, `pipe_net_ref`,
+`accumulator_ref`, `compute_value_ref` and `compute_state_ref` expressions. Each
+function places its static aliases in
+one contiguous PrimFunc prologue, with at most one alias per resource kind and
+canonical ID; a canonical parser-created root block is transparent to this
+rule. Names are diagnostic only and do not emit TTL operations. The resolver
+follows either a prologue alias or an inline reference, checks the expected
+resource kind, and uses the enclosed canonical table ID. A raw integer, an
+alias outside the prologue, an unbound handle, a mismatched reference kind, or
+a dynamic reference that the current mapping cannot select is rejected before
+optional compiler import.
+
+Current compute expressions use the same single-source rule. The ordered
+`dfb_compute`/`compute_value` operands and `tt.value_inputs` contain canonical
+identities once; `dfb_operand(index)` and `compute_value_operand(index)` select
+them by zero-based position. Output dtype/tile geometry and compute-value shapes
+come from typed descriptors. The current emitter must resolve these indices
+before building TTL SSA and must not recover dependencies from duplicated IDs in
+expression leaves.
+
+Current value GEMMs carry only output/lhs/rhs/old operands and use named Boolean
+`tt.transpose_a/b` annotations. ND Tensor transfers carry Tensor/DFB operands
+plus `tt.starts` and `tt.extents` arrays. The preflight resolves refs and checks
+these structured forms; it does not recover their meaning from positional magic
+integers. Derived `tt.debug_*_operands` arrays are ignored by TTL semantics.
 
 TT-Lang's current DFB identity analysis only traces a CB operand directly to
 `ttl.bind_cb` through unrealized casts. The current emitter must therefore add a

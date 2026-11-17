@@ -44,14 +44,26 @@ TVM_DLL const Op &pipe_recv();
 TVM_DLL const Op &core_x();
 TVM_DLL const Op &core_y();
 
+/*! \brief Pure, kinded references to stable current Device resource IDs. */
+TVM_DLL const Op &tensor_ref();
+TVM_DLL const Op &dfb_stream_ref();
+TVM_DLL const Op &pipe_net_ref();
+TVM_DLL const Op &accumulator_ref();
+TVM_DLL const Op &compute_value_ref();
+TVM_DLL const Op &compute_state_ref();
+/*! \brief Pure reference to one PipeNet record selected by record index. */
+TVM_DLL const Op &pipe_record_ref();
+
 /*!
- * \brief Describe one source-exclusive, logically synchronous Core transfer.
+ * \brief Describe one logically synchronous Core transfer.
  *
  * Operands are source/destination read/write regions, source x/y, half-open
  * destination begin x/y and end x/y, contract (point_to_point or collective),
  * and an operation-local call-site ID. Point destinations use a singleton
- * rectangle without changing their contract. Enclosing loops retain repeated
- * occurrences. Endpoint expressions and buffer identity survive until lowering.
+ * rectangle without changing their contract. Collective rectangles may include
+ * the source, which requests loopback delivery into the source-local
+ * destination. Enclosing loops retain repeated occurrences. Endpoint
+ * expressions and buffer identity survive until lowering.
  */
 TVM_DLL const Op &transfer();
 
@@ -77,10 +89,10 @@ TVM_DLL const Op &all_gather();
 TVM_DLL const Op &all_reduce();
 
 /*!
- * \brief Canonical Phase 2 Add operation over normalized BufferRegions.
+ * \brief Legacy Phase 2 Add operation over normalized BufferRegions.
  *
- * LegalizeTenstorrentTileOps creates this intermediate operation. Program
- * formation consumes it and replaces it with logical-DFB Device IR ops.
+ * Retained only so versioned artifacts can be loaded and diagnosed. The
+ * current Lower pipeline must not create or consume this operation.
  */
 TVM_DLL const Op &tile_add();
 
@@ -90,10 +102,16 @@ TVM_DLL const Op &tile_add();
  * Operands are output followed by inputs. Legalization fixes operation kind,
  * dtypes, logical domain and operation-specific parameters in annotations.
  * Formation replaces regions with versioned DFB IDs in dfb_compute, and
- * expression BufferLoads with pure dfb_load values. No frontend block survives.
+ * current Device expressions refer to those ordered operands by zero-based
+ * dfb_operand/compute_value_operand indices. No frontend block survives.
  */
 TVM_DLL const Op &tile_compute();
 TVM_DLL const Op &dfb_compute();
+/*! \brief Current Device expression reference to an ordered DFB operand. */
+TVM_DLL const Op &dfb_operand();
+/*! \brief Current Device expression reference to tt.value_inputs by index. */
+TVM_DLL const Op &compute_value_operand();
+// Legacy/intermediate expression references retain direct resource identities.
 TVM_DLL const Op &dfb_load();
 /*! \brief Pure structured-expression broadcast over the listed logical axes. */
 TVM_DLL const Op &compute_broadcast();
@@ -103,8 +121,16 @@ TVM_DLL const Op &compute_value();
 TVM_DLL const Op &compute_value_load();
 TVM_DLL const Op &compute_value_store();
 TVM_DLL const Op &compute_value_gemm();
+// Abstract compute-local loop state. These operations carry no DFB identity;
+// TTL Codegen maps them to scf.for iter_args and scf.yield.
+TVM_DLL const Op &compute_value_state_init();
+TVM_DLL const Op &compute_value_state_input();
+TVM_DLL const Op &compute_value_state_yield();
+TVM_DLL const Op &compute_value_state_result();
 // Schema v5: init(id), update(lhs, rhs, id, transpose_a, transpose_b),
-// materialize(id, output_dfb). Materialization is the sole narrowing point.
+// materialize(id, output_dfb). Current shared-grid Device IR interprets id in
+// the current Core; versioned legacy schemas retain their global IDs.
+// Materialization is the sole narrowing point.
 TVM_DLL const Op &accumulator_init();
 TVM_DLL const Op &gemm_update();
 TVM_DLL const Op &accumulator_materialize();
@@ -140,8 +166,23 @@ TVM_DLL const Op &dfb_release();
 TVM_DLL const Op &dfb_pipe_send();
 TVM_DLL const Op &dfb_pipe_recv();
 TVM_DLL const Op &dfb_pipe_wait();
+/*!
+ * \brief Current record-level PipeNet delivery and completion operations.
+ *
+ * Current arguments are (pipe_record_ref, local logical DFB stream ref).
+ * pipe_record_ref carries the PipeNet ref and dense record index. Legacy
+ * artifacts retain (PipeNet ID, record index, DFB ID).
+ * Structured control flow represents repeated executions. One source operation
+ * covers the record's complete destination range; each matching destination
+ * Core executes one receive. Source operations run on BRISC and destination
+ * operations run on NCRISC, including a collective loopback destination.
+ */
+TVM_DLL const Op &dfb_pipe_send_record();
+TVM_DLL const Op &dfb_pipe_recv_record();
+TVM_DLL const Op &dfb_pipe_wait_record();
 TVM_DLL const Op &tensor_to_dfb();
 TVM_DLL const Op &dfb_to_tensor();
+/*! \brief Legacy schema-v1 Add marker; forbidden in current Device IR. */
 TVM_DLL const Op &dfb_add();
 /*! \brief Current Device-IR local copy/collective assembly operations. */
 TVM_DLL const Op &dfb_local_copy();
@@ -151,8 +192,9 @@ TVM_DLL const Op &dfb_collective_reduce();
 /*!
  * \brief Schema v2 transfers with rank-preserving Tensor slices.
  *
- * Arguments are tensor/DFB (or DFB/tensor), then (minimum, extent) pairs
- * for every logical Tensor axis. The entire logical DFB value is transferred.
+ * Current arguments are tensor/DFB (or DFB/tensor); tt.starts and tt.extents
+ * carry one expression per logical Tensor axis. Legacy artifacts retain flat
+ * (minimum, extent) pairs. The entire logical DFB value is transferred.
  */
 TVM_DLL const Op &tensor_to_dfb_nd();
 TVM_DLL const Op &dfb_to_tensor_nd();

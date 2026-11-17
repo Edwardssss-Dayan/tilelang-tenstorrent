@@ -1,5 +1,6 @@
 /* Copyright (c) Tile-AI Corporation. Licensed under the MIT License. */
 #include "device_table_compaction.h"
+#include "../op/builtin.h"
 
 #include <algorithm>
 #include <limits>
@@ -8,10 +9,12 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/extra/structural_hash.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tirx/stmt_functor.h>
@@ -28,6 +31,10 @@ constexpr int64_t kMetadataByteBudget = 256LL * 1024 * 1024;
 constexpr int64_t kDecodedIntegerBudget = kMetadataByteBudget / sizeof(int64_t);
 constexpr const char *kDFBFamilies = "tt.compact_dfb_families";
 constexpr const char *kValueFamilies = "tt.compact_value_families";
+constexpr const char *kExpandedAccumulatorLocalIDs =
+    "tt.expanded_accumulator_local_ids";
+constexpr const char *kExpandedComputeValueLocalIDs =
+    "tt.expanded_compute_value_local_ids";
 
 void Check(bool valid, const std::string &message) {
   if (!valid)
@@ -158,11 +165,9 @@ bool SameStorageGroupContract(const DFBStorageGroupDescriptor &group,
                                 dfb->block_shape_in_tiles) &&
          ffi::StructuralEqual()(group->block_count, dfb->block_count) &&
          group->producer_slot == dfb->producer_slot &&
-         ffi::StructuralEqual()(group->producer_domain,
-                                dfb->producer_domain) &&
+         ffi::StructuralEqual()(group->producer_domain, dfb->producer_domain) &&
          group->consumer_slot == dfb->consumer_slot &&
-         ffi::StructuralEqual()(group->consumer_domain,
-                                dfb->consumer_domain);
+         ffi::StructuralEqual()(group->consumer_domain, dfb->consumer_domain);
 }
 
 CurrentStorageGroups BuildCurrentStorageGroups(
@@ -270,10 +275,12 @@ CurrentStorageGroups BuildCurrentStorageGroups(
             group_id, dfb->element_dtype, dfb->tile_shape,
             dfb->block_shape_in_tiles, dfb->block_count, dfb->producer_slot,
             dfb->producer_domain, dfb->consumer_slot, dfb->consumer_domain,
-            std::nullopt, dfb->source_span));
+            dfb->transaction_count_or_loop_relation, std::nullopt,
+            dfb->source_span));
       } else {
-        Check(SameStorageGroupContract(result.descriptors[group_id], dfb),
-              "storage-group generations disagree on capacity, layout, or slots");
+        Check(
+            SameStorageGroupContract(result.descriptors[group_id], dfb),
+            "storage-group generations disagree on capacity, layout, or slots");
       }
       Check(ordinals[group_id].insert(ordinal).second,
             "one logical storage group has a duplicate generation ordinal");
@@ -470,8 +477,8 @@ ExpandTable(const ffi::Array<DeviceIRDescriptorFamily> &families, int64_t total,
   return ffi::Array<Descriptor>(table.begin(), table.end());
 }
 
-ffi::Array<DeviceIRDescriptorFamily> LocalizeFamilyPositions(
-    const ffi::Array<DeviceIRDescriptorFamily> &families) {
+ffi::Array<DeviceIRDescriptorFamily>
+LocalizeFamilyPositions(const ffi::Array<DeviceIRDescriptorFamily> &families) {
   ffi::Array<DeviceIRDescriptorFamily> result;
   for (const DeviceIRDescriptorFamily &family : families) {
     std::vector<int64_t> positions(family->positions->count);
@@ -484,9 +491,9 @@ ffi::Array<DeviceIRDescriptorFamily> LocalizeFamilyPositions(
 }
 
 template <typename Descriptor, typename Restore, typename Identifier>
-ffi::Array<Descriptor> ExpandCurrentTable(
-    const ffi::Array<DeviceIRDescriptorFamily> &families, int64_t total,
-    Restore restore, Identifier identifier) {
+ffi::Array<Descriptor>
+ExpandCurrentTable(const ffi::Array<DeviceIRDescriptorFamily> &families,
+                   int64_t total, Restore restore, Identifier identifier) {
   std::vector<Descriptor> table;
   table.reserve(total);
   for (const DeviceIRDescriptorFamily &family : families) {
@@ -501,10 +508,10 @@ ffi::Array<Descriptor> ExpandCurrentTable(
   }
   Check(table.size() == static_cast<size_t>(total),
         "current family expansion size mismatch");
-  std::sort(table.begin(), table.end(), [&](const Descriptor &a,
-                                            const Descriptor &b) {
-    return identifier(a) < identifier(b);
-  });
+  std::sort(table.begin(), table.end(),
+            [&](const Descriptor &a, const Descriptor &b) {
+              return identifier(a) < identifier(b);
+            });
   for (size_t index = 0; index < table.size(); ++index)
     Check(identifier(table[index]) == static_cast<int64_t>(index),
           "current family identifiers must be dense and unique");
@@ -524,10 +531,10 @@ std::vector<DFBDescriptor> RestoreDFBs(const DeviceIRDescriptorFamily &family,
     std::string prefix = family->source_parts[0];
     constexpr const char *generation_marker = ".generation";
     size_t marker_size = std::char_traits<char>::length(generation_marker);
-    bool generation_only =
-        source_columns == 1 && prefix.size() >= marker_size &&
-        prefix.compare(prefix.size() - marker_size, marker_size,
-                       generation_marker) == 0;
+    bool generation_only = source_columns == 1 &&
+                           prefix.size() >= marker_size &&
+                           prefix.compare(prefix.size() - marker_size,
+                                          marker_size, generation_marker) == 0;
     for (size_t index = 0; index < family->source_parts.size(); ++index) {
       const ffi::String &part = family->source_parts[index];
       Check((generation_only ||
@@ -582,8 +589,8 @@ std::string SpanKey(const Span &span) {
   if (!span.defined() || !span->source_name.defined())
     return "<unknown>";
   return std::string(span->source_name->name) + ":" +
-         std::to_string(span->line) + ":" + std::to_string(span->column) +
-         ":" + std::to_string(span->end_line) + ":" +
+         std::to_string(span->line) + ":" + std::to_string(span->column) + ":" +
+         std::to_string(span->end_line) + ":" +
          std::to_string(span->end_column);
 }
 
@@ -617,10 +624,8 @@ ffi::Array<DeviceIRDescriptorFamily> CompactCurrentAccumulators(
     FamilyBuilder &builder = builders[found->second];
     builder.positions.push_back(builder.positions.size());
     builder.fields["accumulator_id"].push_back(descriptor->accumulator_id);
-    builder.fields["core_begin_x"].push_back(
-        descriptor->core_domain->begin->x);
-    builder.fields["core_begin_y"].push_back(
-        descriptor->core_domain->begin->y);
+    builder.fields["core_begin_x"].push_back(descriptor->core_domain->begin->x);
+    builder.fields["core_begin_y"].push_back(descriptor->core_domain->begin->y);
     builder.fields["core_end_x"].push_back(descriptor->core_domain->end->x);
     builder.fields["core_end_y"].push_back(descriptor->core_domain->end->y);
   }
@@ -630,8 +635,8 @@ ffi::Array<DeviceIRDescriptorFamily> CompactCurrentAccumulators(
   return result;
 }
 
-ffi::Array<DeviceIRDescriptorFamily> CompactCurrentValues(
-    const ffi::Array<ComputeValueDescriptor> &descriptors) {
+ffi::Array<DeviceIRDescriptorFamily>
+CompactCurrentValues(const ffi::Array<ComputeValueDescriptor> &descriptors) {
   std::vector<FamilyBuilder> builders;
   std::unordered_map<std::string, size_t> groups;
   for (size_t position = 0; position < descriptors.size(); ++position) {
@@ -639,9 +644,8 @@ ffi::Array<DeviceIRDescriptorFamily> CompactCurrentValues(
     Check(descriptor.defined() && descriptor->buffer.defined(),
           "undefined current compute-value descriptor");
     std::ostringstream key;
-    key << BufferFamilyKey(descriptor->buffer) << '|'
-        << descriptor->value_kind << '|'
-        << ffi::StructuralHash()(descriptor->logical_shape) << '|'
+    key << BufferFamilyKey(descriptor->buffer) << '|' << descriptor->value_kind
+        << '|' << ffi::StructuralHash()(descriptor->logical_shape) << '|'
         << ffi::StructuralHash()(descriptor->compute_tile_shape) << '|'
         << descriptor->dtype << '|' << descriptor->owner_slot << '|'
         << descriptor->materialization_refs.size() << '|'
@@ -659,10 +663,8 @@ ffi::Array<DeviceIRDescriptorFamily> CompactCurrentValues(
     builder.fields["previous_value_id"].push_back(
         descriptor->previous_value_id);
     builder.fields["accumulator_id"].push_back(descriptor->accumulator_id);
-    builder.fields["core_begin_x"].push_back(
-        descriptor->core_domain->begin->x);
-    builder.fields["core_begin_y"].push_back(
-        descriptor->core_domain->begin->y);
+    builder.fields["core_begin_x"].push_back(descriptor->core_domain->begin->x);
+    builder.fields["core_begin_y"].push_back(descriptor->core_domain->begin->y);
     builder.fields["core_end_x"].push_back(descriptor->core_domain->end->x);
     builder.fields["core_end_y"].push_back(descriptor->core_domain->end->y);
     for (size_t index = 0; index < descriptor->materialization_refs.size();
@@ -676,69 +678,8 @@ ffi::Array<DeviceIRDescriptorFamily> CompactCurrentValues(
   return result;
 }
 
-ffi::Array<DeviceIRDescriptorFamily> CompactCurrentSteps(
-    const ffi::Array<CommunicationStepDescriptor> &descriptors) {
-  std::vector<FamilyBuilder> builders;
-  std::unordered_map<std::string, size_t> groups;
-  for (size_t position = 0; position < descriptors.size(); ++position) {
-    const CommunicationStepDescriptor &descriptor = descriptors[position];
-    Check(descriptor.defined(), "undefined current communication step");
-    const auto *parameter = descriptor->parameter.as<IntImmNode>();
-    std::ostringstream key;
-    key << descriptor->communication_id << '|' << descriptor->kind << '|'
-        << descriptor->owner_slot << '|'
-        << descriptor->source_core.has_value() << '|'
-        << descriptor->destination_core.has_value() << '|'
-        << descriptor->dependencies.size() << '|' << (parameter != nullptr)
-        << '|'
-        << SpanKey(descriptor->source_span);
-    if (!parameter)
-      key << '|' << ffi::StructuralHash()(descriptor->parameter);
-    for (const Integer &dependency : descriptor->dependencies) {
-      Check(dependency->value >= 0 &&
-                dependency->value < static_cast<int64_t>(descriptors.size()),
-            "communication step dependency is out of range");
-      key << '|' << descriptors[dependency->value]->kind;
-    }
-    auto [found, inserted] = groups.emplace(key.str(), builders.size());
-    if (inserted) {
-      FamilyBuilder builder;
-      builder.prototype = descriptor;
-      builders.push_back(std::move(builder));
-    }
-    FamilyBuilder &builder = builders[found->second];
-    builder.positions.push_back(builder.positions.size());
-    builder.fields["step_id"].push_back(descriptor->step_id);
-    builder.fields["occurrence"].push_back(descriptor->occurrence);
-    builder.fields["source_dfb_id"].push_back(descriptor->source_dfb_id);
-    builder.fields["destination_dfb_id"].push_back(
-        descriptor->destination_dfb_id);
-    if (parameter)
-      builder.fields["parameter"].push_back(parameter->value);
-    if (descriptor->source_core.has_value()) {
-      builder.fields["source_x"].push_back(
-          descriptor->source_core.value()->x);
-      builder.fields["source_y"].push_back(
-          descriptor->source_core.value()->y);
-    }
-    if (descriptor->destination_core.has_value()) {
-      builder.fields["destination_x"].push_back(
-          descriptor->destination_core.value()->x);
-      builder.fields["destination_y"].push_back(
-          descriptor->destination_core.value()->y);
-    }
-    for (size_t index = 0; index < descriptor->dependencies.size(); ++index)
-      builder.fields["dependency." + std::to_string(index)].push_back(
-          descriptor->dependencies[index]->value);
-  }
-  ffi::Array<DeviceIRDescriptorFamily> result;
-  for (const FamilyBuilder &builder : builders)
-    result.push_back(builder.Finish());
-  return result;
-}
-
-ffi::Array<DeviceIRDescriptorFamily> CompactCurrentTransports(
-    const ffi::Array<PipeDescriptor> &descriptors) {
+ffi::Array<DeviceIRDescriptorFamily>
+CompactCurrentTransports(const ffi::Array<PipeDescriptor> &descriptors) {
   std::vector<FamilyBuilder> builders;
   std::unordered_map<std::string, size_t> groups;
   for (size_t position = 0; position < descriptors.size(); ++position) {
@@ -755,13 +696,12 @@ ffi::Array<DeviceIRDescriptorFamily> CompactCurrentTransports(
     FamilyBuilder &builder = builders[found->second];
     builder.positions.push_back(position);
     builder.fields["pipe_net_id"].push_back(descriptor->pipe_net_id);
-    builder.fields["event_index"].push_back(descriptor->event_index);
+    builder.fields["communication_id"].push_back(descriptor->communication_id);
+    builder.fields["record_index"].push_back(descriptor->record_index);
     builder.fields["source_x"].push_back(descriptor->src_coord->x);
     builder.fields["source_y"].push_back(descriptor->src_coord->y);
-    builder.fields["destination_begin_x"].push_back(
-        descriptor->dst_begin->x);
-    builder.fields["destination_begin_y"].push_back(
-        descriptor->dst_begin->y);
+    builder.fields["destination_begin_x"].push_back(descriptor->dst_begin->x);
+    builder.fields["destination_begin_y"].push_back(descriptor->dst_begin->y);
     builder.fields["destination_end_x"].push_back(descriptor->dst_end->x);
     builder.fields["destination_end_y"].push_back(descriptor->dst_end->y);
     builder.fields["payload_dfb_id"].push_back(descriptor->payload_dfb_id);
@@ -772,39 +712,39 @@ ffi::Array<DeviceIRDescriptorFamily> CompactCurrentTransports(
   return result;
 }
 
-std::vector<AccumulatorDescriptor> RestoreCurrentAccumulators(
-    const DeviceIRDescriptorFamily &family,
-    const AccumulatorDescriptor &prototype) {
+std::vector<AccumulatorDescriptor>
+RestoreCurrentAccumulators(const DeviceIRDescriptorFamily &family,
+                           const AccumulatorDescriptor &prototype) {
   Check(family->source_parts.empty(),
         "accumulator family cannot have source string parts");
-  DecodedFields fields = ReadFields(
-      family, {"accumulator_id", "core_begin_x", "core_begin_y", "core_end_x",
-               "core_end_y"});
+  DecodedFields fields =
+      ReadFields(family, {"accumulator_id", "core_begin_x", "core_begin_y",
+                          "core_end_x", "core_end_y"});
   std::vector<AccumulatorDescriptor> result;
   result.reserve(family->positions->count);
   for (int64_t row = 0; row < family->positions->count; ++row)
-    result.emplace_back(
-        fields.at("accumulator_id")[row], prototype->accumulator_region,
-        prototype->input_dtype, prototype->accumulation_dtype,
-        prototype->output_dtype, prototype->full_k_tiles,
-        CoreDomain(CoreCoord(fields.at("core_begin_x")[row],
-                             fields.at("core_begin_y")[row]),
-                   CoreCoord(fields.at("core_end_x")[row],
-                             fields.at("core_end_y")[row])),
-        prototype->source_span);
+    result.emplace_back(fields.at("accumulator_id")[row],
+                        prototype->accumulator_region, prototype->input_dtype,
+                        prototype->accumulation_dtype, prototype->output_dtype,
+                        prototype->full_k_tiles,
+                        CoreDomain(CoreCoord(fields.at("core_begin_x")[row],
+                                             fields.at("core_begin_y")[row]),
+                                   CoreCoord(fields.at("core_end_x")[row],
+                                             fields.at("core_end_y")[row])),
+                        prototype->source_span);
   return result;
 }
 
-std::vector<ComputeValueDescriptor> RestoreCurrentValues(
-    const DeviceIRDescriptorFamily &family,
-    const ComputeValueDescriptor &prototype) {
+std::vector<ComputeValueDescriptor>
+RestoreCurrentValues(const DeviceIRDescriptorFamily &family,
+                     const ComputeValueDescriptor &prototype) {
   Check(family->source_parts.empty(),
         "compute-value family cannot have source string parts");
-  std::set<std::string> names{"value_id",        "version",
-                              "previous_value_id", "accumulator_id",
-                              "core_begin_x",   "core_begin_y",
-                              "core_end_x",     "core_end_y"};
-  for (size_t index = 0; index < prototype->materialization_refs.size(); ++index)
+  std::set<std::string> names{
+      "value_id",     "version",      "previous_value_id", "accumulator_id",
+      "core_begin_x", "core_begin_y", "core_end_x",        "core_end_y"};
+  for (size_t index = 0; index < prototype->materialization_refs.size();
+       ++index)
     names.insert("materialization." + std::to_string(index));
   DecodedFields fields = ReadFields(family, names);
   std::vector<ComputeValueDescriptor> result;
@@ -813,87 +753,308 @@ std::vector<ComputeValueDescriptor> RestoreCurrentValues(
     ffi::Array<Integer> materializations;
     for (size_t index = 0; index < prototype->materialization_refs.size();
          ++index)
-      materializations.push_back(Integer(
-          fields.at("materialization." + std::to_string(index))[row]));
-    result.emplace_back(
-        fields.at("value_id")[row], prototype->buffer,
-        fields.at("version")[row], fields.at("previous_value_id")[row],
-        fields.at("accumulator_id")[row], prototype->value_kind,
-        prototype->logical_shape, prototype->compute_tile_shape,
-        prototype->dtype, prototype->owner_slot,
-        CoreDomain(CoreCoord(fields.at("core_begin_x")[row],
-                             fields.at("core_begin_y")[row]),
-                   CoreCoord(fields.at("core_end_x")[row],
-                             fields.at("core_end_y")[row])),
-        materializations, prototype->source_span);
+      materializations.push_back(
+          Integer(fields.at("materialization." + std::to_string(index))[row]));
+    result.emplace_back(fields.at("value_id")[row], prototype->buffer,
+                        fields.at("version")[row],
+                        fields.at("previous_value_id")[row],
+                        fields.at("accumulator_id")[row], prototype->value_kind,
+                        prototype->logical_shape, prototype->compute_tile_shape,
+                        prototype->dtype, prototype->owner_slot,
+                        CoreDomain(CoreCoord(fields.at("core_begin_x")[row],
+                                             fields.at("core_begin_y")[row]),
+                                   CoreCoord(fields.at("core_end_x")[row],
+                                             fields.at("core_end_y")[row])),
+                        materializations, prototype->source_span);
   }
   return result;
 }
 
-std::vector<CommunicationStepDescriptor> RestoreCurrentSteps(
-    const DeviceIRDescriptorFamily &family,
-    const CommunicationStepDescriptor &prototype) {
-  Check(family->source_parts.empty(),
-        "communication-step family cannot have source string parts");
-  std::set<std::string> names{"step_id", "occurrence", "source_dfb_id",
-                              "destination_dfb_id"};
-  bool parameter_column = prototype->parameter.as<IntImmNode>() != nullptr;
-  if (parameter_column)
-    names.insert("parameter");
-  if (prototype->source_core.has_value()) {
-    names.insert("source_x");
-    names.insert("source_y");
-  }
-  if (prototype->destination_core.has_value()) {
-    names.insert("destination_x");
-    names.insert("destination_y");
-  }
-  for (size_t index = 0; index < prototype->dependencies.size(); ++index)
-    names.insert("dependency." + std::to_string(index));
-  DecodedFields fields = ReadFields(family, names);
-  std::vector<CommunicationStepDescriptor> result;
-  result.reserve(family->positions->count);
-  for (int64_t row = 0; row < family->positions->count; ++row) {
-    ffi::Optional<CoreCoord> source = std::nullopt;
-    ffi::Optional<CoreCoord> destination = std::nullopt;
-    if (prototype->source_core.has_value())
-      source = CoreCoord(fields.at("source_x")[row],
-                         fields.at("source_y")[row]);
-    if (prototype->destination_core.has_value())
-      destination = CoreCoord(fields.at("destination_x")[row],
-                              fields.at("destination_y")[row]);
-    ffi::Array<Integer> dependencies;
-    for (size_t index = 0; index < prototype->dependencies.size(); ++index)
-      dependencies.push_back(
-          Integer(fields.at("dependency." + std::to_string(index))[row]));
-    result.emplace_back(
-        fields.at("step_id")[row], prototype->communication_id,
-        fields.at("occurrence")[row], prototype->kind, source, destination,
-        fields.at("source_dfb_id")[row],
-        fields.at("destination_dfb_id")[row], prototype->owner_slot,
-        dependencies,
-        parameter_column ? PrimExpr(Integer(fields.at("parameter")[row]))
-                         : prototype->parameter,
-        prototype->source_span);
+using LocalComputeKey = std::tuple<int64_t, int64_t, int64_t>;
+
+template <typename Descriptor, typename Restore>
+std::vector<Descriptor>
+RestoreCurrentInstanceRows(const ffi::Array<DeviceIRDescriptorFamily> &families,
+                           Restore restore) {
+  std::vector<Descriptor> result;
+  for (const DeviceIRDescriptorFamily &family : families) {
+    auto prototype = family->prototype.as<Descriptor>();
+    Check(prototype.has_value(), "wrong current family prototype type");
+    std::vector<int64_t> positions = ExpandDeviceIntColumn(family->positions);
+    for (size_t index = 0; index < positions.size(); ++index)
+      Check(positions[index] == static_cast<int64_t>(index),
+            "current family positions must be dense local ordinals");
+    std::vector<Descriptor> entries = restore(family, prototype.value());
+    result.insert(result.end(), entries.begin(), entries.end());
   }
   return result;
 }
 
-std::vector<PipeDescriptor> RestoreCurrentTransports(
-    const DeviceIRDescriptorFamily &family,
-    const PipeDescriptor &prototype) {
+LocalComputeKey ComputeInstanceKey(const CoreDomain &domain, int64_t local_id,
+                                   const char *label) {
+  Check(domain.defined() && domain->end->x == domain->begin->x + 1 &&
+            domain->end->y == domain->begin->y + 1,
+        std::string(label) + " requires a singleton Core domain");
+  return {domain->begin->x, domain->begin->y, local_id};
+}
+
+struct CurrentComputeExpansion {
+  ffi::Array<AccumulatorDescriptor> accumulators;
+  ffi::Array<ComputeValueDescriptor> values;
+  ffi::Array<Integer> accumulator_local_ids;
+  ffi::Array<Integer> value_local_ids;
+};
+
+CurrentComputeExpansion ExpandCurrentComputeInstances(
+    const ffi::Optional<ffi::Array<DeviceIRDescriptorFamily>>
+        &accumulator_families,
+    const ffi::Optional<ffi::Array<DeviceIRDescriptorFamily>> &value_families) {
+  CurrentComputeExpansion result;
+  std::map<LocalComputeKey, int64_t> accumulator_ids;
+  std::vector<AccumulatorDescriptor> local_accumulators;
+  if (accumulator_families.has_value())
+    local_accumulators = RestoreCurrentInstanceRows<AccumulatorDescriptor>(
+        accumulator_families.value(), RestoreCurrentAccumulators);
+  std::sort(
+      local_accumulators.begin(), local_accumulators.end(),
+      [](const AccumulatorDescriptor &left,
+         const AccumulatorDescriptor &right) {
+        return std::tie(left->core_domain->begin->x,
+                        left->core_domain->begin->y, left->accumulator_id) <
+               std::tie(right->core_domain->begin->x,
+                        right->core_domain->begin->y, right->accumulator_id);
+      });
+  for (const AccumulatorDescriptor &entry : local_accumulators) {
+    int64_t global_id = result.accumulators.size();
+    LocalComputeKey key = ComputeInstanceKey(
+        entry->core_domain, entry->accumulator_id, "current accumulator");
+    Check(accumulator_ids.emplace(key, global_id).second,
+          "duplicate Core-local accumulator ID");
+    result.accumulator_local_ids.push_back(Integer(entry->accumulator_id));
+    result.accumulators.push_back(AccumulatorDescriptor(
+        global_id, entry->accumulator_region, entry->input_dtype,
+        entry->accumulation_dtype, entry->output_dtype, entry->full_k_tiles,
+        entry->core_domain, entry->source_span));
+  }
+
+  std::map<LocalComputeKey, int64_t> value_ids;
+  std::vector<ComputeValueDescriptor> local_values;
+  if (value_families.has_value())
+    local_values = RestoreCurrentInstanceRows<ComputeValueDescriptor>(
+        value_families.value(), RestoreCurrentValues);
+  std::sort(local_values.begin(), local_values.end(),
+            [](const ComputeValueDescriptor &left,
+               const ComputeValueDescriptor &right) {
+              return std::tie(left->core_domain->begin->x,
+                              left->core_domain->begin->y, left->value_id) <
+                     std::tie(right->core_domain->begin->x,
+                              right->core_domain->begin->y, right->value_id);
+            });
+  for (const ComputeValueDescriptor &entry : local_values) {
+    int64_t global_id = value_ids.size();
+    LocalComputeKey key = ComputeInstanceKey(
+        entry->core_domain, entry->value_id, "current compute value");
+    Check(value_ids.emplace(key, global_id).second,
+          "duplicate Core-local compute value ID");
+  }
+  for (const ComputeValueDescriptor &entry : local_values) {
+    LocalComputeKey key = ComputeInstanceKey(
+        entry->core_domain, entry->value_id, "current compute value");
+    int64_t global_id = value_ids.at(key);
+    int64_t previous = -1;
+    if (entry->previous_value_id >= 0) {
+      auto found = value_ids.find(
+          ComputeInstanceKey(entry->core_domain, entry->previous_value_id,
+                             "compute value predecessor"));
+      Check(found != value_ids.end(),
+            "compute value predecessor references a missing Core-local ID");
+      previous = found->second;
+    }
+    int64_t accumulator = -1;
+    if (entry->accumulator_id >= 0) {
+      auto found = accumulator_ids.find(
+          ComputeInstanceKey(entry->core_domain, entry->accumulator_id,
+                             "compute value accumulator"));
+      Check(found != accumulator_ids.end(),
+            "compute value references a missing Core-local accumulator ID");
+      accumulator = found->second;
+    }
+    result.value_local_ids.push_back(Integer(entry->value_id));
+    result.values.push_back(ComputeValueDescriptor(
+        global_id, entry->buffer, entry->version, previous, accumulator,
+        entry->value_kind, entry->logical_shape, entry->compute_tile_shape,
+        entry->dtype, entry->owner_slot, entry->core_domain,
+        entry->materialization_refs, entry->source_span));
+  }
+  return result;
+}
+
+using CoreKey = std::pair<int64_t, int64_t>;
+
+class CurrentComputeIDShifter : public tirx::StmtExprMutator {
+public:
+  CurrentComputeIDShifter(std::map<CoreKey, int64_t> accumulator_offsets,
+                          std::map<CoreKey, int64_t> value_offsets,
+                          int64_t direction)
+      : accumulator_offsets_(std::move(accumulator_offsets)),
+        value_offsets_(std::move(value_offsets)), direction_(direction) {
+    Check(direction == 1 || direction == -1,
+          "current compute ID shift direction must be +/-1");
+  }
+
+  PrimExpr VisitExpr_(const tirx::CallNode *op) final {
+    tirx::Call call = Downcast<tirx::Call>(StmtExprMutator::VisitExpr_(op));
+    ffi::Array<PrimExpr> args = call->args;
+    auto shift = [&](size_t index, const std::map<CoreKey, int64_t> &offsets,
+                     const char *label, bool optional = false) {
+      Check(index < args.size(), std::string(label) + " operand is missing");
+      if (args[index].dtype().is_handle())
+        return;
+      if (optional) {
+        const int64_t *constant = tirx::as_const_int(args[index]);
+        if (constant && *constant < 0)
+          return;
+      }
+      args.Set(index, Shift(args[index], offsets));
+    };
+    if (call->op.same_as(accumulator_init()) ||
+        call->op.same_as(accumulator_materialize())) {
+      shift(0, accumulator_offsets_, "accumulator");
+    } else if (call->op.same_as(gemm_update())) {
+      shift(2, accumulator_offsets_, "GEMM accumulator");
+    } else if (call->op.same_as(compute_value())) {
+      shift(0, value_offsets_, "compute value output");
+    } else if (call->op.same_as(compute_value_gemm())) {
+      shift(0, value_offsets_, "compute value GEMM output");
+      shift(3, value_offsets_, "compute value GEMM predecessor",
+            /*optional=*/true);
+    } else if (call->op.same_as(compute_value_store()) ||
+               call->op.same_as(compute_value_load())) {
+      shift(0, value_offsets_, "compute value");
+    } else if (call->op.same_as(compute_value_state_init()) ||
+               call->op.same_as(compute_value_state_yield())) {
+      shift(1, value_offsets_, "loop-state value");
+    } else if (call->op.same_as(compute_value_state_input()) ||
+               call->op.same_as(compute_value_state_result())) {
+      shift(0, value_offsets_, "loop-state value");
+    } else if (call->op.same_as(compute_value_ref())) {
+      Check(args.size() == 1,
+            "compute-value ref must contain one identity expression");
+      args.Set(0, Shift(args[0], value_offsets_));
+    }
+    ffi::Map<ffi::String, ffi::ObjectRef> annotations = call->annotations;
+    auto value_inputs = annotations.Get("tt.value_inputs");
+    if (value_inputs.has_value()) {
+      ffi::Array<PrimExpr> shifted;
+      for (const PrimExpr &input :
+           Downcast<ffi::Array<PrimExpr>>(value_inputs.value())) {
+        if (input.dtype().is_handle()) {
+          shifted.push_back(input);
+        } else {
+          shifted.push_back(Shift(input, value_offsets_));
+        }
+      }
+      annotations.Set("tt.value_inputs", shifted);
+    }
+    return tirx::Call(call->dtype, call->op, args, annotations, op->span);
+  }
+
+private:
+  PrimExpr Offset(const std::map<CoreKey, int64_t> &offsets,
+                  DataType dtype) const {
+    PrimExpr result = tirx::make_const(dtype, 0);
+    PrimExpr x = tirx::Call(DataType::Int(32), core_x(), {});
+    PrimExpr y = tirx::Call(DataType::Int(32), core_y(), {});
+    for (auto it = offsets.rbegin(); it != offsets.rend(); ++it) {
+      PrimExpr predicate = x == tirx::make_const(x.dtype(), it->first.first) &&
+                           y == tirx::make_const(y.dtype(), it->first.second);
+      result = tirx::Select(
+          predicate, tirx::make_const(dtype, direction_ * it->second), result);
+    }
+    return result;
+  }
+
+  PrimExpr Shift(const PrimExpr &value,
+                 const std::map<CoreKey, int64_t> &offsets) const {
+    if (offsets.empty())
+      return value;
+    return analyzer_.Simplify(value + Offset(offsets, value.dtype()));
+  }
+
+  std::map<CoreKey, int64_t> accumulator_offsets_;
+  std::map<CoreKey, int64_t> value_offsets_;
+  int64_t direction_;
+  mutable arith::Analyzer analyzer_;
+};
+
+IRModule ShiftCurrentComputeIDs(
+    IRModule mod, const ffi::Array<AccumulatorDescriptor> &accumulators,
+    const ffi::Array<Integer> &accumulator_local_ids,
+    const ffi::Array<ComputeValueDescriptor> &values,
+    const ffi::Array<Integer> &value_local_ids, int64_t direction) {
+  Check(accumulators.size() == accumulator_local_ids.size(),
+        "duplicate accumulator descriptor or expanded local-ID relation has "
+        "the wrong size");
+  if (values.size() != value_local_ids.size()) {
+    std::set<int64_t> ids;
+    bool duplicate = false;
+    for (const ComputeValueDescriptor &value : values)
+      duplicate |= !ids.insert(value->value_id).second;
+    Check(false, duplicate ? "duplicate compute value descriptor ID"
+                           : "undefined compute value descriptor ID");
+  }
+  std::map<CoreKey, int64_t> accumulator_offsets;
+  std::map<CoreKey, int64_t> value_offsets;
+  // The diagnostic tables are dense in their synthetic IDs, so the parallel
+  // local-ID arrays carry the source IDs at the same positions.
+  for (size_t index = 0; index < accumulators.size(); ++index) {
+    const AccumulatorDescriptor &descriptor = accumulators[index];
+    CoreKey core{descriptor->core_domain->begin->x,
+                 descriptor->core_domain->begin->y};
+    int64_t offset =
+        descriptor->accumulator_id - accumulator_local_ids[index]->value;
+    auto [found, inserted] = accumulator_offsets.emplace(core, offset);
+    Check(inserted || found->second == offset,
+          "expanded accumulator local-to-diagnostic relation is not affine");
+  }
+  for (size_t index = 0; index < values.size(); ++index) {
+    const ComputeValueDescriptor &descriptor = values[index];
+    CoreKey core{descriptor->core_domain->begin->x,
+                 descriptor->core_domain->begin->y};
+    int64_t offset = descriptor->value_id - value_local_ids[index]->value;
+    auto [found, inserted] = value_offsets.emplace(core, offset);
+    Check(inserted || found->second == offset,
+          "expanded compute-value local-to-diagnostic relation is not affine");
+  }
+  IRModule result = mod;
+  result.CopyOnWrite();
+  for (const auto &[global, base] : mod->functions) {
+    auto function = base.as<tirx::PrimFunc>();
+    if (!function.has_value())
+      continue;
+    tirx::PrimFunc rewritten = function.value();
+    rewritten.CopyOnWrite()->body = CurrentComputeIDShifter(
+        accumulator_offsets, value_offsets, direction)(rewritten->body);
+    result->Update(global, rewritten);
+  }
+  return result;
+}
+
+std::vector<PipeDescriptor>
+RestoreCurrentTransports(const DeviceIRDescriptorFamily &family,
+                         const PipeDescriptor &prototype) {
   Check(family->source_parts.empty(),
         "transport family cannot have source string parts");
   DecodedFields fields = ReadFields(
-      family,
-      {"pipe_net_id", "event_index", "source_x", "source_y",
-       "destination_begin_x", "destination_begin_y", "destination_end_x",
-       "destination_end_y", "payload_dfb_id"});
+      family, {"pipe_net_id", "communication_id", "record_index", "source_x",
+               "source_y", "destination_begin_x", "destination_begin_y",
+               "destination_end_x", "destination_end_y", "payload_dfb_id"});
   std::vector<PipeDescriptor> result;
   result.reserve(family->positions->count);
   for (int64_t row = 0; row < family->positions->count; ++row)
     result.emplace_back(
-        fields.at("pipe_net_id")[row], fields.at("event_index")[row],
+        fields.at("pipe_net_id")[row], fields.at("communication_id")[row],
+        fields.at("record_index")[row],
         CoreCoord(fields.at("source_x")[row], fields.at("source_y")[row]),
         CoreCoord(fields.at("destination_begin_x")[row],
                   fields.at("destination_begin_y")[row]),
@@ -1046,10 +1207,8 @@ IRModule ExpandDeviceTables(IRModule mod) {
 bool HasCurrentDeviceFamilies(const IRModule &mod) {
   if (!mod->attrs.defined())
     return false;
-  for (const char *key :
-       {kDFBFamiliesAttr, kAccumulatorFamiliesAttr,
-        kComputeValueFamiliesAttr, kCommunicationStepFamiliesAttr,
-        kTransportFamiliesAttr})
+  for (const char *key : {kDFBFamiliesAttr, kAccumulatorFamiliesAttr,
+                          kComputeValueFamiliesAttr, kTransportFamiliesAttr})
     if (mod->attrs->dict.count(key))
       return true;
   return false;
@@ -1063,26 +1222,101 @@ IRModule ParameterizeCurrentDeviceTables(IRModule mod) {
   auto dfbs = mod->GetAttr<ffi::Array<DFBDescriptor>>(kDFBTableAttr);
   auto accumulators =
       mod->GetAttr<ffi::Array<AccumulatorDescriptor>>(kAccumulatorTableAttr);
-  auto values = mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(
-      kComputeValueTableAttr);
-  auto steps = mod->GetAttr<ffi::Array<CommunicationStepDescriptor>>(
-      "tt.communication_step_table");
+  auto values =
+      mod->GetAttr<ffi::Array<ComputeValueDescriptor>>(kComputeValueTableAttr);
   auto transports =
       mod->GetAttr<ffi::Array<PipeDescriptor>>("tt.transport_table");
+  bool stream_operands =
+      mod->GetAttr<Integer>("tt.stream_operands").value_or(Integer(0))->value ==
+      1;
   Check(dfbs.has_value(), "current Device IR is missing tt.dfb_table");
-  Check(steps.has_value(),
-        "current Device IR is missing tt.communication_step_table");
   Check(transports.has_value(),
         "current Device IR is missing tt.transport_table");
-  if (values.has_value()) {
-    std::set<int64_t> value_ids;
-    for (size_t index = 0; index < values.value().size(); ++index) {
-      const ComputeValueDescriptor &value = values.value()[index];
-      Check(value.defined() && value_ids.insert(value->value_id).second,
-            "duplicate compute value descriptor ID");
-      Check(value->value_id == static_cast<int64_t>(index),
-            "undefined compute value descriptor ID");
+  auto expanded_accumulator_local_ids =
+      mod->GetAttr<ffi::Array<Integer>>(kExpandedAccumulatorLocalIDs);
+  auto expanded_value_local_ids =
+      mod->GetAttr<ffi::Array<Integer>>(kExpandedComputeValueLocalIDs);
+  if (expanded_accumulator_local_ids.has_value() ||
+      expanded_value_local_ids.has_value())
+    mod = ShiftCurrentComputeIDs(
+        mod, accumulators.value_or(ffi::Array<AccumulatorDescriptor>()),
+        expanded_accumulator_local_ids.value_or(ffi::Array<Integer>()),
+        values.value_or(ffi::Array<ComputeValueDescriptor>()),
+        expanded_value_local_ids.value_or(ffi::Array<Integer>()), -1);
+  if (expanded_accumulator_local_ids.has_value()) {
+    Check(accumulators.has_value() &&
+              accumulators.value().size() ==
+                  expanded_accumulator_local_ids.value().size(),
+          "expanded accumulator local-ID relation has the wrong size");
+    ffi::Array<AccumulatorDescriptor> localized;
+    for (size_t index = 0; index < accumulators.value().size(); ++index) {
+      const AccumulatorDescriptor &entry = accumulators.value()[index];
+      localized.push_back(AccumulatorDescriptor(
+          expanded_accumulator_local_ids.value()[index]->value,
+          entry->accumulator_region, entry->input_dtype,
+          entry->accumulation_dtype, entry->output_dtype, entry->full_k_tiles,
+          entry->core_domain, entry->source_span));
     }
+    accumulators = localized;
+    mod = WithAttr(mod, kAccumulatorTableAttr, localized);
+  }
+  if (expanded_value_local_ids.has_value()) {
+    Check(values.has_value() &&
+              values.value().size() == expanded_value_local_ids.value().size(),
+          "duplicate compute value descriptor or expanded local-ID relation "
+          "has the wrong size");
+    ffi::Array<ComputeValueDescriptor> localized;
+    for (size_t index = 0; index < values.value().size(); ++index) {
+      const ComputeValueDescriptor &entry = values.value()[index];
+      int64_t previous = -1;
+      if (entry->previous_value_id >= 0) {
+        Check(entry->previous_value_id <
+                  static_cast<int64_t>(expanded_value_local_ids.value().size()),
+              "compute value predecessor references a missing descriptor");
+        previous =
+            expanded_value_local_ids.value()[entry->previous_value_id]->value;
+      }
+      int64_t accumulator = -1;
+      if (entry->accumulator_id >= 0) {
+        Check(expanded_accumulator_local_ids.has_value() &&
+                  entry->accumulator_id <
+                      static_cast<int64_t>(
+                          expanded_accumulator_local_ids.value().size()),
+              "compute value references a missing accumulator descriptor");
+        accumulator =
+            expanded_accumulator_local_ids.value()[entry->accumulator_id]
+                ->value;
+      }
+      localized.push_back(ComputeValueDescriptor(
+          expanded_value_local_ids.value()[index]->value, entry->buffer,
+          entry->version, previous, accumulator, entry->value_kind,
+          entry->logical_shape, entry->compute_tile_shape, entry->dtype,
+          entry->owner_slot, entry->core_domain, entry->materialization_refs,
+          entry->source_span));
+    }
+    values = localized;
+    mod = WithAttr(mod, kComputeValueTableAttr, localized);
+  }
+  if (values.has_value()) {
+    std::set<LocalComputeKey> value_ids;
+    for (const ComputeValueDescriptor &value : values.value())
+      Check(value.defined() && value_ids
+                                   .insert(ComputeInstanceKey(
+                                       value->core_domain, value->value_id,
+                                       "current compute value"))
+                                   .second,
+            "duplicate Core-local compute value descriptor ID");
+  }
+  if (accumulators.has_value()) {
+    std::set<LocalComputeKey> accumulator_ids;
+    for (const AccumulatorDescriptor &accumulator : accumulators.value())
+      Check(accumulator.defined() &&
+                accumulator_ids
+                    .insert(ComputeInstanceKey(accumulator->core_domain,
+                                               accumulator->accumulator_id,
+                                               "current accumulator"))
+                    .second,
+            "duplicate Core-local accumulator descriptor ID");
   }
   ffi::Array<DeviceIRDescriptorFamily> dfb_families =
       LocalizeFamilyPositions(CompactDFBs(dfbs.value()));
@@ -1091,47 +1325,60 @@ IRModule ParameterizeCurrentDeviceTables(IRModule mod) {
   auto stages = mod->GetAttr<Integer>(kPipelineStagesAttr);
   auto extent = mod->GetAttr<Integer>(kPipelineExtentAttr);
   if (stages.has_value() != extent.has_value())
-    Check(false,
-          stages.has_value()
-              ? "missing required Module attr tt.pipeline_extent"
-              : "missing required Module attr tt.pipeline_stages");
-  int64_t pipeline_depth =
-      stages.has_value() ? std::min(stages.value()->value,
-                                    extent.value()->value)
-                         : 0;
-  auto raw_groups = diagnostic_expansion && pipeline_depth > 0
-                        ? mod->GetAttr<ffi::Map<ffi::String, Integer>>(
-                              kDFBStorageGroupsAttr)
-                        : mod->GetAttr<ffi::Map<ffi::String, Integer>>(
-                              kInternalDFBStorageGroupsAttr);
-  auto raw_relations =
-      diagnostic_expansion && pipeline_depth > 0
-          ? mod->GetAttr<ffi::Map<ffi::String, ffi::Array<Integer>>>(
-                kPipelineRelationsAttr)
-          : mod->GetAttr<ffi::Map<ffi::String, ffi::Array<Integer>>>(
-                kInternalDFBTransactionRelationsAttr);
-  CurrentStorageGroups storage = BuildCurrentStorageGroups(
-      dfbs.value(), dfb_families, raw_groups, raw_relations,
-      pipeline_depth);
-  mod = WithAttr(mod, kDFBFamiliesAttr, dfb_families);
+    Check(false, stages.has_value()
+                     ? "missing required Module attr tt.pipeline_extent"
+                     : "missing required Module attr tt.pipeline_stages");
+  int64_t pipeline_depth = stages.has_value() ? std::min(stages.value()->value,
+                                                         extent.value()->value)
+                                              : 0;
+  ffi::Optional<ffi::Map<ffi::String, Integer>> raw_groups;
+  ffi::Optional<ffi::Map<ffi::String, ffi::Array<Integer>>> raw_relations;
+  if (!stream_operands) {
+    raw_groups = diagnostic_expansion && pipeline_depth > 0
+                     ? mod->GetAttr<ffi::Map<ffi::String, Integer>>(
+                           kDFBStorageGroupsAttr)
+                     : mod->GetAttr<ffi::Map<ffi::String, Integer>>(
+                           kInternalDFBStorageGroupsAttr);
+    raw_relations =
+        diagnostic_expansion && pipeline_depth > 0
+            ? mod->GetAttr<ffi::Map<ffi::String, ffi::Array<Integer>>>(
+                  kPipelineRelationsAttr)
+            : mod->GetAttr<ffi::Map<ffi::String, ffi::Array<Integer>>>(
+                  kInternalDFBTransactionRelationsAttr);
+  }
+  auto planned_streams = mod->GetAttr<ffi::Array<DFBStorageGroupDescriptor>>(
+      kDFBStorageGroupsAttr);
+  CurrentStorageGroups storage;
+  if (stream_operands) {
+    Check(planned_streams.has_value(),
+          "stream-centric Device IR requires materialized logical streams");
+    storage.descriptors = planned_streams.value();
+    mod = WithoutAttr(mod, kDFBFamiliesAttr);
+    mod = WithoutAttr(mod, kDFBStorageGroupRelationsAttr);
+  } else {
+    storage = BuildCurrentStorageGroups(dfbs.value(), dfb_families, raw_groups,
+                                        raw_relations, pipeline_depth);
+    mod = WithAttr(mod, kDFBFamiliesAttr, dfb_families);
+    mod = WithAttr(mod, kDFBStorageGroupRelationsAttr, storage.relations);
+  }
   mod = WithoutAttr(mod, kDFBTableAttr);
   mod = WithAttr(mod, kDFBStorageGroupsAttr, storage.descriptors);
-  mod = WithAttr(mod, kDFBStorageGroupRelationsAttr, storage.relations);
   if (mod->attrs->dict.count("tt.expanded_storage_group_descriptors"))
     mod = WithoutAttr(mod, "tt.expanded_storage_group_descriptors");
   if (mod->attrs->dict.count("tt.current_device_table_expansion"))
     mod = WithoutAttr(mod, "tt.current_device_table_expansion");
   if (mod->attrs->dict.count("tt.expanded_dfb_transaction_relations"))
     mod = WithoutAttr(mod, "tt.expanded_dfb_transaction_relations");
+  if (mod->attrs->dict.count(kExpandedAccumulatorLocalIDs))
+    mod = WithoutAttr(mod, kExpandedAccumulatorLocalIDs);
+  if (mod->attrs->dict.count(kExpandedComputeValueLocalIDs))
+    mod = WithoutAttr(mod, kExpandedComputeValueLocalIDs);
   if (mod->attrs->dict.count(kInternalDFBStorageGroupsAttr))
     mod = WithoutAttr(mod, kInternalDFBStorageGroupsAttr);
   if (mod->attrs->dict.count(kInternalDFBTransactionRelationsAttr))
     mod = WithoutAttr(mod, kInternalDFBTransactionRelationsAttr);
   if (mod->attrs->dict.count(kPipelineRelationsAttr))
     mod = WithoutAttr(mod, kPipelineRelationsAttr);
-  mod = WithAttr(mod, kCommunicationStepFamiliesAttr,
-                 CompactCurrentSteps(steps.value()));
-  mod = WithoutAttr(mod, "tt.communication_step_table");
   mod = WithAttr(mod, kTransportFamiliesAttr,
                  CompactCurrentTransports(transports.value()));
   mod = WithoutAttr(mod, "tt.transport_table");
@@ -1151,45 +1398,54 @@ IRModule ParameterizeCurrentDeviceTables(IRModule mod) {
 IRModule ExpandCurrentDeviceTables(IRModule mod) {
   if (!HasCurrentDeviceFamilies(mod))
     return mod;
+  bool stream_operands =
+      mod->GetAttr<Integer>("tt.stream_operands").value_or(Integer(0))->value ==
+      1;
   auto dfbs =
       mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(kDFBFamiliesAttr);
   auto accumulators = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
       kAccumulatorFamiliesAttr);
   auto values = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
       kComputeValueFamiliesAttr);
-  auto steps = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
-      kCommunicationStepFamiliesAttr);
   auto transports = mod->GetAttr<ffi::Array<DeviceIRDescriptorFamily>>(
       kTransportFamiliesAttr);
   auto storage_groups = mod->GetAttr<ffi::Array<DFBStorageGroupDescriptor>>(
       kDFBStorageGroupsAttr);
   auto storage_relations = mod->GetAttr<ffi::Array<DFBStorageGroupRelation>>(
       kDFBStorageGroupRelationsAttr);
-  Check(dfbs.has_value() && steps.has_value() && transports.has_value(),
-        "current Device family representation requires DFB, step and transport families");
-  Check(storage_groups.has_value() && storage_relations.has_value() &&
-            storage_relations.value().size() == dfbs.value().size(),
-        "current Device family representation requires typed storage groups and relations");
+  Check(transports.has_value(),
+        "current Device family representation requires transport families");
+  Check(storage_groups.has_value(),
+        "current Device representation requires typed logical streams");
+  if (stream_operands) {
+    Check(!dfbs.has_value() && !storage_relations.has_value(),
+          "stream-centric Device IR cannot persist DFB generation families");
+  } else {
+    Check(dfbs.has_value() && storage_relations.has_value() &&
+              storage_relations.value().size() == dfbs.value().size(),
+          "current Device family representation requires DFB families and "
+          "storage relations");
+  }
   Check(!mod->attrs->dict.count(kDFBTableAttr) &&
-            !mod->attrs->dict.count("tt.communication_step_table") &&
             !mod->attrs->dict.count("tt.transport_table") &&
             (!accumulators.has_value() ||
              !mod->attrs->dict.count(kAccumulatorTableAttr)) &&
             (!values.has_value() ||
              !mod->attrs->dict.count(kComputeValueTableAttr)),
         "current Device IR cannot mix a table with its family representation");
-  int64_t dfb_count = TableSize(dfbs.value());
+  int64_t dfb_count = dfbs.has_value() ? TableSize(dfbs.value()) : 0;
   int64_t accumulator_count =
       accumulators.has_value() ? TableSize(accumulators.value()) : 0;
   int64_t value_count = values.has_value() ? TableSize(values.value()) : 0;
-  int64_t step_count = TableSize(steps.value());
   int64_t transport_count = TableSize(transports.value());
+  CurrentComputeExpansion compute =
+      ExpandCurrentComputeInstances(accumulators, values);
+  Check(compute.accumulators.size() == static_cast<size_t>(accumulator_count) &&
+            compute.values.size() == static_cast<size_t>(value_count),
+        "current compute family expansion size mismatch");
   Check(dfb_count <= kExpansionBudget - accumulator_count &&
-            dfb_count + accumulator_count <=
-                kExpansionBudget - value_count &&
+            dfb_count + accumulator_count <= kExpansionBudget - value_count &&
             dfb_count + accumulator_count + value_count <=
-                kExpansionBudget - step_count &&
-            dfb_count + accumulator_count + value_count + step_count <=
                 kExpansionBudget - transport_count,
         "current Device family expansion exceeds the bounded proof budget");
   ffi::Map<ffi::String, Integer> expanded_groups;
@@ -1200,93 +1456,96 @@ IRModule ExpandCurrentDeviceTables(IRModule mod) {
   if (pipeline_stages.has_value() && pipeline_extent.has_value())
     pipeline_depth = std::min(pipeline_stages.value()->value,
                               pipeline_extent.value()->value);
-  for (size_t family_id = 0; family_id < dfbs.value().size(); ++family_id) {
-    const DeviceIRDescriptorFamily &family = dfbs.value()[family_id];
-    const DFBStorageGroupRelation &relation =
-        storage_relations.value()[family_id];
-    Check(relation.defined() &&
-              relation->dfb_family_id == static_cast<int64_t>(family_id) &&
-              family->fields.count("dfb_id"),
-          "storage-group relation does not match its DFB family");
-    std::vector<int64_t> ids = ExpandDeviceIntColumn(
-        family->fields.at("dfb_id"), family->positions->count);
-    std::vector<int64_t> groups = ExpandDeviceIntColumn(
-        relation->storage_group_ids, family->positions->count);
-    std::vector<int64_t> ordinals = ExpandDeviceIntColumn(
-        relation->transaction_ordinals, family->positions->count);
-    std::vector<int64_t> pipeline_iterations = ExpandDeviceIntColumn(
-        relation->pipeline_iterations, family->positions->count);
-    for (size_t row = 0; row < ids.size(); ++row) {
-      ffi::String key = std::to_string(ids[row]);
-      int64_t iteration = pipeline_iterations[row];
-      expanded_groups.Set(key, Integer(groups[row]));
-      expanded_relations.Set(
-          key, {Integer(iteration),
-                Integer(iteration < 0 || pipeline_depth <= 0
-                            ? 0
-                            : iteration % pipeline_depth)});
+  if (!stream_operands) {
+    for (size_t family_id = 0; family_id < dfbs.value().size(); ++family_id) {
+      const DeviceIRDescriptorFamily &family = dfbs.value()[family_id];
+      const DFBStorageGroupRelation &relation =
+          storage_relations.value()[family_id];
+      Check(relation.defined() &&
+                relation->dfb_family_id == static_cast<int64_t>(family_id) &&
+                family->fields.count("dfb_id"),
+            "storage-group relation does not match its DFB family");
+      std::vector<int64_t> ids = ExpandDeviceIntColumn(
+          family->fields.at("dfb_id"), family->positions->count);
+      std::vector<int64_t> groups = ExpandDeviceIntColumn(
+          relation->storage_group_ids, family->positions->count);
+      std::vector<int64_t> ordinals = ExpandDeviceIntColumn(
+          relation->transaction_ordinals, family->positions->count);
+      std::vector<int64_t> pipeline_iterations = ExpandDeviceIntColumn(
+          relation->pipeline_iterations, family->positions->count);
+      for (size_t row = 0; row < ids.size(); ++row) {
+        ffi::String key = std::to_string(ids[row]);
+        int64_t iteration = pipeline_iterations[row];
+        expanded_groups.Set(key, Integer(groups[row]));
+        expanded_relations.Set(
+            key,
+            {Integer(iteration), Integer(iteration < 0 || pipeline_depth <= 0
+                                             ? 0
+                                             : iteration % pipeline_depth)});
+      }
     }
-  }
-  mod = WithAttr(mod, "tt.expanded_storage_group_descriptors",
-                 storage_groups.value());
-  mod = WithAttr(mod, kDFBStorageGroupsAttr, expanded_groups);
-  mod = WithAttr(mod, kInternalDFBStorageGroupsAttr, expanded_groups);
-  mod = WithoutAttr(mod, kDFBStorageGroupRelationsAttr);
-  mod = WithAttr(mod, "tt.expanded_dfb_transaction_relations",
-                 expanded_relations);
-  if (pipeline_stages.has_value() && pipeline_extent.has_value())
-    mod = WithAttr(mod, kInternalDFBTransactionRelationsAttr,
+    mod = WithAttr(mod, "tt.expanded_storage_group_descriptors",
+                   storage_groups.value());
+    mod = WithAttr(mod, kDFBStorageGroupsAttr, expanded_groups);
+    mod = WithAttr(mod, kInternalDFBStorageGroupsAttr, expanded_groups);
+    mod = WithoutAttr(mod, kDFBStorageGroupRelationsAttr);
+    mod = WithAttr(mod, "tt.expanded_dfb_transaction_relations",
                    expanded_relations);
-  if (pipeline_stages.has_value() && pipeline_extent.has_value())
-    mod = WithAttr(mod, kPipelineRelationsAttr, expanded_relations);
+    if (pipeline_stages.has_value() && pipeline_extent.has_value())
+      mod = WithAttr(mod, kInternalDFBTransactionRelationsAttr,
+                     expanded_relations);
+    if (pipeline_stages.has_value() && pipeline_extent.has_value())
+      mod = WithAttr(mod, kPipelineRelationsAttr, expanded_relations);
+  }
   mod = WithAttr(mod, "tt.current_device_table_expansion", Integer(1));
-  mod = WithAttr(
-      mod, kDFBTableAttr,
-      ExpandCurrentTable<DFBDescriptor>(
-          dfbs.value(), dfb_count, RestoreDFBs,
-          [](const DFBDescriptor &descriptor) { return descriptor->dfb_id; }));
-  mod = WithoutAttr(mod, kDFBFamiliesAttr);
-  mod = WithAttr(
-      mod, "tt.communication_step_table",
-      ExpandCurrentTable<CommunicationStepDescriptor>(
-          steps.value(), step_count, RestoreCurrentSteps,
-          [](const CommunicationStepDescriptor &descriptor) {
-            return descriptor->step_id;
-          }));
-  mod = WithoutAttr(mod, kCommunicationStepFamiliesAttr);
-  mod = WithAttr(mod, "tt.transport_table",
-                 ExpandTable<PipeDescriptor>(transports.value(),
-                                             transport_count,
-                                             RestoreCurrentTransports));
+  if (stream_operands) {
+    ffi::Array<DFBDescriptor> stream_table;
+    for (const DFBStorageGroupDescriptor &stream : storage_groups.value())
+      stream_table.push_back(DFBDescriptor(
+          stream->storage_group_id,
+          "stream." + std::to_string(stream->storage_group_id),
+          stream->element_dtype, stream->tile_shape,
+          stream->block_shape_in_tiles, stream->block_count, std::nullopt,
+          stream->producer_slot, stream->producer_domain, stream->consumer_slot,
+          stream->consumer_domain, stream->transaction_count_or_loop_relation,
+          stream->source_span));
+    mod = WithAttr(mod, kDFBTableAttr, stream_table);
+  } else {
+    mod = WithAttr(
+        mod, kDFBTableAttr,
+        ExpandCurrentTable<DFBDescriptor>(dfbs.value(), dfb_count, RestoreDFBs,
+                                          [](const DFBDescriptor &descriptor) {
+                                            return descriptor->dfb_id;
+                                          }));
+    mod = WithoutAttr(mod, kDFBFamiliesAttr);
+  }
+  mod =
+      WithAttr(mod, "tt.transport_table",
+               ExpandTable<PipeDescriptor>(transports.value(), transport_count,
+                                           RestoreCurrentTransports));
   mod = WithoutAttr(mod, kTransportFamiliesAttr);
   if (accumulators.has_value()) {
-    mod = WithAttr(
-        mod, kAccumulatorTableAttr,
-        ExpandCurrentTable<AccumulatorDescriptor>(
-            accumulators.value(), accumulator_count,
-            RestoreCurrentAccumulators,
-            [](const AccumulatorDescriptor &descriptor) {
-              return descriptor->accumulator_id;
-            }));
+    mod = WithAttr(mod, kAccumulatorTableAttr, compute.accumulators);
+    mod = WithAttr(mod, kExpandedAccumulatorLocalIDs,
+                   compute.accumulator_local_ids);
     mod = WithoutAttr(mod, kAccumulatorFamiliesAttr);
   }
   if (values.has_value()) {
-    mod = WithAttr(
-        mod, kComputeValueTableAttr,
-        ExpandCurrentTable<ComputeValueDescriptor>(
-            values.value(), value_count, RestoreCurrentValues,
-            [](const ComputeValueDescriptor &descriptor) {
-              return descriptor->value_id;
-            }));
+    mod = WithAttr(mod, kComputeValueTableAttr, compute.values);
+    mod = WithAttr(mod, kExpandedComputeValueLocalIDs, compute.value_local_ids);
     mod = WithoutAttr(mod, kComputeValueFamiliesAttr);
   }
-  return mod;
+  return ShiftCurrentComputeIDs(mod, compute.accumulators,
+                                compute.accumulator_local_ids, compute.values,
+                                compute.value_local_ids, 1);
 }
 
 IRModule DiscardCurrentDeviceExpansionMetadata(IRModule mod) {
-  for (const char *key : {"tt.current_device_table_expansion",
-                          "tt.expanded_storage_group_descriptors",
-                          "tt.expanded_dfb_transaction_relations"})
+  for (const char *key :
+       {"tt.current_device_table_expansion",
+        "tt.expanded_storage_group_descriptors",
+        "tt.expanded_dfb_transaction_relations", kExpandedAccumulatorLocalIDs,
+        kExpandedComputeValueLocalIDs})
     if (mod->attrs.defined() && mod->attrs->dict.count(key))
       mod = WithoutAttr(mod, key);
   if (mod->attrs.defined() && mod->attrs->dict.count(kPipelineRelationsAttr))

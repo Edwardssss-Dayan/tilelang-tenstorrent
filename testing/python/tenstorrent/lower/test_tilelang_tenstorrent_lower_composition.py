@@ -5,7 +5,7 @@ import pytest
 from tilelang import tvm
 from tilelang.tenstorrent import device_ir as D
 from tilelang.tenstorrent import language as T, lower_tenstorrent_ir, transform
-from tvm import ir
+from tvm import ir, tirx
 
 from testing.python.tenstorrent._support.reference import TARGET, _calls, _round, interpret
 
@@ -21,6 +21,19 @@ def lower(program, version=7):
 
 def lower_result(program):
     return lower_tenstorrent_ir(tvm.IRModule({"main": program}), TARGET)
+
+
+def _column_values(column):
+    values = list(map(int, column.values))
+    period = int(column.period)
+    return [
+        values[row % period] + int(column.step) * (row // period)
+        if period
+        else values[row]
+        if values
+        else int(column.start) + int(column.step) * row
+        for row in range(int(column.count))
+    ]
 
 
 def transpose_fragment(dtype="float32", source_fragment=False):
@@ -58,6 +71,38 @@ def test_transpose_fragment_exact_dtype_and_reentry(dtype, source_fragment):
     )
     assert transpose.op.name == "tl.tt.dfb_compute"
     assert all(str(dfb.element_dtype) == dtype for dfb in mod.attrs["tt.dfb_table"])
+
+
+def separate_tiles_stores():
+    @T.prim_func
+    def main(
+        A: T.Tensor((32, 32), "float32"),
+        B: T.Tensor((32, 32), "float32"),
+        C: T.Tensor((32, 32), "float32"),
+    ):
+        with T.Kernel(1, 1, threads=1):
+            a = T.alloc_shared((32, 32), "float32")
+            b = T.alloc_shared((32, 32), "float32")
+            f = T.alloc_fragment((32, 32), "float32")
+            g = T.alloc_fragment((32, 32), "float32")
+            T.copy(A, a)
+            T.copy(B, b)
+            for i, j in T.Tiles(f):
+                f[i, j] = a[i, j] + b[i, j]
+            for i, j in T.Tiles(g):
+                g[i, j] = f[i, j] * T.float32(2)
+            T.copy(g, C)
+
+    return main
+
+
+def test_separate_tiles_stores_preserve_ordered_fragment_values():
+    mod = lower(separate_tiles_stores())
+    rng = np.random.default_rng(19)
+    a = rng.normal(size=(32, 32)).astype("float32")
+    b = rng.normal(size=(32, 32)).astype("float32")
+    outputs, _ = interpret(mod, [a, b, np.zeros_like(a)])
+    np.testing.assert_array_equal(outputs[2], (a + b) * 2)
 
 
 def multicore_values():
@@ -102,6 +147,41 @@ def test_multicore_values_have_isolated_versions_and_numeric_outputs():
         for value in definitions
     }
     assert domains == {(0, 0, 1, 1), (1, 0, 2, 1)}
+
+
+def test_multicore_values_use_spmd_local_definition_ids():
+    mod = lower_result(multicore_values())
+    assert all(len(set(_column_values(family.fields["value_id"]))) == 1 for family in mod.attrs["tt.compute_value_families"])
+    trisc = next(function for function in mod.functions.values() if str(function.attrs["tt.kernel_slot"]) == "trisc")
+    value_operands = []
+
+    def visit(node):
+        if not isinstance(node, tirx.Call) or not hasattr(node.op, "name"):
+            return
+        if node.op.name in (
+            "tl.tt.compute_value",
+            "tl.tt.compute_value_gemm",
+            "tl.tt.compute_value_store",
+            "tl.tt.compute_value_load",
+        ):
+            value_operands.append(node.args[0])
+        if node.op.name == "tl.tt.compute_value_gemm" and int(node.args[3]) >= 0:
+            value_operands.append(node.args[3])
+        for value in node.annotations.get("tt.value_inputs", []):
+            value_operands.append(value)
+
+    tirx.stmt_functor.post_order_visit(trisc.body, visit)
+    assert value_operands
+    aliases = {}
+
+    def collect_alias(node):
+        if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.compute_value_ref":
+            aliases[node.var] = node.value
+
+    tirx.stmt_functor.post_order_visit(trisc.body, collect_alias)
+    assert aliases
+    assert all(isinstance(operand, tirx.Var) and operand in aliases for operand in value_operands)
+    assert all(isinstance(reference.args[0], tirx.IntImm) for reference in aliases.values())
 
 
 def pipe_values():
@@ -159,8 +239,10 @@ def test_independent_fragment_pipeline_prefetch_and_semantics(stages, extent):
     transfer = next(func for func in mod.functions.values() if str(func.attrs["tt.kernel_slot"]) == "ncrisc")
     calls = list(_calls(transfer.body))
     first_completion = next(i for i, call in enumerate(calls) if call.op.name == "tl.tt.dfb_copy_wait")
-    assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in calls[:first_completion]) == min(stages, extent)
-    assert len(set(map(int, mod.attrs["tt.dfb_storage_groups"].values()))) == 2
+    # Lower preserves one lexical copy/completion site. TT-Lang consumes the
+    # pipeline policy and stage count when it forms a physical prefetch window.
+    assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in calls[:first_completion]) == 1
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == len(mod.attrs["tt.dfb_table"])
 
 
 def full_k_pipeline(blocks=5, stages=2):
@@ -191,13 +273,12 @@ def test_full_k_pipeline_preserves_fp32_and_finite_pools(seed):
     result, _ = interpret(mod, [a, b, np.zeros((32, 32), "float32")], seed)
     np.testing.assert_array_equal(result[2], identity * 2.375)
     assert int(mod.attrs["tt.accumulator_table"][0].full_k_tiles) == 5
-    relations = mod.attrs["tt.pipeline_relations"]
-    singletons = [dfb for dfb in mod.attrs["tt.dfb_table"] if int(relations[str(int(dfb.dfb_id))][0]) == -1]
+    singletons = [dfb for dfb in mod.attrs["tt.dfb_table"] if str(dfb.producer_slot) == "trisc" and str(dfb.consumer_slot) == "ncrisc"]
     assert len(singletons) == 1 and int(singletons[0].block_count) == 1
-    assert len(set(map(int, mod.attrs["tt.dfb_storage_groups"].values()))) == 3
+    assert len(mod.attrs["tt.dfb_storage_groups"]) == len(mod.attrs["tt.dfb_table"])
     transfers = [call for f in mod.functions.values() if str(f.attrs["tt.kernel_slot"]) == "ncrisc" for call in _calls(f.body)]
     first_completion = next(i for i, call in enumerate(transfers) if call.op.name == "tl.tt.dfb_copy_wait")
-    assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in transfers[:first_completion]) == 4
+    assert sum(call.op.name == "tl.tt.tensor_to_dfb_nd" for call in transfers[:first_completion]) == 1
 
 
 def pipeline_pipe_values(extent=5, stages=2):
@@ -384,9 +465,8 @@ def pipeline_tensor_inout():
 
 
 def test_fragment_tensor_inout_cannot_be_prefetched():
-    mod = lower_result(pipeline_tensor_inout())
-    assert str(mod.attrs["tt.ir_stage"]) == "structured"
-    assert any("inout Tensor" in str(reason) for reason in mod.attrs["tt.deferred_reasons"])  # codespell:ignore inout
+    with pytest.raises(NotImplementedError, match="inout Tensor"):  # codespell:ignore inout
+        lower_result(pipeline_tensor_inout())
 
 
 def pipeline_carried_fragment():
@@ -404,9 +484,5 @@ def pipeline_carried_fragment():
 
 
 def test_loop_carried_ordinary_fragment_requires_explicit_spill_plan():
-    mod = lower_result(pipeline_carried_fragment())
-    assert str(mod.attrs["tt.ir_stage"]) == "structured"
-    assert any(
-        "carries a value across iterations" in str(reason)
-        for reason in mod.attrs["tt.deferred_reasons"]
-    )
+    with pytest.raises(NotImplementedError, match="carries a value across iterations|must be independently initialized"):
+        lower_result(pipeline_carried_fragment())

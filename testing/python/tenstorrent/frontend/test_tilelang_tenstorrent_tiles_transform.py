@@ -6,6 +6,7 @@ from tilelang import transform, tvm
 from tilelang.backend import create_backend_context
 from tilelang.tenstorrent import execution_backend
 from tilelang.tenstorrent import language as T
+from tilelang.tenstorrent import transform as tt_transform
 from tvm import ir, tirx
 
 
@@ -131,7 +132,15 @@ def _reject_frontend(mod, match):
     assert ir.save_json(mod) == before, "Frontend validation must be read-only"
 
 
-@pytest.mark.parametrize("shape,block_shape", [((32, 32), [1, 1]), ((64, 64), [2, 2]), ((128, 32), [4, 1])])
+@pytest.mark.parametrize(
+    "shape,block_shape",
+    [
+        ((32, 32), [1, 1]),
+        ((33, 32), [2, 1]),
+        ((64, 64), [2, 2]),
+        ((128, 32), [4, 1]),
+    ],
+)
 def test_identity_captures_full_regions_and_tile_geometry(shape, block_shape):
     mod = _canonicalize(_module(shape))
     (block,) = _blocks(mod)
@@ -166,6 +175,29 @@ def test_compound_expression_and_repeated_loads():
     assert isinstance(block.body.value, tirx.Add)
     assert isinstance(block.body.value.a, tirx.Mul)
     assert _effects_by_name(block.reads) == {"A": [64, 64], "B": [64, 64]}
+
+
+def test_frontend_rejects_multiple_stores_in_one_tiles_scope():
+    @T.prim_func
+    def main(A: T.Tensor((32, 32), "float32"), C: T.Tensor((32, 32), "float32")):
+        with T.Kernel(1, 1, threads=1):
+            a = T.alloc_shared((32, 32), "float32")
+            c = T.alloc_shared((32, 32), "float32")
+            T.copy(A, a)
+            for i, j in T.Tiles(c):
+                c[i, j] = a[i, j] + T.float32(1)
+                a[i, j] = c[i, j] * T.float32(2)
+            T.copy(c, C)
+
+    mod = tirx.transform.BindTarget(tvm.target.Target(TARGET))(tvm.IRModule({"main": main}))
+    _reject_frontend(mod, "exactly one BufferStore assignment; found 2")
+
+
+def test_canonicalizer_defensively_rejects_multiple_stores_atomically():
+    def body(a, b, c, ij, store):
+        return tirx.SeqStmt([store, tirx.BufferStore(a, c[tuple(ij)] * b[0, ij[1]], ij)])
+
+    _reject(_module(body=body), "exactly one BufferStore assignment")
 
 
 @pytest.mark.parametrize("kind", ["constant", "cast", "exp", "inplace"])
@@ -263,8 +295,8 @@ def test_allocation_metadata_survives_canonicalization_and_lower_opaque_block(fl
         assert int(allocation.annotations["tt.dfb_block_count"]) == (3 if allocation.buffer.name == "A" else 2)
 
 
-@pytest.mark.parametrize("shape", [(32,), (48, 64)])
-def test_reject_unsupported_domain_geometry(shape):
+@pytest.mark.parametrize("shape", [(32,)])
+def test_reject_unsupported_domain_rank(shape):
     _reject(_module(shape), "rank|[Rr]ank|divisib|32")
 
 
@@ -310,13 +342,25 @@ def test_reject_bool_tiles_extent_before_capture(inner):
         _replace_tiles_loop_extent(_module()["main"], "bool", inner)
 
 
-@pytest.mark.parametrize("b_shape,indices", [((32, 32), "identity"), ((256,), "row"), ((1, 256), "row")])
-def test_reject_mismatched_or_unpadded_operand(b_shape, indices):
+@pytest.mark.parametrize("b_shape,indices", [((32, 32), "identity"), ((256,), "row")])
+def test_reject_mismatched_operand(b_shape, indices):
     def expression(a, b, c, ij):
         access = tuple(ij) if indices == "identity" else ((ij[1],) if len(b_shape) == 1 else (0, ij[1]))
         return a[tuple(ij)] + b[access]
 
     _reject(_module((64, 256), b_shape=b_shape, expression=expression), "[Ss]hape|rank|[Rr]ank|divisib|padded")
+
+
+def test_capture_preserves_unpadded_broadcast_for_layout_capability():
+    def expression(a, b, c, ij):
+        return a[tuple(ij)] + b[0, ij[1]]
+
+    captured = _canonicalize(_module((64, 256), b_shape=(1, 256), expression=expression))
+    (block,) = _blocks(captured)
+    assert _effects_by_name(block.reads) == {"A": [64, 256], "B": [1, 256]}
+    normalized = tt_transform.NormalizeTenstorrentBufferMetadata()(captured)
+    with pytest.raises(NotImplementedError, match="padding/mask contract"):
+        tt_transform.InferTenstorrentTensorLayout()(normalized)
 
 
 @pytest.mark.parametrize("kind", ["transpose", "offset", "coordinate", "gather", "recurrence", "unknown_call"])
@@ -338,11 +382,9 @@ def test_reject_unsupported_access_or_expression(kind):
     _reject(_module(expression=expression), "indices|[Aa]ccess|loop variables|[Cc]all|pure|Phase 1")
 
 
-@pytest.mark.parametrize("kind", ["stores", "conditional", "nested", "loop", "side_effect", "copy", "gemm"])
+@pytest.mark.parametrize("kind", ["conditional", "nested", "loop", "side_effect", "copy", "gemm"])
 def test_reject_unsupported_scope_body(kind):
     def body(a, b, c, ij, store):
-        if kind == "stores":
-            return tirx.SeqStmt([store, tirx.BufferStore(a, b[tuple(ij)], ij)])
         if kind == "conditional":
             return tirx.IfThenElse(ij[0] < 10, store, None)
         if kind == "nested":
@@ -378,8 +420,28 @@ def test_reject_predicates(kind):
         {"a_metadata": {"tt.tile_shape": [32, 32], "tt.dfb_block_count": 0}},
     ],
 )
-def test_reject_missing_or_inconsistent_allocation_metadata(kwargs):
-    _reject(_module(**kwargs), "metadata|tt.tile_shape|tt.dfb_block_count|32")
+def test_capture_does_not_own_allocation_metadata_capability(kwargs):
+    mod = _canonicalize(_module(**kwargs))
+    transform.VerifyTTComputeBlocks()(mod)
+    assert len(_blocks(mod)) == 1
+
+
+def test_buffer_metadata_and_layout_own_allocation_capability():
+    missing = tt_transform.NormalizeTenstorrentBufferMetadata()(_canonicalize(_module(metadata=False)))
+    inferred = tt_transform.InferTenstorrentTensorLayout()(missing)
+    shared = [item for item in inferred["main"].attrs["tt.buffer_metadata_table"] if str(item.kind) == "logical_dfb_candidate"]
+    assert all([int(value) for value in item.tile_shape] == [32, 32] for item in shared)
+    assert all(int(item.dfb_block_count) == 1 for item in shared)
+
+    invalid_count = _canonicalize(_module(a_metadata={"tt.tile_shape": [32, 32], "tt.dfb_block_count": 0}))
+    with pytest.raises((tvm.error.TVMError, ValueError), match=r"dfb_block_count.*\[1, 32\]"):
+        tt_transform.NormalizeTenstorrentBufferMetadata()(invalid_count)
+
+    invalid_tile = tt_transform.NormalizeTenstorrentBufferMetadata()(
+        _canonicalize(_module(a_metadata={"tt.tile_shape": [16, 32], "tt.dfb_block_count": 2}))
+    )
+    with pytest.raises(NotImplementedError, match="supported 32x32 tile shape"):
+        tt_transform.InferTenstorrentTensorLayout()(invalid_tile)
 
 
 @pytest.mark.parametrize("kwargs", [{"a_scope": "global"}, {"c_scope": "global"}])
@@ -952,7 +1014,7 @@ def test_pipeline_executes_each_fixed_stage_once(monkeypatch, size):
     assert names == expected
     assert recorder.names.count("CanonicalizeTTElementwise") == 1
     assert recorder.names.count("VerifyTTComputeBlocks") == 0
-    assert recorder.names.count("VerifyTTGemmAccumulators") == 1
+    assert recorder.names.count("VerifyTTGemmAccumulators") == 0
     assert recorder.names.count("VerifyTTStructuredDataflow") == 1
     assert recorder.names.count("VerifyTenstorrentDeviceIR") == 1
 
@@ -1182,19 +1244,33 @@ def test_tiles02_domain_carrier_does_not_create_effects_or_require_metadata(carr
     assert _integers(block.annotations["tl.tt.logical_domain"]) == [64, 64]
 
 
-def test_tiles02_fragment_does_not_require_dfb_metadata_but_shared_input_does():
+def test_tiles02_capture_does_not_require_dfb_metadata():
     fragments = _module(a_scope="local.fragment", b_scope="local.fragment", c_scope="local.fragment", metadata=False)
     transform.VerifyTTComputeBlocks()(_canonicalize(fragments))
-    _reject(_module(b_scope="local.fragment", c_scope="local.fragment", metadata=False), "metadata")
-    _reject(
-        _module(b_scope="local.fragment", c_scope="local.fragment", a_metadata={**METADATA, "tt.tile_shape": [16, 32]}),
-        "tt.tile_shape|32x32",
+    shared = _canonicalize(_module(b_scope="local.fragment", c_scope="local.fragment", metadata=False))
+    transform.VerifyTTComputeBlocks()(shared)
+
+    invalid_tile = tt_transform.NormalizeTenstorrentBufferMetadata()(
+        _canonicalize(
+            _module(
+                b_scope="local.fragment",
+                c_scope="local.fragment",
+                a_metadata={**METADATA, "tt.tile_shape": [16, 32]},
+            )
+        )
     )
+    with pytest.raises(NotImplementedError, match="supported 32x32 tile shape"):
+        tt_transform.InferTenstorrentTensorLayout()(invalid_tile)
 
 
 @pytest.mark.parametrize("metadata", [{"tt.tile_shape": [32, 32]}, {"tt.dfb_block_count": 2}, {"tt.tensor_backed": 1}])
 def test_tiles02_fragment_rejects_dfb_allocation_metadata(metadata):
-    _reject(_module(a_scope="local.fragment", a_metadata=metadata), "fragment|metadata")
+    captured = _canonicalize(_module(a_scope="local.fragment", a_metadata=metadata))
+    with pytest.raises(
+        (NotImplementedError, tvm.error.TVMError, ValueError),
+        match="non-shared|tensor_backed",
+    ):
+        tt_transform.NormalizeTenstorrentBufferMetadata()(captured)
 
 
 @pytest.mark.parametrize("count", [1, 3, 32])

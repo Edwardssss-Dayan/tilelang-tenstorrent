@@ -69,8 +69,8 @@ analysis does not partially mutate its input.
 
 ## Supported semantic subset
 
-Scopes must have static, positive domains with at least two axes, last two axes divisible by `(32, 32)`, one
-store, and shared or `shared.dyn` buffers with compatible tile metadata.
+Scopes must have static, positive domains with at least two axes, last two axes divisible by `(32, 32)`, exactly one
+`BufferStore` assignment, and shared or `shared.dyn` buffers with compatible tile metadata.
 Supported expressions include arithmetic, casts, compile-time scalar values,
 and supported pure unary calls. An output can also be read for an in-place
 elementwise update. Independent scopes and enclosing serial loops retain their
@@ -92,7 +92,8 @@ deferred to the future TTL consumer.
 Nested Tiles scopes, multiple stores, masks, predicates, dynamic shapes,
 transpose, offsets, gather/scatter, coordinate values in the RHS, unsupported
 buffer views or aliases, global stores, and side effects inside the elementwise
-scope fail explicitly. Copy, GEMM, reduction, and communication are separate
+scope fail explicitly. Use a separate `T.Tiles` scope for each additional
+assignment. Copy, GEMM, reduction, and communication are separate
 operations; they cannot be hidden inside an elementwise expression.
 
 ## Pass order and output stages
@@ -101,14 +102,13 @@ The shared prefix is explicit in `tilelang/tenstorrent/pipeline.py`:
 
 ```text
 BindTarget
-CanonicalizeTTElementwise
-VerifyTTComputeBlocks
 ValidateTenstorrentFrontendIR
+CanonicalizeTTElementwise
 NormalizeTenstorrentLaunch
 NormalizeTenstorrentBufferMetadata
-VerifyTTGemmAccumulators
 NormalizeTenstorrentTopology
 NormalizeTenstorrentRegions
+VerifyTTStructuredDataflow
 LegalizeTenstorrentTileOps
 ```
 
@@ -127,8 +127,10 @@ that distinction by supplying defaults too early.
 
 `LegalizeTenstorrentTileOps` consumes verified structured operations into explicit
 computation calls with scalar expression DAGs, access maps, shapes and dtypes.
-It preserves the classic Add operation for compatible v1 programs and uses the
-[Phase 4 Device contract](tenstorrent_phase4_lower.md) for general computation.
+All supported elementwise expressions use the generic `tl.tt.tile_compute`
+contract described by the
+[Phase 4 Device contract](tenstorrent_phase4_lower.md); the active pipeline has
+no Add-specific operation or formation path.
 
 Every complete pipeline invocation continues through:
 
@@ -139,35 +141,27 @@ InferTenstorrentComputeRequirements
 VerifyTenstorrentDeviceIR
 ```
 
-Pass 12 requires `tt.topology_normalized=1`, including single-Core and empty
+Pass 11 requires `tt.topology_normalized=1`, including single-Core and empty
 programs; direct callers must run `NormalizeTenstorrentTopology` first. There
 is no legacy Add/no-op formation fallback. Supported operations all use the
-shared-grid `GeneralDataflowPlanner`; pipeline and nonpipeline scheduling
-remain distinct. Before planning, formation checks actual operation calls,
-compute kinds, and nested scalar DAGs (including dtype and unary-call variants).
-Its scalar node/unary support set is shared with the Device verifier in
-`compute_support.h`; shape, broadcast access maps, dependencies and resources
-remain subject to planner and Device validation. This is a Lower-stage contract,
-not a promise of TTL codegen or hardware support. Unsupported operations raise
-`NotImplementedError`; missing topology is malformed input (`ValueError`).
+stream-oriented shared-grid planner. Before planning, formation defensively
+checks actual operation calls, compute kinds, and nested scalar DAGs, including
+dtype and unary-call variants. Its scalar node/unary support set is shared with
+the Device verifier in `compute_support.h`; shape, broadcast access maps,
+dependencies and resources remain subject to planner and Device validation.
 
-`tilelang.tenstorrent.lower_tenstorrent_ir(mod, target)` returns Device IR when
-all computations have consumers. Versions 1–4 retain the existing Add, general,
-pipeline and multicore contracts; version 5 adds persistent GEMM accumulators.
-Legal unconsumed elementwise expressions and standalone computations without
-a Tensor ABI return the complete normalized module with
-`tt.ir_stage="structured"` and `tt.deferred_reasons`. Supported siblings are
-not partially replaced by Device operations in this result.
+`tilelang.tenstorrent.lower_tenstorrent_ir(mod, target)` returns verified Device
+IR. A computation without a complete Device consumer raises
+`NotImplementedError` in legalization, layout inference, formation, or compute
+requirement inference. `VerifyTTStructuredDataflow` checks definite
+initialization and region bounds before those capability checks; uninitialized
+reads, malformed metadata and failed semantic proofs raise `ValueError`. This
+is a Lower-stage contract, not a promise of TTL codegen or hardware support.
 
-Before structured return, `VerifyTTStructuredDataflow` checks definite
-initialization and region bounds. Uninitialized reads, malformed metadata and
-other errors are not converted into capability fallbacks. This verifier is
-conservative about aliases and symbolic regions. The registered compilation
-pipeline still requires Device IR and rejects structured output before shared
-host/device filtering. Clients needing capture alone can continue to invoke
-the two capture passes directly. To rerun the complete lowering pipeline, pass
-the original frontend module; normalized structured input is explicitly rejected
-instead of trusting its stage marker to bypass frontend validation.
+Clients needing capture alone invoke the capture and structured verifier passes
+directly. Complete lowering accepts only the original frontend module;
+normalized structured input is rejected instead of trusting a stage marker to
+bypass frontend validation.
 
 SIMT layout inference, generic simplification, `LowerOpaqueBlock`, buffer
 flattening, and scalar loop lowering do not run on the structured templates.
@@ -179,8 +173,8 @@ describes the new Device schema and narrower TTL emission boundary.
 
 The target tests cover both frontend forms, canonical effects and geometry,
 broadcasts, compound expressions, idempotency, malformed contracts, and
-pipeline stages. Device IR tests retain descriptor and instruction-protocol
-checks for the existing Add consumer.
+pipeline stages. Device IR tests cover descriptor, resource, lifecycle,
+communication and instruction-protocol contracts for generic compute consumers.
 
 Numerical evaluation of structured templates in tests checks logical indexing
 and expression semantics on the CPU. It does not validate BF16 device rounding,

@@ -1,4 +1,4 @@
-"""Pass 12 checks actual scalar DAGs and always uses normalized formation."""
+"""Formation checks actual scalar DAGs and always uses normalized input."""
 
 import pytest
 from tilelang import tvm
@@ -22,43 +22,55 @@ def before_formation(frontend=add_fp32):
     return mod
 
 
-def replace_add(mod, expression):
+def replace_expression(mod, expression):
+    replaced = False
+
     def rewrite(node):
-        if isinstance(node, tirx.Call) and isinstance(node.op, Op) and node.op.name == "tl.tt.tile_add":
-            a, b, c = [arg.buffer for arg in node.args]
+        nonlocal replaced
+        if (
+            isinstance(node, tirx.Call)
+            and isinstance(node.op, Op)
+            and node.op.name == "tl.tt.tile_compute"
+            and node.annotations["tt.compute_kind"].value == "elementwise"
+        ):
+            replaced = True
+            _, a, b = [arg.buffer for arg in node.args]
             attrs = dict(node.annotations)
-            attrs.update({
-                "tt.compute_kind": tirx.StringImm("elementwise"),
-                "tt.logical_domain": c.shape,
-                "tt.input_shapes": [a.shape, b.shape],
-                "tt.expression": expression(tirx.BufferLoad(a, [0, 0]), tirx.BufferLoad(b, [0, 0])),
-            })
-            return tirx.Call("void", Op.get("tl.tt.tile_compute"), [node.args[2], node.args[0], node.args[1]], attrs, node.span)
+            attrs["tt.expression"] = expression(
+                tirx.BufferLoad(a, [0, 0]),
+                tirx.BufferLoad(b, [0, 0]),
+            )
+            return tirx.Call(node.dtype, node.op, node.args, attrs, node.span)
         return None
+
     func = mod["main"]
     mod["main"] = func.with_body(tirx.stmt_functor.ir_transform(func.body, None, rewrite), func.span)
+    assert replaced
     return mod
 
 
-@pytest.mark.parametrize("expression", [None, lambda a, b: a + b, lambda a, b: a * b, lambda a, b: a / b,
-                                        lambda a, b: (a + b) * a / b])
+@pytest.mark.parametrize("expression", [None, lambda a, b: a + b, lambda a, b: a * b, lambda a, b: a / b, lambda a, b: (a + b) * a / b])
 def test_supported_operations_share_planner(expression):
     mod = before_formation()
     if expression is not None:
-        mod = replace_add(mod, expression)
+        mod = replace_expression(mod, expression)
     formed = transform.FormTenstorrentDeviceProgram()(mod)
     assert str(formed.attrs["tt.ir_stage"]) == "device"
-    assert "tt.dfb_families" in formed.attrs
+    assert formed.attrs["tt.dfb_storage_groups"]
+    assert list(formed.attrs["tt.kernel_order"]) == ["main_trisc", "main_ncrisc", "main_brisc"]
     formed = transform.InferTenstorrentComputeRequirements()(formed)
     transform.VerifyTenstorrentDeviceIR()(formed)
 
 
-@pytest.mark.parametrize("expression,reason", [
-    (lambda a, b: a + tirx.call_intrin("float32", "tirx.erf", b), "tirx.erf"),
-    (lambda a, b: a * tirx.FloorMod(a, b), "FloorMod"),
-])
+@pytest.mark.parametrize(
+    "expression,reason",
+    [
+        (lambda a, b: a + tirx.call_intrin("float32", "tirx.erf", b), "tirx.erf"),
+        (lambda a, b: a * tirx.FloorMod(a, b), "FloorMod"),
+    ],
+)
 def test_nested_unsupported_is_reported_before_formation(expression, reason):
-    mod = replace_add(before_formation(), expression)
+    mod = replace_expression(before_formation(), expression)
     before = ir.save_json(mod)
     with pytest.raises(NotImplementedError, match=reason):
         transform.FormTenstorrentDeviceProgram()(mod)
@@ -66,17 +78,23 @@ def test_nested_unsupported_is_reported_before_formation(expression, reason):
 
 
 @pytest.mark.parametrize("frontend", [add_fp32, phase1_noop])
-def test_all_inputs_require_normalized_topology(frontend):
+@pytest.mark.parametrize("value", [None, 0, 2])
+def test_all_inputs_require_normalized_topology(frontend, value):
     mod = before_formation(frontend)
-    mod["main"] = mod["main"].without_attr("tt.topology_normalized")
+    mod["main"] = (
+        mod["main"].without_attr("tt.topology_normalized") if value is None else mod["main"].with_attr("tt.topology_normalized", value)
+    )
+    before = ir.save_json(mod)
     with pytest.raises(ValueError, match="NormalizeTenstorrentTopology"):
         transform.FormTenstorrentDeviceProgram()(mod)
+    assert ir.save_json(mod) == before
 
 
 def test_empty_body_uses_common_planner():
     mod = transform.FormTenstorrentDeviceProgram()(before_formation(phase1_noop))
     assert str(mod.attrs["tt.ir_stage"]) == "device"
-    assert not mod.attrs["tt.dfb_families"]
+    assert not mod.attrs.get("tt.dfb_families", [])
+    assert not mod.attrs.get("tt.dfb_storage_groups", [])
     transform.VerifyTenstorrentDeviceIR()(transform.InferTenstorrentComputeRequirements()(mod))
 
 
@@ -90,11 +108,15 @@ def test_unsupported_actual_operation_has_no_noop_fallback():
 
     func = mod["main"]
     mod["main"] = func.with_body(tirx.stmt_functor.ir_transform(func.body, None, rewrite), func.span)
+    before = ir.save_json(mod)
     with pytest.raises(NotImplementedError, match="unsupported program: operation"):
         transform.FormTenstorrentDeviceProgram()(mod)
+    assert ir.save_json(mod) == before
 
 
 def test_unsupported_nested_dtype_reports_unsupported():
-    mod = replace_add(before_formation(), lambda a, b: a + tirx.Cast("float32", tirx.Cast("float16", b)))
+    mod = replace_expression(before_formation(), lambda a, b: a + tirx.Cast("float32", tirx.Cast("float16", b)))
+    before = ir.save_json(mod)
     with pytest.raises(NotImplementedError, match="scalar BF16/FP32"):
         transform.FormTenstorrentDeviceProgram()(mod)
+    assert ir.save_json(mod) == before

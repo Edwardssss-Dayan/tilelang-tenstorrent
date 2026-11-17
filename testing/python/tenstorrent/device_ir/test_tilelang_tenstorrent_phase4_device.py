@@ -1,5 +1,7 @@
 """Device formation, dependency, metadata, and host-reference regressions."""
 
+import inspect
+
 import numpy as np
 import pytest
 
@@ -20,7 +22,6 @@ from testing.python.tenstorrent.lower.test_tilelang_tenstorrent_phase4_compute i
     transpose_program,
 )
 from testing.python.tenstorrent.legacy.test_tilelang_tenstorrent_phase2_device_ir import (
-    _replace_dfb,
     _slots,
 )
 from testing.python.tenstorrent._support.reference import _calls, _core_statements, _with_core_statements
@@ -46,6 +47,12 @@ def replace_core_statements(mod, slot, statements):
             mod[global_var] = _with_core_statements(function, statements)
             return
     raise AssertionError(f"missing slot {slot}")
+
+
+def replace_group(group, **changes):
+    fields = {name: getattr(group, name) for name in inspect.signature(D.DFBStorageGroupDescriptor.__init__).parameters if name != "self"}
+    fields.update(changes)
+    return D.DFBStorageGroupDescriptor(**fields)
 
 
 def reference_device(mod, inputs):
@@ -168,7 +175,7 @@ def test_elementwise_semantics(monkeypatch, broadcast, inplace):
     b = rng.uniform(0.5, 2, (32 if broadcast else 64, 64)).astype("float32")
     actual = reference_device(mod, {0: a, 1: b})[2]
     np.testing.assert_allclose(actual, np.sqrt(a * a + (b[0] if broadcast else b)) / 2, rtol=1e-6)
-    assert all(".generation" in str(d.source_buffer_identity) for d in mod.attrs["tt.dfb_table"])
+    assert all(str(d.source_buffer_identity).startswith("stream.") for d in mod.attrs["tt.dfb_table"])
 
 
 @pytest.mark.parametrize("program", [cast_program, fill_program, transpose_program])
@@ -207,32 +214,59 @@ def test_reduction_semantics(monkeypatch, kind, axis, clear):
     [
         ({"consumer_slot": "brisc"}, "wait in wrong slot|consumer slot"),
         ({"transaction_count_or_loop_relation": 2}, "transaction count disagrees"),
-        ({"element_dtype": "bfloat16"}, "backing metadata mismatch|dfb_load dtype mismatch"),
+        ({"element_dtype": "bfloat16"}, "backing metadata mismatch|dfb_operand dtype mismatch"),
     ],
 )
 def test_resource_metadata_rejected(monkeypatch, change, match):
     mod = lower(monkeypatch, elementwise_program())
-    dfbs = list(mod.attrs["tt.dfb_table"])
-    dfbs[0] = _replace_dfb(dfbs[0], **change)
-    mod = mod.with_attr("tt.dfb_table", dfbs)
+    groups = list(mod.attrs["tt.dfb_storage_groups"])
+    groups[0] = replace_group(groups[0], **change)
+    mod = mod.with_attr("tt.dfb_storage_groups", groups)
     with pytest.raises(ValueError, match=match):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 def test_missing_wait_rejected(monkeypatch):
     mod = lower(monkeypatch, elementwise_program())
-    statements = _core_statements(_slots(mod)["trisc"])
+    trisc = _slots(mod)["trisc"]
+    statements = _core_statements(trisc)
+    aliases = {}
+    tirx.stmt_functor.post_order_visit(
+        trisc.body,
+        lambda node: (
+            aliases.setdefault(node.var, int(node.value.args[0]))
+            if isinstance(node, tirx.Bind) and isinstance(node.value, tirx.Call) and node.value.op.name == "tl.tt.dfb_stream_ref"
+            else None
+        ),
+    )
     statements = [
-        statement for statement in statements if not (statement.value.op.name == "tl.tt.dfb_wait" and int(statement.value.args[0]) == 0)
+        statement
+        for statement in statements
+        if not (
+            isinstance(statement, tirx.Evaluate)
+            and statement.value.op.name == "tl.tt.dfb_wait"
+            and aliases.get(statement.value.args[0]) == 0
+        )
     ]
     replace_core_statements(mod, "trisc", statements)
-    with pytest.raises(ValueError, match="missing consumer wait"):
+    with pytest.raises(ValueError, match="missing consumer wait|no active acquisition"):
         transform.VerifyTenstorrentDeviceIR()(mod)
 
 
 def test_cross_slot_cycle_rejected(monkeypatch):
     mod = lower(monkeypatch, elementwise_program())
-    statements = [tirx.Evaluate(call) for call in _calls(_slots(mod)["ncrisc"].body)]
+    body = _slots(mod)["ncrisc"].body
+    aliases = {}
+    calls = []
+
+    def collect(node):
+        if isinstance(node, tirx.Bind):
+            aliases[node.var] = node.value
+        elif isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
+            calls.append(tirx.stmt_functor.substitute(node.value, aliases))
+
+    tirx.stmt_functor.post_order_visit(body, collect)
+    statements = [tirx.Evaluate(call) for call in calls]
     export_wait = next(i for i, statement in enumerate(statements) if statement.value.op.name == "tl.tt.dfb_wait")
     statements.insert(0, statements.pop(export_wait))
     replace_core_statements(mod, "ncrisc", statements)
@@ -298,7 +332,10 @@ def replace_compute_annotation(mod, key, value, *, kind=None):
 @pytest.mark.parametrize(
     "key,value,match",
     [
-        ("tt.compute_dtype", tirx.StringImm("bfloat16"), "dtype annotation"),
+        ("tt.compute_dtype", tirx.StringImm("bfloat16"), "must not carry tt.compute_dtype"),
+        ("tt.compute_tile_shape", ir_metadata([32, 32]), "must not carry tt.compute_tile_shape"),
+        ("tt.value_input_shapes", ir_metadata([[32, 32]]), "must not carry tt.value_input_shapes"),
+        ("tt.clear", tirx.IntImm("int32", 1), "must not carry tt.clear"),
         ("tt.logical_domain", [32, 64], "tile-grid metadata"),
         ("tt.compute_kind", tirx.StringImm("unknown"), "unknown compute kind"),
     ],

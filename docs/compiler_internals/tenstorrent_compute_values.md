@@ -30,15 +30,18 @@ PipeNet communication and independent pipelined value chains are described in
 
 ## Authoritative IR
 
-`tt.compute_value_table` contains typed `ComputeValueDescriptor` entries:
+Current Device IR stores typed `ComputeValueDescriptor` prototypes and instance
+relations in `tt.compute_value_families`. Each ID in the shared body is local to
+the current Core; diagnostic expansion may synthesize a globally numbered
+`tt.compute_value_table` without changing the persisted contract.
 
 | Field | Meaning |
 | --- | --- |
-| `value_id` | Operation-local immutable definition ID |
+| `value_id` | Core-local immutable definition ID |
 | `buffer` | Logical fragment identity, shape and dtype |
 | `version` | Zero-based write version of that logical Buffer |
-| `previous_value_id` | Previous write to that Buffer, or -1 |
-| `accumulator_id` | Owning or single contributing accumulator, or -1 |
+| `previous_value_id` | Previous Core-local write to that Buffer, or -1 |
+| `accumulator_id` | Owning Core-local accumulator, or -1 |
 | `source_span` | Original source location |
 
 Multiple contributing accumulator roots are recovered from the body def-use
@@ -49,22 +52,35 @@ The TRISC body owns the definitions and actual dependencies:
 
 | Intrinsic | Contract |
 | --- | --- |
-| `compute_value(output, dfb_inputs...)` | Define a typed pure elementwise/fill/typecast value |
-| `compute_value_load(value)` | Pure expression reference to a dominating definition |
-| `compute_value_gemm(output, lhs_dfb, rhs_dfb, old, transpose_a, transpose_b)` | Produce a new accumulator version |
+| `compute_value_ref(id)` | Pure, handle-typed readable reference to one Core-local canonical value ID |
+| `compute_state_ref(id)` | Pure, handle-typed readable reference to one abstract loop-state ID |
+| `compute_value(output, dfb_inputs...)` | Define a typed pure elementwise/fill/typecast value through refs |
+| `compute_value_operand(index)` | Pure expression reference through `tt.value_inputs[index]` |
+| `compute_value_gemm(output, lhs_dfb, rhs_dfb, old)` | Produce a new accumulator version; Boolean `tt.transpose_a/b` are named annotations |
 | `compute_value_store(value, output_dfb)` | Exact-dtype compute store to a reserved DFB |
 
-Expression annotations reuse the existing logical domain, compute dtype and
-tile geometry. `tt.access_maps` / `tt.input_shapes` describe only DFB operands;
-`tt.value_inputs`, `tt.value_access_maps` and `tt.value_input_shapes` describe
-compute-local operands. Tensor exports use an explicit compute cast when their
-storage dtype differs; they never silently retag a value.
+The output `ComputeValueDescriptor` is authoritative for logical domain, dtype
+and tile geometry. Current Device calls do not repeat those fields or
+`tt.value_input_shapes`. `tt.input_shapes` describes nonempty DFB operand views;
+`tt.value_inputs` is the only serialized compute-value identity list. Effective
+value-input views are derived from each input descriptor plus explicit
+`compute_broadcast` axes. The expression uses zero-based `dfb_operand` and
+`compute_value_operand` leaves, so it never duplicates resource IDs. Tensor
+exports use an explicit compute cast when their storage dtype differs; they
+never silently retag a value.
 
-The verifier checks definitions, predecessor chains, exact expression effects,
-geometry, ownership, accumulator provenance, complete K, final output dtype
-and precision requirements independently of the frontend. JSON roundtrips
-retain the complete contract. Runtime objects and frontend side tables are not
-needed for codegen.
+The canonical integer remains inside each function-entry `compute_value_ref` or
+`compute_state_ref`; body operations use the readable handle alias. Formation
+also emits derived `tt.debug_dfb_operands` and `tt.debug_value_operands` names so
+an expression's local operand indices can be audited without duplicating
+identity in the expression DAG. These names are deterministic diagnostics only:
+the verifier checks their shape and type, while Codegen uses refs and descriptors.
+
+The verifier resolves value and accumulator IDs using the active Core before it
+checks definitions, predecessor chains, exact expression effects, geometry,
+ownership, accumulator provenance, complete K, final output dtype and precision
+requirements independently of the frontend. JSON roundtrips retain the complete
+contract. Runtime objects and frontend side tables are not needed for codegen.
 
 ## Materialization and lifetime
 

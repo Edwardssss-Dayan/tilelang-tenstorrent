@@ -176,7 +176,8 @@ def test_frozen_device_ir_schema_and_slot_contract():
     )
     assert contracts.PIPE_DESCRIPTOR_FIELDS == (
         "pipe_net_id",
-        "event_index",
+        "communication_id",
+        "record_index",
         "src_coord",
         "dst_begin",
         "dst_end",
@@ -238,7 +239,6 @@ def test_structured_compute_precedes_device_lowering_in_pass_order():
         "CanonicalizeTTElementwise",
         "NormalizeTenstorrentLaunch",
         "NormalizeTenstorrentBufferMetadata",
-        "VerifyTTGemmAccumulators",
         "NormalizeTenstorrentTopology",
         "NormalizeTenstorrentRegions",
         "VerifyTTStructuredDataflow",
